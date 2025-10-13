@@ -243,6 +243,20 @@ struct mem_cgroup {
 	atomic_long_t		memory_events[MEMCG_NR_MEMORY_EVENTS];
 	atomic_long_t		memory_events_local[MEMCG_NR_MEMORY_EVENTS];
 
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER
+	/*
+	 * Per-cgroup atomic counter stats (experimental alternative to rstat).
+	 * Each memcg maintains its own atomic counter data. The parent maintains
+	 * a list of child memcgs (not counters) for hierarchical aggregation.
+	 */
+	struct memcg_atomic_counter *atomic_counter;
+
+	/* List of child cgroups for recursive aggregation (RCU protected) */
+	struct list_head atomic_children;	/* list of child memcgs */
+	struct list_head atomic_sibling;	/* linked to parent's atomic_children */
+	spinlock_t atomic_children_lock;	/* for list add/remove; traversal uses RCU */
+#endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
+
 #ifdef CONFIG_MEMCG_NMI_SAFETY_REQUIRES_ATOMIC
 	/* MEMCG_KMEM for nmi context */
 	atomic_t		kmem_stat;

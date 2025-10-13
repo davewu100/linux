@@ -1039,23 +1039,121 @@ config MEMCG
 	help
 	  Provides control over the memory footprint of tasks in a cgroup.
 
+if MEMCG
+
 config MEMCG_NMI_UNSAFE
 	bool
-	depends on MEMCG
 	depends on HAVE_NMI
 	depends on !ARCH_HAS_NMI_SAFE_THIS_CPU_OPS && !ARCH_HAVE_NMI_SAFE_CMPXCHG
 	default y
 
 config MEMCG_NMI_SAFETY_REQUIRES_ATOMIC
 	bool
-	depends on MEMCG
 	depends on HAVE_NMI
 	depends on !ARCH_HAS_NMI_SAFE_THIS_CPU_OPS && ARCH_HAVE_NMI_SAFE_CMPXCHG
 	default y
 
+config MEMCG_ATOMIC_COUNTER
+	bool "Enable atomic per-cgroup counter (experimental)"
+	depends on !MEMCG_V1
+	default n
+	help
+	  Enable atomic per-cgroup counter based statistics as an experimental
+	  alternative to rstat. Each cgroup has a single set of atomic counters
+	  (not per-CPU), which are updated on every stat change.
+
+	  Pros:
+	    - Faster reads (no aggregation needed)
+	    - Simple recursive aggregation for hierarchical stats
+	    - Real-time updates without flush delay
+
+	  Cons:
+	    - Potential cache line bouncing on writes
+	    - NOT compatible with cgroup v1 (v1 requires local statistics)
+	    - NO per-NUMA-node statistics (only cgroup-level aggregation)
+	    - Read path O(descendants) complexity for deep cgroup trees
+
+	  IMPORTANT LIMITATIONS:
+	  1. Atomic counters ONLY support hierarchical (subtree) statistics.
+	     They cannot provide local (non-hierarchical) statistics required
+	     by cgroup v1. This option is only available for cgroup v2.
+
+	  2. NO per-node statistics: Atomic counters maintain only per-cgroup
+	     totals, not per-NUMA-node breakdowns. Code paths requiring
+	     per-node data (e.g., some NUMA-aware reclaim heuristics) will
+	     see inaccurate or zero values. memory.stat output aggregates
+	     correctly, but per-node derivatives are NOT supported.
+
+	  3. Performance trade-off: Faster reads O(tree depth) but slower
+	     for very deep cgroup hierarchies. Best for small-to-medium
+	     cgroup trees with frequent memory.stat reads.
+
+	  NOTE: This option is mutually exclusive with MEMCG_RSTAT_COUNTER
+	  unless MEMCG_STAT_COMPARISON is enabled for side-by-side comparison.
+
+	  Say N unless you are doing performance testing or need lock-free
+	  hierarchical stats on cgroup v2 and do NOT require per-node data.
+
+comment "WARNING: Atomic counters are incompatible with cgroup v1!"
+	depends on MEMCG_V1 && MEMCG_ATOMIC_COUNTER
+
+comment "INFO: Enable MEMCG_STAT_COMPARISON if you want to use both RSTAT and ATOMIC"
+	depends on MEMCG_ATOMIC_COUNTER && MEMCG_RSTAT_COUNTER && !MEMCG_STAT_COMPARISON
+
+config MEMCG_RSTAT_COUNTER
+	bool "Enable rstat tree per-CPU counter"
+	default y
+	help
+	  Enable rstat tree per-CPU counter for memory statistics. This is the
+	  default memory statistics mechanism in cgroup memory controller.
+
+	  When enabled (default):
+	    - Use per-CPU counters for stats updates (low write contention)
+	    - Lazy aggregation on read path (amortized read cost)
+	    - 2-second periodic flush to prevent unbounded tree growth
+
+	  When disabled:
+	    - No per-CPU counter updates
+	    - No memcg_rstat_updated() calls
+	    - Stats updates will only use atomic counters (if enabled)
+
+	  WARNING: Disabling this without enabling MEMCG_ATOMIC_COUNTER will
+	  result in no memory statistics being collected!
+
+	  Say Y (default) for normal operation.
+
+# Internal config to detect invalid configuration
+config MEMCG_NO_STATS
+	def_bool y
+	depends on !MEMCG_RSTAT_COUNTER && !MEMCG_ATOMIC_COUNTER
+
+comment "WARNING: No memcg statistics method enabled! Enable at least one of RSTAT or ATOMIC."
+	depends on MEMCG_NO_STATS
+
+config MEMCG_STAT_COMPARISON
+	bool "Show comparison between rstat and atomic counter"
+	depends on MEMCG_RSTAT_COUNTER && MEMCG_ATOMIC_COUNTER
+	default n
+	help
+	  Enable side-by-side comparison of rstat and atomic counter statistics
+	  in memory.stat output. This option is only available when both
+	  MEMCG_RSTAT_COUNTER and MEMCG_ATOMIC_COUNTER are enabled.
+
+	  When enabled:
+	    - memory.stat displays both counter values with difference
+	    - Forces synchronous stats flushing for accurate comparison
+	    - Useful for debugging and performance analysis
+
+	  Typical use case:
+	    1. Enable both MEMCG_RSTAT_COUNTER and MEMCG_ATOMIC_COUNTER
+	    2. Enable this option to see side-by-side comparison
+	    3. Check memory.stat for comparison output with diff values
+
+	  Say N for production systems to avoid the flush overhead.
+	  Say Y if you need to compare the two counting mechanisms.
+
 config MEMCG_V1
 	bool "Legacy cgroup v1 memory controller"
-	depends on MEMCG
 	default n
 	help
 	  Legacy cgroup v1 memory controller which has been deprecated by
@@ -1069,6 +1167,8 @@ config MEMCG_V1
 	  controller are highly discouraged.
 
 	  Say N if unsure.
+
+endif # MEMCG
 
 config BLK_CGROUP
 	bool "IO controller"
