@@ -388,6 +388,18 @@ struct lruvec_stats {
 	long state_pending[NR_MEMCG_NODE_STAT_ITEMS];
 };
 
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER
+/*
+ * Per-node atomic counter based stats (similar to lruvec_stats)
+ *
+ * Per-node atomic counters for NUMA-aware statistics. Each node maintains
+ * its own atomic counters for per-node per-cgroup statistics.
+ */
+struct memcg_atomic_counter_per_node {
+	atomic64_t		state[NR_MEMCG_NODE_STAT_ITEMS];
+} ____cacheline_aligned_in_smp;
+#endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
+
 unsigned long lruvec_page_state(struct lruvec *lruvec, enum node_stat_item idx)
 {
 	struct mem_cgroup_per_node *pn;
@@ -432,6 +444,38 @@ unsigned long lruvec_page_state_local(struct lruvec *lruvec,
 #endif
 	return x;
 }
+
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER
+/**
+ * lruvec_page_state_atomic_counter - read per-node atomic counter stat
+ * @lruvec: the lruvec
+ * @idx: the stat item
+ *
+ * Returns the per-node atomic counter value for the given stat item.
+ * Similar to lruvec_page_state but reads from atomic counter instead of rstat.
+ */
+unsigned long lruvec_page_state_atomic_counter(struct lruvec *lruvec,
+						enum node_stat_item idx)
+{
+	struct mem_cgroup_per_node *pn;
+	u64 x;
+	int i;
+
+	if (mem_cgroup_disabled())
+		return node_page_state(lruvec_pgdat(lruvec), idx);
+
+	i = memcg_stats_index(idx);
+	if (WARN_ONCE(BAD_STAT_IDX(i), "%s: missing stat item %d\n", __func__, idx))
+		return 0;
+
+	pn = container_of(lruvec, struct mem_cgroup_per_node, lruvec);
+	if (unlikely(!pn->atomic_counter_per_node))
+		return 0;
+
+	x = atomic64_read(&pn->atomic_counter_per_node->state[i]);
+	return x;
+}
+#endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
 
 /* Subset of vm_event_item to report for memcg event stats */
 static const unsigned int memcg_vm_event_stat[] = {
@@ -668,7 +712,8 @@ static void flush_memcg_stats_dwork(struct work_struct *w)
 
 static int memcg_page_state_unit(int item);
 #ifdef CONFIG_MEMCG_ATOMIC_COUNTER
-static u64 memcg_page_state_atomic_counter_recursive(struct mem_cgroup *memcg, int idx);
+static u64 __maybe_unused
+memcg_page_state_atomic_counter_recursive(struct mem_cgroup *memcg, int idx);
 static unsigned long memcg_events_atomic_counter_recursive(struct mem_cgroup *memcg,
 							   enum vm_event_item idx);
 #endif
@@ -770,13 +815,17 @@ void mod_memcg_state(struct mem_cgroup *memcg, enum memcg_stat_item idx,
  *
  * Returns: aggregated stat value including all descendants (across all nodes)
  */
-static u64 memcg_page_state_atomic_counter_recursive(struct mem_cgroup *memcg, int idx)
+static u64 __maybe_unused
+memcg_page_state_atomic_counter_recursive(struct mem_cgroup *memcg, int idx)
 {
 	struct mem_cgroup *child;
+	struct memcg_atomic_counter *counter;
 	u64 total = 0;
 	int i;
 
-	if (unlikely(!memcg->atomic_counter))
+	/* Early exit if no atomic counter */
+	counter = READ_ONCE(memcg->atomic_counter);
+	if (unlikely(!counter))
 		return 0;
 
 	i = memcg_stats_index(idx);
@@ -796,7 +845,11 @@ static u64 memcg_page_state_atomic_counter_recursive(struct mem_cgroup *memcg, i
 	 *
 	 * We trade perfect snapshot consistency for lock-free performance.
 	 */
-	total = atomic64_read(&memcg->atomic_counter->state[i]);
+	total = atomic64_read(&counter->state[i]);
+
+	/* Early exit if no children to avoid RCU overhead */
+	if (list_empty(&memcg->atomic_children))
+		return total;
 
 	/* Recursively aggregate all children - RCU protected, no lock */
 	rcu_read_lock();
@@ -806,6 +859,54 @@ static u64 memcg_page_state_atomic_counter_recursive(struct mem_cgroup *memcg, i
 	rcu_read_unlock();
 
 	return total;
+}
+
+/**
+ * memcg_page_state_atomic_counter_batch - batch read all atomic counter stats
+ * @memcg: the memory cgroup
+ * @results: array to store results (size MEMCG_VMSTAT_SIZE)
+ *
+ * Batch read all atomic counter stats in a single tree traversal.
+ * This is much more efficient than calling recursive function for each stat.
+ * Uses iterative approach to avoid deep recursion and stack overflow.
+ *
+ * Returns: 0 on success, -1 if atomic_counter is not available
+ */
+static int memcg_page_state_atomic_counter_batch(struct mem_cgroup *memcg,
+						  u64 *results)
+{
+	struct mem_cgroup *child;
+	struct memcg_atomic_counter *counter;
+	int i, j;
+
+	/* Early exit if no atomic counter */
+	counter = READ_ONCE(memcg->atomic_counter);
+	if (unlikely(!counter))
+		return -1;
+
+	/* Read all stats for this memcg in one pass - cache-friendly sequential access */
+	for (i = 0; i < MEMCG_VMSTAT_SIZE; i++)
+		results[i] = atomic64_read(&counter->state[i]);
+
+	/* Early exit if no children to avoid RCU overhead */
+	if (list_empty(&memcg->atomic_children))
+		return 0;
+
+	/* Recursively aggregate all children - RCU protected, no lock */
+	rcu_read_lock();
+	list_for_each_entry_rcu(child, &memcg->atomic_children, atomic_sibling) {
+		u64 child_results[MEMCG_VMSTAT_SIZE];
+
+		/* Recursively get child results - early exit for empty children */
+		if (memcg_page_state_atomic_counter_batch(child, child_results) == 0) {
+			/* Aggregate child results into parent - sequential addition */
+			for (j = 0; j < MEMCG_VMSTAT_SIZE; j++)
+				results[j] += child_results[j];
+		}
+	}
+	rcu_read_unlock();
+
+	return 0;
 }
 
 /**
@@ -822,22 +923,62 @@ static unsigned long memcg_events_atomic_counter_recursive(struct mem_cgroup *me
 							    enum vm_event_item idx)
 {
 	struct mem_cgroup *child;
+	struct memcg_atomic_counter *counter;
 	unsigned long total = 0;
 	int i;
 
-	if (unlikely(!memcg->atomic_counter))
+	/* Early exit if no atomic counter */
+	counter = READ_ONCE(memcg->atomic_counter);
+	if (unlikely(!counter))
 		return 0;
 
 	i = memcg_events_index(idx);
 
 	/* Read single atomic value for this memcg */
-	total = atomic64_read(&memcg->atomic_counter->events[i]);
+	total = atomic64_read(&counter->events[i]);
+
+	/* Early exit if no children to avoid RCU overhead */
+	if (list_empty(&memcg->atomic_children))
+		return total;
 
 	/* Recursively aggregate all children - RCU protected, no lock */
 	rcu_read_lock();
 	list_for_each_entry_rcu(child, &memcg->atomic_children, atomic_sibling) {
 		total += memcg_events_atomic_counter_recursive(child, idx);
 	}
+	rcu_read_unlock();
+
+	return total;
+}
+
+static u64 memcg_atomic_counter_numa_sum(struct mem_cgroup *memcg,
+					 int nid, int stat_idx)
+{
+	struct cgroup_subsys_state *css = NULL;
+	struct mem_cgroup_per_node *pn;
+	struct memcg_atomic_counter_per_node *node_counter;
+	u64 total = 0;
+
+	if (BAD_STAT_IDX(stat_idx))
+		return 0;
+
+	rcu_read_lock();
+
+	while ((css = css_next_descendant_pre(css, &memcg->css))) {
+		struct mem_cgroup *child = mem_cgroup_from_css(css);
+
+		if (!child)
+			continue;
+
+		pn = READ_ONCE(child->nodeinfo[nid]);
+		if (!pn)
+			continue;
+
+		node_counter = READ_ONCE(pn->atomic_counter_per_node);
+		if (node_counter)
+			total += (u64)atomic64_read(&node_counter->state[stat_idx]);
+	}
+
 	rcu_read_unlock();
 
 	return total;
@@ -893,31 +1034,21 @@ static void mod_memcg_lruvec_state(struct lruvec *lruvec,
 #endif
 
 #ifdef CONFIG_MEMCG_ATOMIC_COUNTER
-	/*
-	 * Atomic counter design limitation: NO per-node tracking.
-	 *
-	 * Design trade-off:
-	 * - rstat: Maintains per-node counters (pn->lruvec_stats_percpu) for
-	 *   NUMA-aware statistics and per-node queries
-	 * - atomic: Only maintains per-cgroup totals to reduce memory overhead
-	 *   and simplify atomic operations (no per-node atomic arrays)
-	 *
-	 * Implications:
-	 * 1. memory.stat output: Correct total values (aggregated across nodes)
-	 * 2. Per-node queries: Will NOT reflect atomic counter updates
-	 * 3. NUMA-aware code: Paths using per-node breakdowns (e.g., some
-	 *    reclaim heuristics checking per-node LRU sizes) will see stale
-	 *    or inaccurate data when using atomic counters
-	 * 4. Comparison mode: Differences between rstat and atomic may include
-	 *    per-node flush timing in addition to per-CPU flush timing
-	 *
-	 * This is a fundamental limitation documented in Kconfig. Users needing
-	 * per-node statistics granularity should use rstat counters.
-	 */
-	struct memcg_atomic_counter *counter = memcg->atomic_counter;
+	/* Update per-cgroup atomic counter - cache pointer to avoid repeated reads */
+	struct memcg_atomic_counter *counter = READ_ONCE(memcg->atomic_counter);
+	struct memcg_atomic_counter_per_node *node_counter =
+		READ_ONCE(pn->atomic_counter_per_node);
 
-	if (likely(counter))
+	/* Use READ_ONCE to avoid unnecessary memory barriers on the pointer */
+	/* Update both counters if available - group writes together for better cache behavior */
+	if (likely(counter)) {
 		atomic64_add(val, &counter->state[i]);
+		if (likely(node_counter))
+			atomic64_add(val, &node_counter->state[i]);
+	} else if (unlikely(node_counter)) {
+		/* Fallback: only per-node counter exists (shouldn't happen normally) */
+		atomic64_add(val, &node_counter->state[i]);
+	}
 #endif
 
 	trace_mod_memcg_lruvec_state(memcg, idx, val_pages);
@@ -1647,9 +1778,74 @@ static bool memcg_accounts_hugetlb(void)
 }
 #endif /* CONFIG_HUGETLB_PAGE */
 
+/*
+ * Fold NMI-safe deferred deltas (kmem_stat/slab_*) into atomic counters
+ * before reading stats. This helps ensure atomic outputs include NMI-path
+ * updates regardless of whether RSTAT is enabled.
+ */
+#if defined(CONFIG_MEMCG_ATOMIC_COUNTER) && \
+	defined(CONFIG_MEMCG_NMI_SAFETY_REQUIRES_ATOMIC) && \
+	defined(CONFIG_MEMCG_STAT_COMPARISON)
+static void memcg_atomic_flush_pending_only(struct mem_cgroup *memcg)
+{
+	int nid;
+
+	/* kmem: fold deferred kmem delta into cgroup-level atomic counter */
+	if (atomic_read(&memcg->kmem_stat)) {
+		int kmem = atomic_xchg(&memcg->kmem_stat, 0);
+		int index = memcg_stats_index(MEMCG_KMEM);
+		struct memcg_atomic_counter *counter =
+			READ_ONCE(memcg->atomic_counter);
+
+		if (kmem && likely(counter))
+			atomic64_add(kmem, &counter->state[index]);
+	}
+
+	/* slab: fold per-node deferred deltas into per-node and cgroup atomics */
+	for_each_node_state(nid, N_MEMORY) {
+		struct mem_cgroup_per_node *pn = memcg->nodeinfo[nid];
+		struct memcg_atomic_counter *counter =
+			READ_ONCE(memcg->atomic_counter);
+		struct memcg_atomic_counter_per_node *node_counter =
+			READ_ONCE(pn->atomic_counter_per_node);
+
+		if (atomic_read(&pn->slab_reclaimable)) {
+			int slab = atomic_xchg(&pn->slab_reclaimable, 0);
+			int index = memcg_stats_index(NR_SLAB_RECLAIMABLE_B);
+
+			if (slab) {
+				if (likely(counter))
+					atomic64_add(slab, &counter->state[index]);
+				if (likely(node_counter))
+					atomic64_add(slab, &node_counter->state[index]);
+			}
+		}
+		if (atomic_read(&pn->slab_unreclaimable)) {
+			int slab = atomic_xchg(&pn->slab_unreclaimable, 0);
+			int index = memcg_stats_index(NR_SLAB_UNRECLAIMABLE_B);
+
+			if (slab) {
+				if (likely(counter))
+					atomic64_add(slab, &counter->state[index]);
+				if (likely(node_counter))
+					atomic64_add(slab, &node_counter->state[index]);
+			}
+		}
+	}
+}
+#else
+static void memcg_atomic_flush_pending_only(struct mem_cgroup *memcg)
+{
+}
+#endif
+
 static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 {
 	int i;
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER
+	u64 atomic_results[MEMCG_VMSTAT_SIZE];
+	bool atomic_available = false;
+#endif
 
 	/*
 	 * Provide statistics on the state of the memory subsystem as
@@ -1671,26 +1867,37 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 #endif /* CONFIG_MEMCG_STAT_COMPARISON */
 #endif /* CONFIG_MEMCG_RSTAT_COUNTER */
 
+	/* Fold NMI deferred deltas before reading. */
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER
+	memcg_atomic_flush_pending_only(memcg);
+	/* Batch read all atomic counter stats in a single tree traversal */
+	if (likely(memcg->atomic_counter)) {
+		atomic_available = (memcg_page_state_atomic_counter_batch(
+					memcg, atomic_results) == 0);
+	}
+#endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
+
 	for (i = 0; i < ARRAY_SIZE(memory_stats); i++) {
 		u64 size;
+		int idx = memory_stats[i].idx;
 
 #ifdef CONFIG_HUGETLB_PAGE
-		if (unlikely(memory_stats[i].idx == NR_HUGETLB) &&
+		if (unlikely(idx == NR_HUGETLB) &&
 			!memcg_accounts_hugetlb())
 			continue;
 #endif
 
 #ifdef CONFIG_MEMCG_RSTAT_COUNTER
-		size = memcg_page_state_output(memcg, memory_stats[i].idx);
+		size = memcg_page_state_output(memcg, idx);
 		seq_buf_printf(s, "%s %llu\n", memory_stats[i].name, size);
 #endif /* CONFIG_MEMCG_RSTAT_COUNTER */
 
 #ifdef CONFIG_MEMCG_ATOMIC_COUNTER
-		if (likely(memcg->atomic_counter)) {
-			u64 size_atomic = memcg_page_state_atomic_counter_recursive(
-					memcg, memory_stats[i].idx);
-			size_atomic *= memcg_page_state_output_unit(
-					memory_stats[i].idx);
+		if (atomic_available) {
+			int stat_idx = memcg_stats_index(idx);
+			u64 size_atomic = atomic_results[stat_idx];
+
+			size_atomic *= memcg_page_state_output_unit(idx);
 
 #ifdef CONFIG_MEMCG_STAT_COMPARISON
 			/* Show comparison between rstat and atomic counter */
@@ -1705,7 +1912,7 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 		}
 #endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
 
-		if (unlikely(memory_stats[i].idx == NR_SLAB_UNRECLAIMABLE_B)) {
+		if (unlikely(idx == NR_SLAB_UNRECLAIMABLE_B)) {
 #ifdef CONFIG_MEMCG_RSTAT_COUNTER
 			u64 slab_reclaimable = memcg_page_state_output(memcg,
 								   NR_SLAB_RECLAIMABLE_B);
@@ -1713,27 +1920,25 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 #endif /* CONFIG_MEMCG_RSTAT_COUNTER */
 
 #ifdef CONFIG_MEMCG_ATOMIC_COUNTER
-			if (likely(memcg->atomic_counter)) {
+			if (atomic_available) {
+				int slab_unreclaimable_idx =
+					memcg_stats_index(NR_SLAB_UNRECLAIMABLE_B);
+				int slab_reclaimable_idx =
+					memcg_stats_index(NR_SLAB_RECLAIMABLE_B);
 				u64 slab_unreclaimable_atomic =
-					memcg_page_state_atomic_counter_recursive(
-						memcg, NR_SLAB_UNRECLAIMABLE_B);
+					atomic_results[slab_unreclaimable_idx];
 				u64 slab_reclaimable_atomic =
-					memcg_page_state_atomic_counter_recursive(
-						memcg, NR_SLAB_RECLAIMABLE_B);
+					atomic_results[slab_reclaimable_idx];
 				slab_unreclaimable_atomic *=
-					memcg_page_state_output_unit(
-						NR_SLAB_UNRECLAIMABLE_B);
+					memcg_page_state_output_unit(NR_SLAB_UNRECLAIMABLE_B);
 				slab_reclaimable_atomic *=
-					memcg_page_state_output_unit(
-						NR_SLAB_RECLAIMABLE_B);
+					memcg_page_state_output_unit(NR_SLAB_RECLAIMABLE_B);
 				u64 slab_total_atomic = slab_unreclaimable_atomic +
 						    slab_reclaimable_atomic;
 
 #ifdef CONFIG_MEMCG_STAT_COMPARISON
 				/* Show comparison between rstat and atomic counter for slab */
-				u64 slab_total_rstat = size +
-					memcg_page_state_output(memcg,
-							NR_SLAB_RECLAIMABLE_B);
+				u64 slab_total_rstat = size + slab_reclaimable;
 				s64 diff = (s64)slab_total_rstat - (s64)slab_total_atomic;
 
 				seq_buf_printf(s, "slab_atomic %llu (rstat=%llu diff=%lld)\n",
@@ -2873,7 +3078,7 @@ static void commit_charge(struct folio *folio, struct mem_cgroup *memcg)
 	folio->memcg_data = (unsigned long)memcg;
 }
 
-#ifdef CONFIG_MEMCG_NMI_SAFETY_REQUIRES_ATOMIC
+#if defined(CONFIG_MEMCG_NMI_SAFETY_REQUIRES_ATOMIC) && defined(CONFIG_MEMCG_RSTAT_COUNTER)
 static inline void account_slab_nmi_safe(struct mem_cgroup *memcg,
 					 struct pglist_data *pgdat,
 					 enum node_stat_item idx, int nr)
@@ -3096,7 +3301,7 @@ struct obj_cgroup *get_obj_cgroup_from_folio(struct folio *folio)
 	return objcg;
 }
 
-#ifdef CONFIG_MEMCG_NMI_SAFETY_REQUIRES_ATOMIC
+#if defined(CONFIG_MEMCG_NMI_SAFETY_REQUIRES_ATOMIC) && defined(CONFIG_MEMCG_RSTAT_COUNTER)
 static inline void account_kmem_nmi_safe(struct mem_cgroup *memcg, int val)
 {
 	if (likely(!in_nmi())) {
@@ -4002,6 +4207,9 @@ static void free_mem_cgroup_per_node_info(struct mem_cgroup_per_node *pn)
 
 	free_percpu(pn->lruvec_stats_percpu);
 	kfree(pn->lruvec_stats);
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER
+	kfree(pn->atomic_counter_per_node);
+#endif
 	kfree(pn);
 }
 
@@ -4023,6 +4231,14 @@ static bool alloc_mem_cgroup_per_node_info(struct mem_cgroup *memcg, int node)
 						   GFP_KERNEL_ACCOUNT);
 	if (!pn->lruvec_stats_percpu)
 		goto fail;
+
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER
+	pn->atomic_counter_per_node = kzalloc_node(
+		sizeof(struct memcg_atomic_counter_per_node),
+		GFP_KERNEL_ACCOUNT, node);
+	if (!pn->atomic_counter_per_node)
+		goto fail;
+#endif
 
 	lruvec_init(&pn->lruvec);
 	pn->memcg = memcg;
@@ -4438,7 +4654,7 @@ static void mem_cgroup_stat_aggregate(struct aggregate_control *ac)
 	}
 }
 
-#ifdef CONFIG_MEMCG_NMI_SAFETY_REQUIRES_ATOMIC
+#if defined(CONFIG_MEMCG_NMI_SAFETY_REQUIRES_ATOMIC) && defined(CONFIG_MEMCG_RSTAT_COUNTER)
 static void flush_nmi_stats(struct mem_cgroup *memcg, struct mem_cgroup *parent,
 			    int cpu)
 {
@@ -4930,12 +5146,33 @@ static inline unsigned long lruvec_page_state_output(struct lruvec *lruvec,
 		memcg_page_state_output_unit(item);
 }
 
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER
+static inline unsigned long lruvec_page_state_atomic_counter_output(
+	struct lruvec *lruvec, int item)
+{
+	return lruvec_page_state_atomic_counter(lruvec, item) *
+		memcg_page_state_output_unit(item);
+}
+#endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
+
 static int memory_numa_stat_show(struct seq_file *m, void *v)
 {
 	int i;
 	struct mem_cgroup *memcg = mem_cgroup_from_seq(m);
 
+#ifdef CONFIG_MEMCG_STAT_COMPARISON
+	/* Force flush to ensure rstat values are up-to-date for comparison */
+#ifdef CONFIG_MEMCG_RSTAT_COUNTER
+	__mem_cgroup_flush_stats(memcg, true);
+#endif
+#else
+	/* Normal flush (or no flush if atomic counter only) */
+#ifdef CONFIG_MEMCG_RSTAT_COUNTER
 	mem_cgroup_flush_stats(memcg);
+#endif
+#endif /* CONFIG_MEMCG_STAT_COMPARISON */
+
+	memcg_atomic_flush_pending_only(memcg);
 
 	for (i = 0; i < ARRAY_SIZE(memory_stats); i++) {
 		int nid;
@@ -4943,6 +5180,7 @@ static int memory_numa_stat_show(struct seq_file *m, void *v)
 		if (memory_stats[i].idx >= NR_VM_NODE_STAT_ITEMS)
 			continue;
 
+#ifdef CONFIG_MEMCG_RSTAT_COUNTER
 		seq_printf(m, "%s", memory_stats[i].name);
 		for_each_node_state(nid, N_MEMORY) {
 			u64 size;
@@ -4954,6 +5192,41 @@ static int memory_numa_stat_show(struct seq_file *m, void *v)
 			seq_printf(m, " N%d=%llu", nid, size);
 		}
 		seq_putc(m, '\n');
+#endif /* CONFIG_MEMCG_RSTAT_COUNTER */
+
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER
+		if (likely(memcg->atomic_counter)) {
+			seq_printf(m, "%s_atomic", memory_stats[i].name);
+			for_each_node_state(nid, N_MEMORY) {
+				u64 size_atomic;
+				u64 size_rstat = 0;
+				int stat_idx =
+					memcg_stats_index(memory_stats[i].idx);
+
+				size_atomic = memcg_atomic_counter_numa_sum(memcg,
+									    nid,
+									    stat_idx);
+				size_atomic *= memcg_page_state_output_unit(
+						memory_stats[i].idx);
+
+#ifdef CONFIG_MEMCG_STAT_COMPARISON
+#ifdef CONFIG_MEMCG_RSTAT_COUNTER
+				size_rstat = lruvec_page_state_output(
+					mem_cgroup_lruvec(memcg, NODE_DATA(nid)),
+					memory_stats[i].idx);
+#endif /* CONFIG_MEMCG_RSTAT_COUNTER */
+
+				s64 diff = (s64)size_rstat - (s64)size_atomic;
+
+				seq_printf(m, " N%d=%llu (rstat=%llu diff=%lld)",
+					   nid, size_atomic, size_rstat, diff);
+#else
+				seq_printf(m, " N%d=%llu", nid, size_atomic);
+#endif /* CONFIG_MEMCG_STAT_COMPARISON */
+			}
+			seq_putc(m, '\n');
+		}
+#endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
 	}
 
 	return 0;

@@ -1070,7 +1070,6 @@ config MEMCG_ATOMIC_COUNTER
 	  Cons:
 	    - Potential cache line bouncing on writes
 	    - NOT compatible with cgroup v1 (v1 requires local statistics)
-	    - NO per-NUMA-node statistics (only cgroup-level aggregation)
 	    - Read path O(descendants) complexity for deep cgroup trees
 
 	  IMPORTANT LIMITATIONS:
@@ -1078,11 +1077,11 @@ config MEMCG_ATOMIC_COUNTER
 	     They cannot provide local (non-hierarchical) statistics required
 	     by cgroup v1. This option is only available for cgroup v2.
 
-	  2. NO per-node statistics: Atomic counters maintain only per-cgroup
-	     totals, not per-NUMA-node breakdowns. Code paths requiring
-	     per-node data (e.g., some NUMA-aware reclaim heuristics) will
-	     see inaccurate or zero values. memory.stat output aggregates
-	     correctly, but per-node derivatives are NOT supported.
+	  2. Per-node statistics: Atomic counters now support per-NUMA-node
+	     statistics (similar to lruvec_stats). Per-node breakdowns are
+	     available via memory.numa_stat. However, code paths requiring
+	     per-node data may still see timing differences between rstat
+	     and atomic counter values due to different update mechanisms.
 
 	  3. Performance trade-off: Faster reads O(tree depth) but slower
 	     for very deep cgroup hierarchies. Best for small-to-medium

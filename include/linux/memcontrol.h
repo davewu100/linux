@@ -75,6 +75,9 @@ struct memcg1_events_percpu;
 struct memcg_vmstats;
 struct lruvec_stats_percpu;
 struct lruvec_stats;
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER
+struct memcg_atomic_counter_per_node;
+#endif
 
 struct mem_cgroup_reclaim_iter {
 	struct mem_cgroup *position;
@@ -93,6 +96,10 @@ struct mem_cgroup_per_node {
 	struct lruvec_stats_percpu __percpu	*lruvec_stats_percpu;
 	struct lruvec_stats			*lruvec_stats;
 	struct shrinker_info __rcu	*shrinker_info;
+
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER
+	struct memcg_atomic_counter_per_node	*atomic_counter_per_node;
+#endif
 
 #ifdef CONFIG_MEMCG_V1
 	/*
@@ -967,6 +974,10 @@ unsigned long memcg_page_state(struct mem_cgroup *memcg, int idx);
 unsigned long lruvec_page_state(struct lruvec *lruvec, enum node_stat_item idx);
 unsigned long lruvec_page_state_local(struct lruvec *lruvec,
 				      enum node_stat_item idx);
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER
+unsigned long lruvec_page_state_atomic_counter(struct lruvec *lruvec,
+						enum node_stat_item idx);
+#endif
 
 void mem_cgroup_flush_stats(struct mem_cgroup *memcg);
 void mem_cgroup_flush_stats_ratelimited(struct mem_cgroup *memcg);
