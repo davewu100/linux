@@ -262,6 +262,9 @@ struct mem_cgroup {
 	struct list_head atomic_children;	/* list of child memcgs */
 	struct list_head atomic_sibling;	/* linked to parent's atomic_children */
 	spinlock_t atomic_children_lock;	/* for list add/remove; traversal uses RCU */
+
+	/* Lightweight cache for batch-read stats (2 second TTL) */
+	struct memcg_atomic_cache *atomic_cache;
 #endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
 
 #ifdef CONFIG_MEMCG_NMI_SAFETY_REQUIRES_ATOMIC
