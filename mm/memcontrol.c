@@ -61,6 +61,7 @@
 #include <linux/resume_user_mode.h>
 #include <linux/psi.h>
 #include <linux/seq_buf.h>
+#include <linux/jiffies.h>
 #include <linux/sched/isolation.h>
 #include <linux/kmemleak.h>
 #include "internal.h"
@@ -579,6 +580,15 @@ struct memcg_atomic_counter {
 	atomic64_t		state[MEMCG_VMSTAT_SIZE];
 	atomic64_t		events[NR_MEMCG_EVENTS];
 } ____cacheline_aligned_in_smp;
+
+/* Align with rstat flush cadence (approx. 2 seconds) */
+#define MEMCG_ATOMIC_CACHE_TTL (2ULL * HZ)
+
+struct memcg_atomic_cache {
+	u64 stats[MEMCG_VMSTAT_SIZE];
+	unsigned long events[NR_MEMCG_EVENTS];
+	u64 last_updated;
+};
 #endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
 
 struct memcg_vmstats {
@@ -909,6 +919,71 @@ static int memcg_page_state_atomic_counter_batch(struct mem_cgroup *memcg,
 	return 0;
 }
 
+static int memcg_events_atomic_counter_batch(struct mem_cgroup *memcg,
+					     unsigned long *results)
+{
+	struct mem_cgroup *child;
+	struct memcg_atomic_counter *counter;
+	int i, j;
+
+	counter = READ_ONCE(memcg->atomic_counter);
+	if (unlikely(!counter))
+		return -1;
+
+	for (i = 0; i < NR_MEMCG_EVENTS; i++)
+		results[i] = (unsigned long)atomic64_read(&counter->events[i]);
+
+	if (list_empty(&memcg->atomic_children))
+		return 0;
+
+	rcu_read_lock();
+	list_for_each_entry_rcu(child, &memcg->atomic_children, atomic_sibling) {
+		unsigned long child_results[NR_MEMCG_EVENTS];
+
+		if (memcg_events_atomic_counter_batch(child, child_results) == 0) {
+			for (j = 0; j < NR_MEMCG_EVENTS; j++)
+				results[j] += child_results[j];
+		}
+	}
+	rcu_read_unlock();
+
+	return 0;
+}
+
+static inline bool memcg_atomic_cache_is_fresh(const struct memcg_atomic_cache *cache)
+{
+	return cache &&
+		time_before64(jiffies_64,
+			      cache->last_updated + MEMCG_ATOMIC_CACHE_TTL);
+}
+
+static void memcg_atomic_cache_store(struct mem_cgroup *memcg,
+				     const u64 *stats,
+				     const unsigned long *events)
+{
+	struct memcg_atomic_cache *inactive, *active;
+
+	spin_lock(&memcg->atomic_cache_lock);
+
+	inactive = memcg->atomic_cache_inactive;
+	if (!inactive) {
+		spin_unlock(&memcg->atomic_cache_lock);
+		return;
+	}
+
+	memcpy(inactive->stats, stats, sizeof(inactive->stats));
+	memcpy(inactive->events, events, sizeof(inactive->events));
+	inactive->last_updated = jiffies_64;
+
+	active = rcu_dereference_protected(memcg->atomic_cache,
+		lockdep_is_held(&memcg->atomic_cache_lock));
+
+	rcu_assign_pointer(memcg->atomic_cache, inactive);
+	memcg->atomic_cache_inactive = active;
+
+	spin_unlock(&memcg->atomic_cache_lock);
+}
+
 /**
  * memcg_events_atomic_counter_recursive - read atomic counter events recursively
  * @memcg: the memory cgroup
@@ -919,8 +994,9 @@ static int memcg_page_state_atomic_counter_batch(struct mem_cgroup *memcg,
  *
  * Returns: aggregated event count including all descendants
  */
-static unsigned long memcg_events_atomic_counter_recursive(struct mem_cgroup *memcg,
-							    enum vm_event_item idx)
+static unsigned long __maybe_unused
+memcg_events_atomic_counter_recursive(struct mem_cgroup *memcg,
+				      enum vm_event_item idx)
 {
 	struct mem_cgroup *child;
 	struct memcg_atomic_counter *counter;
@@ -1844,7 +1920,13 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 	int i;
 #ifdef CONFIG_MEMCG_ATOMIC_COUNTER
 	u64 atomic_results[MEMCG_VMSTAT_SIZE];
+	unsigned long atomic_event_results[NR_MEMCG_EVENTS];
+	const u64 *atomic_stats_view = NULL;
+	const unsigned long *atomic_events_view = NULL;
+	struct memcg_atomic_cache *cache_snapshot = NULL;
 	bool atomic_available = false;
+	bool atomic_events_available = false;
+	bool cache_locked = false;
 #endif
 
 	/*
@@ -1872,8 +1954,36 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 	memcg_atomic_flush_pending_only(memcg);
 	/* Batch read all atomic counter stats in a single tree traversal */
 	if (likely(memcg->atomic_counter)) {
-		atomic_available = (memcg_page_state_atomic_counter_batch(
-					memcg, atomic_results) == 0);
+		rcu_read_lock();
+		cache_snapshot = rcu_dereference(memcg->atomic_cache);
+		if (memcg_atomic_cache_is_fresh(cache_snapshot)) {
+			atomic_stats_view = cache_snapshot->stats;
+			atomic_events_view = cache_snapshot->events;
+			atomic_available = true;
+			atomic_events_available = true;
+			cache_locked = true;
+		} else {
+			rcu_read_unlock();
+			cache_snapshot = NULL;
+		}
+
+		if (!atomic_available &&
+		    memcg_page_state_atomic_counter_batch(memcg,
+							  atomic_results) == 0) {
+			atomic_stats_view = atomic_results;
+			atomic_available = true;
+		}
+
+		if (!atomic_events_available &&
+		    memcg_events_atomic_counter_batch(memcg,
+						      atomic_event_results) == 0) {
+			atomic_events_view = atomic_event_results;
+			atomic_events_available = true;
+		}
+
+		if (!cache_locked && atomic_available && atomic_events_available)
+			memcg_atomic_cache_store(memcg, atomic_results,
+						 atomic_event_results);
 	}
 #endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
 
@@ -1895,7 +2005,7 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 #ifdef CONFIG_MEMCG_ATOMIC_COUNTER
 		if (atomic_available) {
 			int stat_idx = memcg_stats_index(idx);
-			u64 size_atomic = atomic_results[stat_idx];
+			u64 size_atomic = atomic_stats_view[stat_idx];
 
 			size_atomic *= memcg_page_state_output_unit(idx);
 
@@ -1926,9 +2036,9 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 				int slab_reclaimable_idx =
 					memcg_stats_index(NR_SLAB_RECLAIMABLE_B);
 				u64 slab_unreclaimable_atomic =
-					atomic_results[slab_unreclaimable_idx];
+					atomic_stats_view[slab_unreclaimable_idx];
 				u64 slab_reclaimable_atomic =
-					atomic_results[slab_reclaimable_idx];
+					atomic_stats_view[slab_reclaimable_idx];
 				slab_unreclaimable_atomic *=
 					memcg_page_state_output_unit(NR_SLAB_UNRECLAIMABLE_B);
 				slab_reclaimable_atomic *=
@@ -1962,12 +2072,12 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 #endif /* CONFIG_MEMCG_RSTAT_COUNTER */
 
 #ifdef CONFIG_MEMCG_ATOMIC_COUNTER
-	if (likely(memcg->atomic_counter)) {
+	if (atomic_events_available) {
 		unsigned long pgscan_atomic =
-			memcg_events_atomic_counter_recursive(memcg, PGSCAN_KSWAPD) +
-			memcg_events_atomic_counter_recursive(memcg, PGSCAN_DIRECT) +
-			memcg_events_atomic_counter_recursive(memcg, PGSCAN_PROACTIVE) +
-			memcg_events_atomic_counter_recursive(memcg, PGSCAN_KHUGEPAGED);
+			atomic_events_view[memcg_events_index(PGSCAN_KSWAPD)] +
+			atomic_events_view[memcg_events_index(PGSCAN_DIRECT)] +
+			atomic_events_view[memcg_events_index(PGSCAN_PROACTIVE)] +
+			atomic_events_view[memcg_events_index(PGSCAN_KHUGEPAGED)];
 
 #ifdef CONFIG_MEMCG_STAT_COMPARISON
 		/* Show comparison between rstat and atomic counter for pgscan */
@@ -1993,12 +2103,12 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 #endif /* CONFIG_MEMCG_RSTAT_COUNTER */
 
 #ifdef CONFIG_MEMCG_ATOMIC_COUNTER
-	if (likely(memcg->atomic_counter)) {
+	if (atomic_events_available) {
 		unsigned long pgsteal_atomic =
-			memcg_events_atomic_counter_recursive(memcg, PGSTEAL_KSWAPD) +
-			memcg_events_atomic_counter_recursive(memcg, PGSTEAL_DIRECT) +
-			memcg_events_atomic_counter_recursive(memcg, PGSTEAL_PROACTIVE) +
-			memcg_events_atomic_counter_recursive(memcg, PGSTEAL_KHUGEPAGED);
+			atomic_events_view[memcg_events_index(PGSTEAL_KSWAPD)] +
+			atomic_events_view[memcg_events_index(PGSTEAL_DIRECT)] +
+			atomic_events_view[memcg_events_index(PGSTEAL_PROACTIVE)] +
+			atomic_events_view[memcg_events_index(PGSTEAL_KHUGEPAGED)];
 
 #ifdef CONFIG_MEMCG_STAT_COMPARISON
 		/* Show comparison between rstat and atomic counter for pgsteal */
@@ -2031,9 +2141,12 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 #endif /* CONFIG_MEMCG_RSTAT_COUNTER */
 
 #ifdef CONFIG_MEMCG_ATOMIC_COUNTER
-		if (likely(memcg->atomic_counter)) {
-			unsigned long count_atomic = memcg_events_atomic_counter_recursive(
-					memcg, memcg_vm_event_stat[i]);
+		if (atomic_events_available) {
+			enum vm_event_item event_item =
+				memcg_vm_event_stat[i];
+			int event_idx = memcg_events_index(event_item);
+			unsigned long count_atomic =
+				atomic_events_view[event_idx];
 
 #ifdef CONFIG_MEMCG_STAT_COMPARISON
 			/* Show comparison between rstat and atomic counter */
@@ -2051,6 +2164,11 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 		}
 #endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
 	}
+
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER
+	if (cache_locked)
+		rcu_read_unlock();
+#endif
 }
 
 static void memory_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
@@ -4277,6 +4395,8 @@ static void __mem_cgroup_free(struct mem_cgroup *memcg)
 	 * all readers using list_for_each_entry_rcu() have completed.
 	 */
 	kfree(memcg->atomic_counter);
+	kfree(memcg->atomic_cache);
+	kfree(memcg->atomic_cache_inactive);
 #endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
 	kfree(memcg);
 }
@@ -4320,14 +4440,23 @@ static struct mem_cgroup *mem_cgroup_alloc(struct mem_cgroup *parent)
 #ifdef CONFIG_MEMCG_ATOMIC_COUNTER
 	/* Allocate per-cgroup atomic counter stats (experimental) */
 	memcg->atomic_counter = kzalloc(sizeof(struct memcg_atomic_counter),
-						  GFP_KERNEL_ACCOUNT);
+					GFP_KERNEL_ACCOUNT);
 	if (unlikely(!memcg->atomic_counter))
 		goto fail;
+
+	memcg->atomic_cache = kzalloc(sizeof(struct memcg_atomic_cache),
+				      GFP_KERNEL_ACCOUNT);
+	memcg->atomic_cache_inactive = kzalloc(sizeof(struct memcg_atomic_cache),
+					       GFP_KERNEL_ACCOUNT);
+	if (unlikely(!memcg->atomic_cache || !memcg->atomic_cache_inactive))
+		goto fail;
+	RCU_INIT_POINTER(memcg->atomic_cache, memcg->atomic_cache);
 
 	/* Initialize atomic counter children list for hierarchical aggregation */
 	INIT_LIST_HEAD(&memcg->atomic_children);
 	INIT_LIST_HEAD(&memcg->atomic_sibling);
 	spin_lock_init(&memcg->atomic_children_lock);
+	spin_lock_init(&memcg->atomic_cache_lock);
 #endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
 
 	if (!memcg1_alloc_events(memcg))
