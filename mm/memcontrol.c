@@ -950,6 +950,65 @@ static int memcg_events_atomic_counter_batch(struct mem_cgroup *memcg,
 	return 0;
 }
 
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER
+static void memcg_atomic_transfer_to_parent(struct mem_cgroup *memcg)
+{
+	struct mem_cgroup *parent = parent_mem_cgroup(memcg);
+	struct memcg_atomic_counter *child_counter;
+	struct memcg_atomic_counter *parent_counter;
+	int i;
+
+	if (unlikely(!parent))
+		return;
+
+	child_counter = READ_ONCE(memcg->atomic_counter);
+	parent_counter = READ_ONCE(parent->atomic_counter);
+	if (unlikely(!child_counter || !parent_counter))
+		return;
+
+	for (i = 0; i < MEMCG_VMSTAT_SIZE; i++) {
+		s64 delta = atomic64_xchg(&child_counter->state[i], 0);
+
+		if (delta)
+			atomic64_add(delta, &parent_counter->state[i]);
+	}
+
+	for (i = 0; i < NR_MEMCG_EVENTS; i++) {
+		s64 delta = atomic64_xchg(&child_counter->events[i], 0);
+
+		if (delta)
+			atomic64_add(delta, &parent_counter->events[i]);
+	}
+
+	for_each_node_state(i, N_MEMORY) {
+		struct mem_cgroup_per_node *pn = memcg->nodeinfo[i];
+		struct mem_cgroup_per_node *ppn = parent->nodeinfo[i];
+		struct memcg_atomic_counter_per_node *child_node_counter;
+		struct memcg_atomic_counter_per_node *parent_node_counter;
+		int j;
+
+		if (unlikely(!pn || !ppn))
+			continue;
+
+		child_node_counter = READ_ONCE(pn->atomic_counter_per_node);
+		parent_node_counter = READ_ONCE(ppn->atomic_counter_per_node);
+		if (unlikely(!child_node_counter || !parent_node_counter))
+			continue;
+
+		for (j = 0; j < NR_MEMCG_NODE_STAT_ITEMS; j++) {
+			s64 delta = atomic64_xchg(&child_node_counter->state[j], 0);
+
+			if (delta)
+				atomic64_add(delta, &parent_node_counter->state[j]);
+		}
+	}
+}
+#else
+static inline void memcg_atomic_transfer_to_parent(struct mem_cgroup *memcg)
+{
+}
+#endif
+
 static inline bool memcg_atomic_cache_is_fresh(const struct memcg_atomic_cache *cache)
 {
 	return cache &&
@@ -1967,14 +2026,14 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 			cache_snapshot = NULL;
 		}
 
-		if (!atomic_available &&
+		if (unlikely(!atomic_available) &&
 		    memcg_page_state_atomic_counter_batch(memcg,
 							  atomic_results) == 0) {
 			atomic_stats_view = atomic_results;
 			atomic_available = true;
 		}
 
-		if (!atomic_events_available &&
+		if (unlikely(!atomic_events_available) &&
 		    memcg_events_atomic_counter_batch(memcg,
 						      atomic_event_results) == 0) {
 			atomic_events_view = atomic_event_results;
@@ -1988,7 +2047,6 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 #endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
 
 	for (i = 0; i < ARRAY_SIZE(memory_stats); i++) {
-		u64 size;
 		int idx = memory_stats[i].idx;
 
 #ifdef CONFIG_HUGETLB_PAGE
@@ -1998,7 +2056,8 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 #endif
 
 #ifdef CONFIG_MEMCG_RSTAT_COUNTER
-		size = memcg_page_state_output(memcg, idx);
+		u64 size = memcg_page_state_output(memcg, idx);
+
 		seq_buf_printf(s, "%s %llu\n", memory_stats[i].name, size);
 #endif /* CONFIG_MEMCG_RSTAT_COUNTER */
 
@@ -4655,6 +4714,8 @@ static void mem_cgroup_css_offline(struct cgroup_subsys_state *css)
 	 * Therefore, no explicit synchronize_rcu() or call_rcu() is needed here.
 	 */
 	if (!mem_cgroup_is_root(memcg)) {
+		memcg_atomic_transfer_to_parent(memcg);
+
 		struct mem_cgroup *parent = parent_mem_cgroup(memcg);
 
 		spin_lock(&parent->atomic_children_lock);
@@ -5327,24 +5388,20 @@ static int memory_numa_stat_show(struct seq_file *m, void *v)
 		if (likely(memcg->atomic_counter)) {
 			seq_printf(m, "%s_atomic", memory_stats[i].name);
 			for_each_node_state(nid, N_MEMORY) {
-				u64 size_atomic;
-				u64 size_rstat = 0;
 				int stat_idx =
 					memcg_stats_index(memory_stats[i].idx);
 
-				size_atomic = memcg_atomic_counter_numa_sum(memcg,
+				u64 size_atomic = memcg_atomic_counter_numa_sum(memcg,
 									    nid,
 									    stat_idx);
+
 				size_atomic *= memcg_page_state_output_unit(
 						memory_stats[i].idx);
 
 #ifdef CONFIG_MEMCG_STAT_COMPARISON
-#ifdef CONFIG_MEMCG_RSTAT_COUNTER
-				size_rstat = lruvec_page_state_output(
+				u64 size_rstat = lruvec_page_state_output(
 					mem_cgroup_lruvec(memcg, NODE_DATA(nid)),
 					memory_stats[i].idx);
-#endif /* CONFIG_MEMCG_RSTAT_COUNTER */
-
 				s64 diff = (s64)size_rstat - (s64)size_atomic;
 
 				seq_printf(m, " N%d=%llu (rstat=%llu diff=%lld)",
