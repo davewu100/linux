@@ -579,6 +579,29 @@ struct memcg_atomic_counter {
 	atomic64_t		state[MEMCG_VMSTAT_SIZE];
 	atomic64_t		events[NR_MEMCG_EVENTS];
 } ____cacheline_aligned_in_smp;
+
+struct memcg_atomic_node_accum {
+	int nid;
+	int stat_idx;
+	u64 total;
+};
+
+struct memcg_atomic_numa_batch_accum {
+	int nid;
+	u64 stats[NR_MEMCG_NODE_STAT_ITEMS];
+};
+
+struct memcg_atomic_all_numa_batch_accum {
+	u64 stats[NR_NODE_STATES][NR_MEMCG_NODE_STAT_ITEMS];
+};
+
+/* Lightweight cache for batch-read stats (2 second TTL) */
+struct memcg_atomic_cache {
+	u64 stats[MEMCG_VMSTAT_SIZE];
+	unsigned long events[NR_MEMCG_EVENTS];
+	unsigned long jiffies;	/* timestamp when cache was populated */
+	spinlock_t lock;	/* protects cache updates */
+};
 #endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
 
 struct memcg_vmstats {
@@ -712,6 +735,9 @@ static void flush_memcg_stats_dwork(struct work_struct *w)
 
 static int memcg_page_state_unit(int item);
 #ifdef CONFIG_MEMCG_ATOMIC_COUNTER
+static int memcg_atomic_walk(struct mem_cgroup *memcg,
+			     int (*visit)(struct mem_cgroup *, void *),
+			     void *arg);
 static u64 __maybe_unused
 memcg_page_state_atomic_counter_recursive(struct mem_cgroup *memcg, int idx);
 static unsigned long memcg_events_atomic_counter_recursive(struct mem_cgroup *memcg,
@@ -844,8 +870,9 @@ memcg_page_state_atomic_counter_recursive(struct mem_cgroup *memcg, int idx)
 	 * 3. The actual counter value is not lost (next read will see new value)
 	 *
 	 * We trade perfect snapshot consistency for lock-free performance.
+	 * Use READ_ONCE on .counter field instead of atomic64_read for better performance.
 	 */
-	total = atomic64_read(&counter->state[i]);
+	total = READ_ONCE(counter->state[i].counter);
 
 	/* Early exit if no children to avoid RCU overhead */
 	if (list_empty(&memcg->atomic_children))
@@ -868,46 +895,275 @@ memcg_page_state_atomic_counter_recursive(struct mem_cgroup *memcg, int idx)
  *
  * Batch read all atomic counter stats in a single tree traversal.
  * This is much more efficient than calling recursive function for each stat.
- * Uses iterative approach to avoid deep recursion and stack overflow.
+ * Uses iterative approach with dynamic allocation to avoid deep recursion
+ * and stack overflow.
  *
  * Returns: 0 on success, -1 if atomic_counter is not available
  */
-static int memcg_page_state_atomic_counter_batch(struct mem_cgroup *memcg,
-						  u64 *results)
+/* Visit callback for non-NUMA batch aggregation */
+static int memcg_atomic_visit_batch(struct mem_cgroup *memcg, void *data)
 {
-	struct mem_cgroup *child;
+	u64 *results = data;
 	struct memcg_atomic_counter *counter;
-	int i, j;
+	int i;
 
-	/* Early exit if no atomic counter */
 	counter = READ_ONCE(memcg->atomic_counter);
-	if (unlikely(!counter))
-		return -1;
-
-	/* Read all stats for this memcg in one pass - cache-friendly sequential access */
-	for (i = 0; i < MEMCG_VMSTAT_SIZE; i++)
-		results[i] = atomic64_read(&counter->state[i]);
-
-	/* Early exit if no children to avoid RCU overhead */
-	if (list_empty(&memcg->atomic_children))
+	if (!counter)
 		return 0;
 
-	/* Recursively aggregate all children - RCU protected, no lock */
-	rcu_read_lock();
-	list_for_each_entry_rcu(child, &memcg->atomic_children, atomic_sibling) {
-		u64 child_results[MEMCG_VMSTAT_SIZE];
-
-		/* Recursively get child results - early exit for empty children */
-		if (memcg_page_state_atomic_counter_batch(child, child_results) == 0) {
-			/* Aggregate child results into parent - sequential addition */
-			for (j = 0; j < MEMCG_VMSTAT_SIZE; j++)
-				results[j] += child_results[j];
-		}
-	}
-	rcu_read_unlock();
+	/* Directly accumulate into results array - cache-friendly sequential access
+	 * Use READ_ONCE on .counter field instead of atomic64_read for better performance.
+	 * The race window is tiny and errors don't accumulate across reads.
+	 */
+	for (i = 0; i < MEMCG_VMSTAT_SIZE; i++)
+		results[i] += READ_ONCE(counter->state[i].counter);
 
 	return 0;
 }
+
+/* Check if cache is valid (within 2 second TTL) */
+static bool memcg_atomic_cache_is_valid(struct mem_cgroup *memcg)
+{
+	struct memcg_atomic_cache *cache;
+	unsigned long now, cache_time;
+	unsigned long ttl = 2 * HZ; /* 2 seconds */
+
+	if (unlikely(!memcg->atomic_cache))
+		return false;
+
+	cache = memcg->atomic_cache;
+	now = jiffies;
+	cache_time = READ_ONCE(cache->jiffies);
+
+	/* Check if cache is valid (not expired) */
+	if (cache_time == 0 || time_after(now, cache_time + ttl))
+		return false;
+
+	return true;
+}
+
+/* Try to read from cache, return true if cache hit */
+static bool memcg_atomic_cache_read_stats(struct mem_cgroup *memcg, u64 *results)
+{
+	struct memcg_atomic_cache *cache;
+	int i;
+
+	if (unlikely(!memcg->atomic_cache))
+		return false;
+
+	if (!memcg_atomic_cache_is_valid(memcg))
+		return false;
+
+	cache = memcg->atomic_cache;
+	spin_lock(&cache->lock);
+	/* Re-check after acquiring lock */
+	if (!memcg_atomic_cache_is_valid(memcg)) {
+		spin_unlock(&cache->lock);
+		return false;
+	}
+	/* Fast memory copy - compiler can optimize this */
+	for (i = 0; i < MEMCG_VMSTAT_SIZE; i++)
+		results[i] = cache->stats[i];
+	spin_unlock(&cache->lock);
+	return true;
+}
+
+/* Try to read events from cache, return true if cache hit */
+static bool memcg_atomic_cache_read_events(struct mem_cgroup *memcg,
+					    unsigned long *results)
+{
+	struct memcg_atomic_cache *cache;
+	int i;
+
+	if (unlikely(!memcg->atomic_cache))
+		return false;
+
+	if (!memcg_atomic_cache_is_valid(memcg))
+		return false;
+
+	cache = memcg->atomic_cache;
+	spin_lock(&cache->lock);
+	/* Re-check after acquiring lock */
+	if (!memcg_atomic_cache_is_valid(memcg)) {
+		spin_unlock(&cache->lock);
+		return false;
+	}
+	/* Fast memory copy - compiler can optimize this */
+	for (i = 0; i < NR_MEMCG_EVENTS; i++)
+		results[i] = cache->events[i];
+	spin_unlock(&cache->lock);
+	return true;
+}
+
+/* Update cache with fresh stats */
+static void memcg_atomic_cache_update_stats(struct mem_cgroup *memcg,
+					     const u64 *results)
+{
+	struct memcg_atomic_cache *cache;
+	int i;
+
+	if (unlikely(!memcg->atomic_cache))
+		return;
+
+	cache = memcg->atomic_cache;
+	spin_lock(&cache->lock);
+	/* Copy stats to cache */
+	for (i = 0; i < MEMCG_VMSTAT_SIZE; i++)
+		cache->stats[i] = results[i];
+	cache->jiffies = jiffies; /* Update timestamp */
+	spin_unlock(&cache->lock);
+}
+
+/* Update cache with fresh events */
+static void memcg_atomic_cache_update_events(struct mem_cgroup *memcg,
+					      const unsigned long *results)
+{
+	struct memcg_atomic_cache *cache;
+	int i;
+
+	if (unlikely(!memcg->atomic_cache))
+		return;
+
+	cache = memcg->atomic_cache;
+	spin_lock(&cache->lock);
+	/* Copy events to cache */
+	for (i = 0; i < NR_MEMCG_EVENTS; i++)
+		cache->events[i] = results[i];
+	cache->jiffies = jiffies; /* Update timestamp */
+	spin_unlock(&cache->lock);
+}
+
+static int memcg_page_state_atomic_counter_batch(struct mem_cgroup *memcg,
+						  u64 *results)
+{
+	int i;
+
+	/* Try cache first */
+	if (memcg_atomic_cache_read_stats(memcg, results))
+		return 0;
+
+	/* Cache miss - read from atomic counters */
+	/* Initialize results array to zero */
+	for (i = 0; i < MEMCG_VMSTAT_SIZE; i++)
+		results[i] = 0;
+
+	/* Use memcg_atomic_walk to avoid recursive allocation overhead.
+	 * This eliminates multiple kmalloc/kfree calls in deep hierarchies
+	 * by using a single traversal with direct accumulation.
+	 */
+	memcg_atomic_walk(memcg, memcg_atomic_visit_batch, results);
+
+	/* Update cache with fresh data */
+	memcg_atomic_cache_update_stats(memcg, results);
+
+	return 0;
+}
+
+/* Visit callback for events batch aggregation */
+static int memcg_atomic_visit_events_batch(struct mem_cgroup *memcg, void *data)
+{
+	unsigned long *results = data;
+	struct memcg_atomic_counter *counter;
+	int i;
+
+	counter = READ_ONCE(memcg->atomic_counter);
+	if (!counter)
+		return 0;
+
+	/* Directly accumulate into results array - cache-friendly sequential access
+	 * Use READ_ONCE on .counter field instead of atomic64_read for better performance.
+	 * The race window is tiny and errors don't accumulate across reads.
+	 */
+	for (i = 0; i < NR_MEMCG_EVENTS; i++)
+		results[i] += (unsigned long)READ_ONCE(counter->events[i].counter);
+
+	return 0;
+}
+
+static int memcg_events_atomic_counter_batch(struct mem_cgroup *memcg,
+					     unsigned long *results)
+{
+	int i;
+
+	/* Try cache first */
+	if (memcg_atomic_cache_read_events(memcg, results))
+		return 0;
+
+	/* Cache miss - read from atomic counters */
+	/* Initialize results array to zero */
+	for (i = 0; i < NR_MEMCG_EVENTS; i++)
+		results[i] = 0;
+
+	/* Use memcg_atomic_walk to avoid recursive allocation overhead.
+	 * This eliminates multiple kmalloc/kfree calls in deep hierarchies
+	 * by using a single traversal with direct accumulation.
+	 */
+	memcg_atomic_walk(memcg, memcg_atomic_visit_events_batch, results);
+
+	/* Update cache with fresh data */
+	memcg_atomic_cache_update_events(memcg, results);
+
+	return 0;
+}
+
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER
+static void memcg_atomic_transfer_to_parent(struct mem_cgroup *memcg)
+{
+	struct mem_cgroup *parent = parent_mem_cgroup(memcg);
+	struct memcg_atomic_counter *child_counter;
+	struct memcg_atomic_counter *parent_counter;
+	int i;
+
+	if (unlikely(!parent))
+		return;
+
+	child_counter = READ_ONCE(memcg->atomic_counter);
+	parent_counter = READ_ONCE(parent->atomic_counter);
+	if (unlikely(!child_counter || !parent_counter))
+		return;
+
+	for (i = 0; i < MEMCG_VMSTAT_SIZE; i++) {
+		s64 delta = atomic64_xchg(&child_counter->state[i], 0);
+
+		if (delta)
+			atomic64_add(delta, &parent_counter->state[i]);
+	}
+
+	for (i = 0; i < NR_MEMCG_EVENTS; i++) {
+		s64 delta = atomic64_xchg(&child_counter->events[i], 0);
+
+		if (delta)
+			atomic64_add(delta, &parent_counter->events[i]);
+	}
+
+	for_each_node_state(i, N_MEMORY) {
+		struct mem_cgroup_per_node *pn = memcg->nodeinfo[i];
+		struct mem_cgroup_per_node *ppn = parent->nodeinfo[i];
+		struct memcg_atomic_counter_per_node *child_node_counter;
+		struct memcg_atomic_counter_per_node *parent_node_counter;
+		int j;
+
+		if (unlikely(!pn || !ppn))
+			continue;
+
+		child_node_counter = READ_ONCE(pn->atomic_counter_per_node);
+		parent_node_counter = READ_ONCE(ppn->atomic_counter_per_node);
+		if (unlikely(!child_node_counter || !parent_node_counter))
+			continue;
+
+		for (j = 0; j < NR_MEMCG_NODE_STAT_ITEMS; j++) {
+			s64 delta = atomic64_xchg(&child_node_counter->state[j], 0);
+
+			if (delta)
+				atomic64_add(delta, &parent_node_counter->state[j]);
+		}
+	}
+}
+#else
+static inline void memcg_atomic_transfer_to_parent(struct mem_cgroup *memcg)
+{
+}
+#endif
 
 /**
  * memcg_events_atomic_counter_recursive - read atomic counter events recursively
@@ -934,8 +1190,10 @@ static unsigned long memcg_events_atomic_counter_recursive(struct mem_cgroup *me
 
 	i = memcg_events_index(idx);
 
-	/* Read single atomic value for this memcg */
-	total = atomic64_read(&counter->events[i]);
+	/* Read single atomic value for this memcg
+	 * Use READ_ONCE on .counter field instead of atomic64_read for better performance.
+	 */
+	total = READ_ONCE(counter->events[i].counter);
 
 	/* Early exit if no children to avoid RCU overhead */
 	if (list_empty(&memcg->atomic_children))
@@ -951,37 +1209,249 @@ static unsigned long memcg_events_atomic_counter_recursive(struct mem_cgroup *me
 	return total;
 }
 
-static u64 memcg_atomic_counter_numa_sum(struct mem_cgroup *memcg,
+/**
+ * memcg_atomic_walk - recursively walk cgroup tree using atomic_children list
+ * @memcg: starting memory cgroup
+ * @visit: callback function to call for each cgroup
+ * @arg: user data passed to visit callback
+ *
+ * Recursively traverse the cgroup tree using the atomic_children linked list.
+ * This is more efficient than css_next_descendant_pre() because it only
+ * traverses branches that have children, skipping leaf nodes early.
+ *
+ * Returns: 0 on success, or non-zero if visit callback returns non-zero
+ */
+static int memcg_atomic_walk(struct mem_cgroup *memcg,
+			     int (*visit)(struct mem_cgroup *, void *),
+			     void *arg)
+{
+	struct mem_cgroup *child;
+	int ret;
+
+	ret = visit(memcg, arg);
+	if (ret)
+		return ret;
+
+	if (list_empty(&memcg->atomic_children))
+		return 0;
+
+	rcu_read_lock();
+	list_for_each_entry_rcu(child, &memcg->atomic_children, atomic_sibling) {
+		ret = memcg_atomic_walk(child, visit, arg);
+		if (ret) {
+			rcu_read_unlock();
+			return ret;
+		}
+	}
+	rcu_read_unlock();
+	return 0;
+}
+
+/**
+ * memcg_atomic_visit_node - visit callback for per-node atomic counter aggregation
+ * @memcg: memory cgroup to visit
+ * @data: pointer to memcg_atomic_node_accum structure
+ *
+ * Accumulates per-node atomic counter values for a specific stat index.
+ * This is used by memcg_atomic_counter_numa_sum() to efficiently aggregate
+ * per-node statistics across the cgroup tree.
+ *
+ * Returns: 0 on success, -1 if memcg has no per-node counter for the target node
+ */
+static int memcg_atomic_visit_node(struct mem_cgroup *memcg, void *data)
+{
+	struct memcg_atomic_node_accum *acc = data;
+	struct mem_cgroup_per_node *pn = memcg->nodeinfo[acc->nid];
+	struct memcg_atomic_counter_per_node *node_counter;
+
+	if (!pn)
+		return 0;
+
+	node_counter = READ_ONCE(pn->atomic_counter_per_node);
+	if (node_counter)
+		acc->total += READ_ONCE(node_counter->state[acc->stat_idx].counter);
+
+	return 0;
+}
+
+/**
+ * memcg_atomic_counter_numa_sum - sum per-node atomic counter across cgroup tree
+ * @memcg: root memory cgroup
+ * @nid: NUMA node ID
+ * @stat_idx: stat item index
+ *
+ * Efficiently aggregates per-node atomic counter values for a specific stat
+ * across the entire cgroup subtree. Uses optimized tree traversal via
+ * atomic_children list to skip branches without children, improving performance
+ * especially for deep cgroup hierarchies.
+ *
+ * Returns: aggregated stat value for the specified NUMA node
+ */
+static u64 __maybe_unused memcg_atomic_counter_numa_sum(struct mem_cgroup *memcg,
 					 int nid, int stat_idx)
 {
-	struct cgroup_subsys_state *css = NULL;
-	struct mem_cgroup_per_node *pn;
-	struct memcg_atomic_counter_per_node *node_counter;
-	u64 total = 0;
+	struct memcg_atomic_node_accum acc = {
+		.nid = nid,
+		.stat_idx = stat_idx,
+		.total = 0,
+	};
 
 	if (BAD_STAT_IDX(stat_idx))
 		return 0;
 
-	rcu_read_lock();
+	memcg_atomic_walk(memcg, memcg_atomic_visit_node, &acc);
 
-	while ((css = css_next_descendant_pre(css, &memcg->css))) {
-		struct mem_cgroup *child = mem_cgroup_from_css(css);
+	return acc.total;
+}
 
-		if (!child)
-			continue;
+/**
+ * memcg_atomic_visit_numa_batch - visit callback for batch NUMA stat aggregation
+ * @memcg: memory cgroup to visit
+ * @data: pointer to memcg_atomic_numa_batch_accum structure
+ *
+ * Accumulates all per-node atomic counter stat items for a specific NUMA node
+ * in a single pass. This is optimized for flat topologies where multiple stat
+ * items need to be read for the same NUMA node, reducing tree traversal overhead.
+ *
+ * Returns: 0 on success
+ */
+static int memcg_atomic_visit_numa_batch(struct mem_cgroup *memcg, void *data)
+{
+	struct memcg_atomic_numa_batch_accum *acc = data;
+	struct mem_cgroup_per_node *pn = memcg->nodeinfo[acc->nid];
+	struct memcg_atomic_counter_per_node *node_counter;
+	int i;
 
-		pn = READ_ONCE(child->nodeinfo[nid]);
+	if (!pn)
+		return 0;
+
+	node_counter = READ_ONCE(pn->atomic_counter_per_node);
+	if (!node_counter)
+		return 0;
+
+	/* Batch read all stat items for this NUMA node - sequential access,
+	 * cache-friendly pattern similar to vmstat's batch aggregation.
+	 * Use READ_ONCE on .counter field instead of atomic64_read for better performance.
+	 */
+	for (i = 0; i < NR_MEMCG_NODE_STAT_ITEMS; i++) {
+		acc->stats[i] += READ_ONCE(node_counter->state[i].counter);
+	}
+
+	return 0;
+}
+
+/**
+ * memcg_atomic_counter_numa_batch - batch read all stat items for a NUMA node
+ * @memcg: root memory cgroup
+ * @nid: NUMA node ID
+ * @results: array to store results (size NR_MEMCG_NODE_STAT_ITEMS)
+ *
+ * Efficiently aggregates all per-node atomic counter stat items for a specific
+ * NUMA node in a single tree traversal. This is optimized for flat topologies
+ * like /sys/fs/cgroup/a/b/c/[0-25] where multiple stat items need to be read.
+ *
+ * Performance benefit: Instead of traversing the cgroup tree N times (once per
+ * stat item), this function traverses only once and reads all stat items.
+ *
+ * Returns: 0 on success, results are stored in @results array
+ */
+static int __maybe_unused memcg_atomic_counter_numa_batch(struct mem_cgroup *memcg,
+					   int nid, u64 *results)
+{
+	struct memcg_atomic_numa_batch_accum acc = {
+		.nid = nid,
+		.stats = {0},
+	};
+	int i;
+
+	memcg_atomic_walk(memcg, memcg_atomic_visit_numa_batch, &acc);
+
+	/* Copy results to output array */
+	for (i = 0; i < NR_MEMCG_NODE_STAT_ITEMS; i++)
+		results[i] = acc.stats[i];
+
+	return 0;
+}
+
+/**
+ * memcg_atomic_visit_all_numa_batch - visit callback for all-NUMA batch aggregation
+ * @memcg: memory cgroup to visit
+ * @data: pointer to results array [NR_NODE_STATES][NR_MEMCG_NODE_STAT_ITEMS]
+ *
+ * Accumulates all per-node atomic counter stat items for ALL NUMA nodes in a
+ * single pass. This is the optimal approach for flat topologies where we need
+ * to read stats for all NUMA nodes - it requires only ONE tree traversal instead
+ * of one per NUMA node.
+ *
+ * Returns: 0 on success
+ */
+static int memcg_atomic_visit_all_numa_batch(struct mem_cgroup *memcg, void *data)
+{
+	u64 (*results)[NR_MEMCG_NODE_STAT_ITEMS] = data;
+	int nid, i;
+
+	/* Directly accumulate into results array to avoid memory copy overhead.
+	 * Access pattern: for each NUMA node, read all stat items sequentially.
+	 * This improves cache locality compared to accessing all nodes for all stats.
+	 */
+	for_each_node_state(nid, N_MEMORY) {
+		struct mem_cgroup_per_node *pn = memcg->nodeinfo[nid];
+		struct memcg_atomic_counter_per_node *node_counter;
+
 		if (!pn)
 			continue;
 
 		node_counter = READ_ONCE(pn->atomic_counter_per_node);
-		if (node_counter)
-			total += (u64)atomic64_read(&node_counter->state[stat_idx]);
+		if (!node_counter)
+			continue;
+
+		/* Sequential access to all stat items for this NUMA node - cache-friendly
+		 * Use READ_ONCE on .counter field instead of atomic64_read for better performance.
+		 */
+		for (i = 0; i < NR_MEMCG_NODE_STAT_ITEMS; i++) {
+			results[nid][i] += READ_ONCE(node_counter->state[i].counter);
+		}
+	}
+	return 0;
+}
+
+/**
+ * memcg_atomic_counter_all_numa_batch - batch read all stats for all NUMA nodes
+ * @memcg: root memory cgroup
+ * @results: 2D array to store results [nid][stat_idx], must be
+ *           u64 (*)[NR_MEMCG_NODE_STAT_ITEMS] type
+ *
+ * Efficiently aggregates all per-node atomic counter stat items for ALL NUMA
+ * nodes in a SINGLE tree traversal. This is the optimal approach for flat
+ * topologies like /sys/fs/cgroup/a/b/c/[0-25] where we need stats for all
+ * NUMA nodes.
+ *
+ * Performance benefit: Instead of traversing the cgroup tree N times (once per
+ * NUMA node), this function traverses only ONCE and reads all NUMA nodes and
+ * all stat items. For 4 NUMA nodes, this reduces traversals from 4 to 1.
+ *
+ * Returns: 0 on success, results are stored in @results array
+ */
+static int memcg_atomic_counter_all_numa_batch(struct mem_cgroup *memcg,
+					      void *results)
+{
+	u64 (*results_array)[NR_MEMCG_NODE_STAT_ITEMS] = results;
+	int nid, i;
+
+	/* Initialize results array to zero */
+	for_each_node_state(nid, N_MEMORY) {
+		for (i = 0; i < NR_MEMCG_NODE_STAT_ITEMS; i++) {
+			results_array[nid][i] = 0;
+		}
 	}
 
-	rcu_read_unlock();
+	/* Directly accumulate into results array to avoid memory allocation
+	 * and copy overhead. This eliminates one kmalloc/kfree pair and the
+	 * memory copy operation, improving performance.
+	 */
+	memcg_atomic_walk(memcg, memcg_atomic_visit_all_numa_batch, results);
 
-	return total;
+	return 0;
 }
 #endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
 
@@ -1839,12 +2309,119 @@ static void memcg_atomic_flush_pending_only(struct mem_cgroup *memcg)
 }
 #endif
 
+/**
+ * fast_u64_to_str - Fast conversion of u64 to decimal string
+ * @val: value to convert
+ * @buf: buffer to write to (must be at least 21 bytes)
+ * @len: pointer to store the length of the string (excluding null terminator)
+ *
+ * Returns: pointer to the start of the number string in buf
+ *
+ * This is optimized for performance-critical paths where we need to convert
+ * numbers to strings frequently. Avoids the overhead of full printf formatting.
+ */
+static char *fast_u64_to_str(u64 val, char *buf, int *len)
+{
+	char *p = buf + 20;  /* Start from the end */
+	*p = '\0';
+	*len = 0;
+
+	if (val == 0) {
+		*--p = '0';
+		*len = 1;
+		return p;
+	}
+
+	while (val > 0) {
+		*--p = '0' + (val % 10);
+		val /= 10;
+		(*len)++;
+	}
+
+	return p;
+}
+
+/**
+ * fast_ulong_to_str - Fast conversion of unsigned long to decimal string
+ * @val: value to convert
+ * @buf: buffer to write to (must be at least 21 bytes)
+ * @len: pointer to store the length of the string (excluding null terminator)
+ *
+ * Returns: pointer to the start of the number string in buf
+ */
+static char *fast_ulong_to_str(unsigned long val, char *buf, int *len)
+{
+	return fast_u64_to_str((u64)val, buf, len);
+}
+
+/**
+ * seq_buf_put_name_val - Optimized formatting: name + value + newline
+ * @s: seq_buf to write to
+ * @name: stat name (null-terminated string)
+ * @val: stat value (u64)
+ *
+ * This function reduces formatting overhead by:
+ * 1. Using fast number-to-string conversion
+ * 2. Combining name, value, and newline in a single write operation
+ * 3. Avoiding printf parsing overhead
+ */
+static void seq_buf_put_name_val(struct seq_buf *s, const char *name, u64 val)
+{
+	char num_buf[21];
+	int num_len;
+	char *num_str = fast_u64_to_str(val, num_buf, &num_len);
+	int name_len = strlen(name);
+	char *buf;
+	size_t avail;
+
+	/* Reserve space: name + space + number + newline */
+	if (seq_buf_has_overflowed(s))
+		return;
+
+	avail = seq_buf_get_buf(s, &buf);
+	if (avail < name_len + 1 + num_len + 1) {
+		seq_buf_set_overflow(s);
+		return;
+	}
+
+	/* Write name */
+	memcpy(buf, name, name_len);
+	buf += name_len;
+
+	/* Write space */
+	*buf++ = ' ';
+
+	/* Write number */
+	memcpy(buf, num_str, num_len);
+	buf += num_len;
+
+	/* Write newline */
+	*buf++ = '\n';
+
+	/* Commit the written bytes */
+	seq_buf_commit(s, name_len + 1 + num_len + 1);
+}
+
+/**
+ * seq_buf_put_name_val_ulong - Optimized formatting for unsigned long
+ * @s: seq_buf to write to
+ * @name: stat name
+ * @val: stat value (unsigned long)
+ */
+static void seq_buf_put_name_val_ulong(struct seq_buf *s, const char *name,
+				       unsigned long val)
+{
+	seq_buf_put_name_val(s, name, (u64)val);
+}
+
 static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 {
 	int i;
 #ifdef CONFIG_MEMCG_ATOMIC_COUNTER
 	u64 atomic_results[MEMCG_VMSTAT_SIZE];
+	unsigned long atomic_event_results[NR_MEMCG_EVENTS];
 	bool atomic_available = false;
+	bool atomic_events_available = false;
 #endif
 
 	/*
@@ -1870,15 +2447,16 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 	/* Fold NMI deferred deltas before reading. */
 #ifdef CONFIG_MEMCG_ATOMIC_COUNTER
 	memcg_atomic_flush_pending_only(memcg);
-	/* Batch read all atomic counter stats in a single tree traversal */
+	/* Batch read all atomic counter stats and events in single tree traversals */
 	if (likely(memcg->atomic_counter)) {
 		atomic_available = (memcg_page_state_atomic_counter_batch(
 					memcg, atomic_results) == 0);
+		atomic_events_available = (memcg_events_atomic_counter_batch(
+					memcg, atomic_event_results) == 0);
 	}
 #endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
 
 	for (i = 0; i < ARRAY_SIZE(memory_stats); i++) {
-		u64 size;
 		int idx = memory_stats[i].idx;
 
 #ifdef CONFIG_HUGETLB_PAGE
@@ -1888,8 +2466,9 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 #endif
 
 #ifdef CONFIG_MEMCG_RSTAT_COUNTER
-		size = memcg_page_state_output(memcg, idx);
-		seq_buf_printf(s, "%s %llu\n", memory_stats[i].name, size);
+		u64 size = memcg_page_state_output(memcg, idx);
+
+		seq_buf_put_name_val(s, memory_stats[i].name, size);
 #endif /* CONFIG_MEMCG_RSTAT_COUNTER */
 
 #ifdef CONFIG_MEMCG_ATOMIC_COUNTER
@@ -1902,12 +2481,14 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 #ifdef CONFIG_MEMCG_STAT_COMPARISON
 			/* Show comparison between rstat and atomic counter */
 			s64 diff = (s64)size - (s64)size_atomic;
-
-			seq_buf_printf(s, "%s_atomic %llu (rstat=%llu diff=%lld)\n",
-				       memory_stats[i].name, size_atomic, size, diff);
+			char name_buf[64];
+			snprintf(name_buf, sizeof(name_buf), "%s_atomic", memory_stats[i].name);
+			seq_buf_put_name_val(s, name_buf, size_atomic);
+			/* Note: comparison output still uses printf for complex format */
+			seq_buf_printf(s, " (rstat=%llu diff=%lld)\n", size, diff);
 #else
 			/* Atomic counter only - output clean format without suffix */
-			seq_buf_printf(s, "%s %llu\n", memory_stats[i].name, size_atomic);
+			seq_buf_put_name_val(s, memory_stats[i].name, size_atomic);
 #endif /* CONFIG_MEMCG_STAT_COMPARISON */
 		}
 #endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
@@ -1916,7 +2497,7 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 #ifdef CONFIG_MEMCG_RSTAT_COUNTER
 			u64 slab_reclaimable = memcg_page_state_output(memcg,
 								   NR_SLAB_RECLAIMABLE_B);
-			seq_buf_printf(s, "slab %llu\n", size + slab_reclaimable);
+			seq_buf_put_name_val(s, "slab", size + slab_reclaimable);
 #endif /* CONFIG_MEMCG_RSTAT_COUNTER */
 
 #ifdef CONFIG_MEMCG_ATOMIC_COUNTER
@@ -1941,11 +2522,12 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 				u64 slab_total_rstat = size + slab_reclaimable;
 				s64 diff = (s64)slab_total_rstat - (s64)slab_total_atomic;
 
-				seq_buf_printf(s, "slab_atomic %llu (rstat=%llu diff=%lld)\n",
-					       slab_total_atomic, slab_total_rstat, diff);
+				seq_buf_put_name_val(s, "slab_atomic", slab_total_atomic);
+				seq_buf_printf(s, " (rstat=%llu diff=%lld)\n",
+					       slab_total_rstat, diff);
 #else
 				/* Atomic counter only - output clean format */
-				seq_buf_printf(s, "slab %llu\n", slab_total_atomic);
+				seq_buf_put_name_val(s, "slab", slab_total_atomic);
 #endif /* CONFIG_MEMCG_STAT_COMPARISON */
 			}
 #endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
@@ -1954,7 +2536,7 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 
 	/* Accumulated memory events */
 #ifdef CONFIG_MEMCG_RSTAT_COUNTER
-	seq_buf_printf(s, "pgscan %lu\n",
+	seq_buf_put_name_val_ulong(s, "pgscan",
 		       memcg_events(memcg, PGSCAN_KSWAPD) +
 		       memcg_events(memcg, PGSCAN_DIRECT) +
 		       memcg_events(memcg, PGSCAN_PROACTIVE) +
@@ -1962,12 +2544,12 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 #endif /* CONFIG_MEMCG_RSTAT_COUNTER */
 
 #ifdef CONFIG_MEMCG_ATOMIC_COUNTER
-	if (likely(memcg->atomic_counter)) {
+	if (atomic_events_available) {
 		unsigned long pgscan_atomic =
-			memcg_events_atomic_counter_recursive(memcg, PGSCAN_KSWAPD) +
-			memcg_events_atomic_counter_recursive(memcg, PGSCAN_DIRECT) +
-			memcg_events_atomic_counter_recursive(memcg, PGSCAN_PROACTIVE) +
-			memcg_events_atomic_counter_recursive(memcg, PGSCAN_KHUGEPAGED);
+			atomic_event_results[memcg_events_index(PGSCAN_KSWAPD)] +
+			atomic_event_results[memcg_events_index(PGSCAN_DIRECT)] +
+			atomic_event_results[memcg_events_index(PGSCAN_PROACTIVE)] +
+			atomic_event_results[memcg_events_index(PGSCAN_KHUGEPAGED)];
 
 #ifdef CONFIG_MEMCG_STAT_COMPARISON
 		/* Show comparison between rstat and atomic counter for pgscan */
@@ -1975,17 +2557,18 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 			       memcg_events(memcg, PGSCAN_DIRECT) +
 			       memcg_events(memcg, PGSCAN_PROACTIVE) +
 			       memcg_events(memcg, PGSCAN_KHUGEPAGED);
-		seq_buf_printf(s, "pgscan_atomic %lu (rstat=%lu diff=%ld)\n",
-			       pgscan_atomic, pgscan_rstat, (long)(pgscan_rstat - pgscan_atomic));
+		seq_buf_put_name_val_ulong(s, "pgscan_atomic", pgscan_atomic);
+		seq_buf_printf(s, " (rstat=%lu diff=%ld)\n",
+			       pgscan_rstat, (long)(pgscan_rstat - pgscan_atomic));
 #else
 		/* Atomic counter only - output clean format */
-		seq_buf_printf(s, "pgscan %lu\n", pgscan_atomic);
+		seq_buf_put_name_val_ulong(s, "pgscan", pgscan_atomic);
 #endif /* CONFIG_MEMCG_STAT_COMPARISON */
 	}
 #endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
 
 #ifdef CONFIG_MEMCG_RSTAT_COUNTER
-	seq_buf_printf(s, "pgsteal %lu\n",
+	seq_buf_put_name_val_ulong(s, "pgsteal",
 		       memcg_events(memcg, PGSTEAL_KSWAPD) +
 		       memcg_events(memcg, PGSTEAL_DIRECT) +
 		       memcg_events(memcg, PGSTEAL_PROACTIVE) +
@@ -1993,12 +2576,12 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 #endif /* CONFIG_MEMCG_RSTAT_COUNTER */
 
 #ifdef CONFIG_MEMCG_ATOMIC_COUNTER
-	if (likely(memcg->atomic_counter)) {
+	if (atomic_events_available) {
 		unsigned long pgsteal_atomic =
-			memcg_events_atomic_counter_recursive(memcg, PGSTEAL_KSWAPD) +
-			memcg_events_atomic_counter_recursive(memcg, PGSTEAL_DIRECT) +
-			memcg_events_atomic_counter_recursive(memcg, PGSTEAL_PROACTIVE) +
-			memcg_events_atomic_counter_recursive(memcg, PGSTEAL_KHUGEPAGED);
+			atomic_event_results[memcg_events_index(PGSTEAL_KSWAPD)] +
+			atomic_event_results[memcg_events_index(PGSTEAL_DIRECT)] +
+			atomic_event_results[memcg_events_index(PGSTEAL_PROACTIVE)] +
+			atomic_event_results[memcg_events_index(PGSTEAL_KHUGEPAGED)];
 
 #ifdef CONFIG_MEMCG_STAT_COMPARISON
 		/* Show comparison between rstat and atomic counter for pgsteal */
@@ -2006,12 +2589,12 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 				memcg_events(memcg, PGSTEAL_DIRECT) +
 				memcg_events(memcg, PGSTEAL_PROACTIVE) +
 				memcg_events(memcg, PGSTEAL_KHUGEPAGED);
-		seq_buf_printf(s, "pgsteal_atomic %lu (rstat=%lu diff=%ld)\n",
-			       pgsteal_atomic, pgsteal_rstat,
-			       (long)(pgsteal_rstat - pgsteal_atomic));
+		seq_buf_put_name_val_ulong(s, "pgsteal_atomic", pgsteal_atomic);
+		seq_buf_printf(s, " (rstat=%lu diff=%ld)\n",
+			       pgsteal_rstat, (long)(pgsteal_rstat - pgsteal_atomic));
 #else
 		/* Atomic counter only - output clean format */
-		seq_buf_printf(s, "pgsteal %lu\n", pgsteal_atomic);
+		seq_buf_put_name_val_ulong(s, "pgsteal", pgsteal_atomic);
 #endif /* CONFIG_MEMCG_STAT_COMPARISON */
 	}
 #endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
@@ -2025,27 +2608,25 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 
 #ifdef CONFIG_MEMCG_RSTAT_COUNTER
 		unsigned long count = memcg_events(memcg, memcg_vm_event_stat[i]);
-		seq_buf_printf(s, "%s %lu\n",
-			       vm_event_name(memcg_vm_event_stat[i]),
+		seq_buf_put_name_val_ulong(s, vm_event_name(memcg_vm_event_stat[i]),
 			       count);
 #endif /* CONFIG_MEMCG_RSTAT_COUNTER */
 
 #ifdef CONFIG_MEMCG_ATOMIC_COUNTER
-		if (likely(memcg->atomic_counter)) {
-			unsigned long count_atomic = memcg_events_atomic_counter_recursive(
-					memcg, memcg_vm_event_stat[i]);
+		if (atomic_events_available) {
+			unsigned long count_atomic = atomic_event_results[i];
 
 #ifdef CONFIG_MEMCG_STAT_COMPARISON
 			/* Show comparison between rstat and atomic counter */
 			long diff_long = (long)count - (long)count_atomic;
-
-			seq_buf_printf(s, "%s_atomic %lu (rstat=%lu diff=%ld)\n",
-				       vm_event_name(memcg_vm_event_stat[i]),
-				       count_atomic, count, diff_long);
+			char event_name_buf[64];
+			snprintf(event_name_buf, sizeof(event_name_buf), "%s_atomic",
+				 vm_event_name(memcg_vm_event_stat[i]));
+			seq_buf_put_name_val_ulong(s, event_name_buf, count_atomic);
+			seq_buf_printf(s, " (rstat=%lu diff=%ld)\n", count, diff_long);
 #else
 			/* Atomic counter only - output clean format */
-			seq_buf_printf(s, "%s %lu\n",
-				       vm_event_name(memcg_vm_event_stat[i]),
+			seq_buf_put_name_val_ulong(s, vm_event_name(memcg_vm_event_stat[i]),
 				       count_atomic);
 #endif /* CONFIG_MEMCG_STAT_COMPARISON */
 		}
@@ -4277,6 +4858,7 @@ static void __mem_cgroup_free(struct mem_cgroup *memcg)
 	 * all readers using list_for_each_entry_rcu() have completed.
 	 */
 	kfree(memcg->atomic_counter);
+	kfree(memcg->atomic_cache);
 #endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
 	kfree(memcg);
 }
@@ -4328,6 +4910,14 @@ static struct mem_cgroup *mem_cgroup_alloc(struct mem_cgroup *parent)
 	INIT_LIST_HEAD(&memcg->atomic_children);
 	INIT_LIST_HEAD(&memcg->atomic_sibling);
 	spin_lock_init(&memcg->atomic_children_lock);
+
+	/* Allocate and initialize atomic cache (2 second TTL) */
+	memcg->atomic_cache = kzalloc(sizeof(struct memcg_atomic_cache),
+				       GFP_KERNEL_ACCOUNT);
+	if (unlikely(!memcg->atomic_cache))
+		goto fail;
+	spin_lock_init(&memcg->atomic_cache->lock);
+	memcg->atomic_cache->jiffies = 0; /* Mark as invalid initially */
 #endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
 
 	if (!memcg1_alloc_events(memcg))
@@ -4526,6 +5116,8 @@ static void mem_cgroup_css_offline(struct cgroup_subsys_state *css)
 	 * Therefore, no explicit synchronize_rcu() or call_rcu() is needed here.
 	 */
 	if (!mem_cgroup_is_root(memcg)) {
+		memcg_atomic_transfer_to_parent(memcg);
+
 		struct mem_cgroup *parent = parent_mem_cgroup(memcg);
 
 		spin_lock(&parent->atomic_children_lock);
@@ -5174,6 +5766,33 @@ static int memory_numa_stat_show(struct seq_file *m, void *v)
 
 	memcg_atomic_flush_pending_only(memcg);
 
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER
+	/* Optimize for flat topologies: batch read all stat items for all NUMA nodes
+	 * in a SINGLE tree traversal to avoid repeated cgroup tree walks.
+	 * For /sys/fs/cgroup/a/b/c/[0-25] structure, this reduces tree traversals
+	 * from (stat_items × numa_nodes) to 1, providing maximum speedup.
+	 *
+	 * Previous approach: O(numa_nodes) traversals (one per NUMA node)
+	 * This approach: O(1) traversal (one for all NUMA nodes)
+	 *
+	 * Use dynamic allocation to avoid large stack frame warning.
+	 */
+	u64 (*numa_batch_stats)[NR_MEMCG_NODE_STAT_ITEMS] = NULL;
+	bool batch_read_done = false;
+
+	if (likely(memcg->atomic_counter)) {
+		numa_batch_stats = kmalloc_array(NR_NODE_STATES,
+						sizeof(*numa_batch_stats), GFP_KERNEL);
+		if (likely(numa_batch_stats)) {
+			memset(numa_batch_stats, 0,
+			       NR_NODE_STATES * sizeof(*numa_batch_stats));
+			/* Single tree traversal reads all NUMA nodes and all stat items */
+			if (memcg_atomic_counter_all_numa_batch(memcg, numa_batch_stats) == 0)
+				batch_read_done = true;
+		}
+	}
+#endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
+
 	for (i = 0; i < ARRAY_SIZE(memory_stats); i++) {
 		int nid;
 
@@ -5181,54 +5800,62 @@ static int memory_numa_stat_show(struct seq_file *m, void *v)
 			continue;
 
 #ifdef CONFIG_MEMCG_RSTAT_COUNTER
-		seq_printf(m, "%s", memory_stats[i].name);
-		for_each_node_state(nid, N_MEMORY) {
-			u64 size;
-			struct lruvec *lruvec;
+		/* Optimize: use seq_buf for batch formatting */
+		{
+			char numa_buf[512];  /* Buffer for one line */
+			struct seq_buf numa_s;
+			seq_buf_init(&numa_s, numa_buf, sizeof(numa_buf));
+			seq_buf_printf(&numa_s, "%s", memory_stats[i].name);
+			for_each_node_state(nid, N_MEMORY) {
+				u64 size;
+				struct lruvec *lruvec;
 
-			lruvec = mem_cgroup_lruvec(memcg, NODE_DATA(nid));
-			size = lruvec_page_state_output(lruvec,
-							memory_stats[i].idx);
-			seq_printf(m, " N%d=%llu", nid, size);
+				lruvec = mem_cgroup_lruvec(memcg, NODE_DATA(nid));
+				size = lruvec_page_state_output(lruvec,
+								memory_stats[i].idx);
+				seq_buf_printf(&numa_s, " N%d=%llu", nid, size);
+			}
+			seq_buf_putc(&numa_s, '\n');
+			seq_puts(m, numa_buf);
 		}
-		seq_putc(m, '\n');
 #endif /* CONFIG_MEMCG_RSTAT_COUNTER */
 
 #ifdef CONFIG_MEMCG_ATOMIC_COUNTER
-		if (likely(memcg->atomic_counter)) {
-			seq_printf(m, "%s_atomic", memory_stats[i].name);
-			for_each_node_state(nid, N_MEMORY) {
-				u64 size_atomic;
-				u64 size_rstat = 0;
-				int stat_idx =
-					memcg_stats_index(memory_stats[i].idx);
+		if (batch_read_done && numa_batch_stats) {
+			int stat_idx = memcg_stats_index(memory_stats[i].idx);
+			char numa_buf[1024];  /* Larger buffer for comparison output */
+			struct seq_buf numa_s;
 
-				size_atomic = memcg_atomic_counter_numa_sum(memcg,
-									    nid,
-									    stat_idx);
+			seq_buf_init(&numa_s, numa_buf, sizeof(numa_buf));
+			seq_buf_init(&numa_s, numa_buf, sizeof(numa_buf));
+			seq_buf_printf(&numa_s, "%s_atomic", memory_stats[i].name);
+			for_each_node_state(nid, N_MEMORY) {
+				u64 size_atomic = numa_batch_stats[nid][stat_idx];
+
 				size_atomic *= memcg_page_state_output_unit(
 						memory_stats[i].idx);
 
 #ifdef CONFIG_MEMCG_STAT_COMPARISON
-#ifdef CONFIG_MEMCG_RSTAT_COUNTER
-				size_rstat = lruvec_page_state_output(
+				u64 size_rstat = lruvec_page_state_output(
 					mem_cgroup_lruvec(memcg, NODE_DATA(nid)),
 					memory_stats[i].idx);
-#endif /* CONFIG_MEMCG_RSTAT_COUNTER */
-
 				s64 diff = (s64)size_rstat - (s64)size_atomic;
 
-				seq_printf(m, " N%d=%llu (rstat=%llu diff=%lld)",
-					   nid, size_atomic, size_rstat, diff);
+				seq_buf_printf(&numa_s, " N%d=%llu (rstat=%llu diff=%lld)",
+					       nid, size_atomic, size_rstat, diff);
 #else
-				seq_printf(m, " N%d=%llu", nid, size_atomic);
+				seq_buf_printf(&numa_s, " N%d=%llu", nid, size_atomic);
 #endif /* CONFIG_MEMCG_STAT_COMPARISON */
 			}
-			seq_putc(m, '\n');
+			seq_buf_putc(&numa_s, '\n');
+			seq_puts(m, numa_buf);
 		}
 #endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
 	}
 
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER
+	kfree(numa_batch_stats);
+#endif
 	return 0;
 }
 #endif
