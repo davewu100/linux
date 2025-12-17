@@ -77,7 +77,6 @@ struct lruvec_stats_percpu;
 struct lruvec_stats;
 #ifdef CONFIG_MEMCG_ATOMIC_COUNTER
 struct memcg_atomic_counter_per_node;
-struct memcg_atomic_cache;
 #endif
 
 struct mem_cgroup_reclaim_iter {
@@ -263,11 +262,6 @@ struct mem_cgroup {
 	struct list_head atomic_children;	/* list of child memcgs */
 	struct list_head atomic_sibling;	/* linked to parent's atomic_children */
 	spinlock_t atomic_children_lock;	/* for list add/remove; traversal uses RCU */
-
-	/* Cached aggregated atomic stats/events to throttle frequent reads */
-	struct memcg_atomic_cache *atomic_cache;
-	struct memcg_atomic_cache *atomic_cache_inactive;
-	spinlock_t atomic_cache_lock;
 #endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
 
 #ifdef CONFIG_MEMCG_NMI_SAFETY_REQUIRES_ATOMIC
