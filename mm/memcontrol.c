@@ -862,8 +862,9 @@ memcg_page_state_atomic_counter_recursive(struct mem_cgroup *memcg, int idx)
 	 * 3. The actual counter value is not lost (next read will see new value)
 	 *
 	 * We trade perfect snapshot consistency for lock-free performance.
+	 * Use READ_ONCE on .counter field instead of atomic64_read for better performance.
 	 */
-	total = atomic64_read(&counter->state[i]);
+	total = READ_ONCE(counter->state[i].counter);
 
 	/* Early exit if no children to avoid RCU overhead */
 	if (list_empty(&memcg->atomic_children))
@@ -902,9 +903,12 @@ static int memcg_atomic_visit_batch(struct mem_cgroup *memcg, void *data)
 	if (!counter)
 		return 0;
 
-	/* Directly accumulate into results array - cache-friendly sequential access */
+	/* Directly accumulate into results array - cache-friendly sequential access
+	 * Use READ_ONCE on .counter field instead of atomic64_read for better performance.
+	 * The race window is tiny and errors don't accumulate across reads.
+	 */
 	for (i = 0; i < MEMCG_VMSTAT_SIZE; i++)
-		results[i] += atomic64_read(&counter->state[i]);
+		results[i] += READ_ONCE(counter->state[i].counter);
 
 	return 0;
 }
@@ -928,7 +932,7 @@ static int memcg_page_state_atomic_counter_batch(struct mem_cgroup *memcg,
 }
 
 /* Visit callback for events batch aggregation */
-static int __maybe_unused memcg_atomic_visit_events_batch(struct mem_cgroup *memcg, void *data)
+static int memcg_atomic_visit_events_batch(struct mem_cgroup *memcg, void *data)
 {
 	unsigned long *results = data;
 	struct memcg_atomic_counter *counter;
@@ -938,14 +942,17 @@ static int __maybe_unused memcg_atomic_visit_events_batch(struct mem_cgroup *mem
 	if (!counter)
 		return 0;
 
-	/* Directly accumulate into results array - cache-friendly sequential access */
+	/* Directly accumulate into results array - cache-friendly sequential access
+	 * Use READ_ONCE on .counter field instead of atomic64_read for better performance.
+	 * The race window is tiny and errors don't accumulate across reads.
+	 */
 	for (i = 0; i < NR_MEMCG_EVENTS; i++)
-		results[i] += (unsigned long)atomic64_read(&counter->events[i]);
+		results[i] += (unsigned long)READ_ONCE(counter->events[i].counter);
 
 	return 0;
 }
 
-static int __maybe_unused memcg_events_atomic_counter_batch(struct mem_cgroup *memcg,
+static int memcg_events_atomic_counter_batch(struct mem_cgroup *memcg,
 					     unsigned long *results)
 {
 	int i;
@@ -1047,8 +1054,10 @@ static unsigned long memcg_events_atomic_counter_recursive(struct mem_cgroup *me
 
 	i = memcg_events_index(idx);
 
-	/* Read single atomic value for this memcg */
-	total = atomic64_read(&counter->events[i]);
+	/* Read single atomic value for this memcg
+	 * Use READ_ONCE on .counter field instead of atomic64_read for better performance.
+	 */
+	total = READ_ONCE(counter->events[i].counter);
 
 	/* Early exit if no children to avoid RCU overhead */
 	if (list_empty(&memcg->atomic_children))
@@ -1124,7 +1133,7 @@ static int memcg_atomic_visit_node(struct mem_cgroup *memcg, void *data)
 
 	node_counter = READ_ONCE(pn->atomic_counter_per_node);
 	if (node_counter)
-		acc->total += atomic64_read(&node_counter->state[acc->stat_idx]);
+		acc->total += READ_ONCE(node_counter->state[acc->stat_idx].counter);
 
 	return 0;
 }
@@ -1185,10 +1194,11 @@ static int memcg_atomic_visit_numa_batch(struct mem_cgroup *memcg, void *data)
 		return 0;
 
 	/* Batch read all stat items for this NUMA node - sequential access,
-	 * cache-friendly pattern similar to vmstat's batch aggregation
+	 * cache-friendly pattern similar to vmstat's batch aggregation.
+	 * Use READ_ONCE on .counter field instead of atomic64_read for better performance.
 	 */
 	for (i = 0; i < NR_MEMCG_NODE_STAT_ITEMS; i++) {
-		acc->stats[i] += atomic64_read(&node_counter->state[i]);
+		acc->stats[i] += READ_ONCE(node_counter->state[i].counter);
 	}
 
 	return 0;
@@ -1259,9 +1269,11 @@ static int memcg_atomic_visit_all_numa_batch(struct mem_cgroup *memcg, void *dat
 		if (!node_counter)
 			continue;
 
-		/* Sequential access to all stat items for this NUMA node - cache-friendly */
+		/* Sequential access to all stat items for this NUMA node - cache-friendly
+		 * Use READ_ONCE on .counter field instead of atomic64_read for better performance.
+		 */
 		for (i = 0; i < NR_MEMCG_NODE_STAT_ITEMS; i++) {
-			results[nid][i] += atomic64_read(&node_counter->state[i]);
+			results[nid][i] += READ_ONCE(node_counter->state[i].counter);
 		}
 	}
 	return 0;
@@ -2166,7 +2178,9 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 	int i;
 #ifdef CONFIG_MEMCG_ATOMIC_COUNTER
 	u64 atomic_results[MEMCG_VMSTAT_SIZE];
+	unsigned long atomic_event_results[NR_MEMCG_EVENTS];
 	bool atomic_available = false;
+	bool atomic_events_available = false;
 #endif
 
 	/*
@@ -2192,10 +2206,12 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 	/* Fold NMI deferred deltas before reading. */
 #ifdef CONFIG_MEMCG_ATOMIC_COUNTER
 	memcg_atomic_flush_pending_only(memcg);
-	/* Batch read all atomic counter stats in a single tree traversal */
+	/* Batch read all atomic counter stats and events in single tree traversals */
 	if (likely(memcg->atomic_counter)) {
 		atomic_available = (memcg_page_state_atomic_counter_batch(
 					memcg, atomic_results) == 0);
+		atomic_events_available = (memcg_events_atomic_counter_batch(
+					memcg, atomic_event_results) == 0);
 	}
 #endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
 
@@ -2284,12 +2300,12 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 #endif /* CONFIG_MEMCG_RSTAT_COUNTER */
 
 #ifdef CONFIG_MEMCG_ATOMIC_COUNTER
-	if (likely(memcg->atomic_counter)) {
+	if (atomic_events_available) {
 		unsigned long pgscan_atomic =
-			memcg_events_atomic_counter_recursive(memcg, PGSCAN_KSWAPD) +
-			memcg_events_atomic_counter_recursive(memcg, PGSCAN_DIRECT) +
-			memcg_events_atomic_counter_recursive(memcg, PGSCAN_PROACTIVE) +
-			memcg_events_atomic_counter_recursive(memcg, PGSCAN_KHUGEPAGED);
+			atomic_event_results[memcg_events_index(PGSCAN_KSWAPD)] +
+			atomic_event_results[memcg_events_index(PGSCAN_DIRECT)] +
+			atomic_event_results[memcg_events_index(PGSCAN_PROACTIVE)] +
+			atomic_event_results[memcg_events_index(PGSCAN_KHUGEPAGED)];
 
 #ifdef CONFIG_MEMCG_STAT_COMPARISON
 		/* Show comparison between rstat and atomic counter for pgscan */
@@ -2315,12 +2331,12 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 #endif /* CONFIG_MEMCG_RSTAT_COUNTER */
 
 #ifdef CONFIG_MEMCG_ATOMIC_COUNTER
-	if (likely(memcg->atomic_counter)) {
+	if (atomic_events_available) {
 		unsigned long pgsteal_atomic =
-			memcg_events_atomic_counter_recursive(memcg, PGSTEAL_KSWAPD) +
-			memcg_events_atomic_counter_recursive(memcg, PGSTEAL_DIRECT) +
-			memcg_events_atomic_counter_recursive(memcg, PGSTEAL_PROACTIVE) +
-			memcg_events_atomic_counter_recursive(memcg, PGSTEAL_KHUGEPAGED);
+			atomic_event_results[memcg_events_index(PGSTEAL_KSWAPD)] +
+			atomic_event_results[memcg_events_index(PGSTEAL_DIRECT)] +
+			atomic_event_results[memcg_events_index(PGSTEAL_PROACTIVE)] +
+			atomic_event_results[memcg_events_index(PGSTEAL_KHUGEPAGED)];
 
 #ifdef CONFIG_MEMCG_STAT_COMPARISON
 		/* Show comparison between rstat and atomic counter for pgsteal */
@@ -2353,9 +2369,8 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 #endif /* CONFIG_MEMCG_RSTAT_COUNTER */
 
 #ifdef CONFIG_MEMCG_ATOMIC_COUNTER
-		if (likely(memcg->atomic_counter)) {
-			unsigned long count_atomic = memcg_events_atomic_counter_recursive(
-					memcg, memcg_vm_event_stat[i]);
+		if (atomic_events_available) {
+			unsigned long count_atomic = atomic_event_results[i];
 
 #ifdef CONFIG_MEMCG_STAT_COMPARISON
 			/* Show comparison between rstat and atomic counter */
