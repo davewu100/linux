@@ -594,6 +594,14 @@ struct memcg_atomic_numa_batch_accum {
 struct memcg_atomic_all_numa_batch_accum {
 	u64 stats[NR_NODE_STATES][NR_MEMCG_NODE_STAT_ITEMS];
 };
+
+/* Lightweight cache for batch-read stats (2 second TTL) */
+struct memcg_atomic_cache {
+	u64 stats[MEMCG_VMSTAT_SIZE];
+	unsigned long events[NR_MEMCG_EVENTS];
+	unsigned long jiffies;	/* timestamp when cache was populated */
+	spinlock_t lock;	/* protects cache updates */
+};
 #endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
 
 struct memcg_vmstats {
@@ -913,11 +921,122 @@ static int memcg_atomic_visit_batch(struct mem_cgroup *memcg, void *data)
 	return 0;
 }
 
+/* Check if cache is valid (within 2 second TTL) */
+static bool memcg_atomic_cache_is_valid(struct mem_cgroup *memcg)
+{
+	struct memcg_atomic_cache *cache;
+	unsigned long now, cache_time;
+	unsigned long ttl = 2 * HZ; /* 2 seconds */
+
+	if (unlikely(!memcg->atomic_cache))
+		return false;
+
+	cache = memcg->atomic_cache;
+	now = jiffies;
+	cache_time = READ_ONCE(cache->jiffies);
+
+	/* Check if cache is valid (not expired) */
+	if (cache_time == 0 || time_after(now, cache_time + ttl))
+		return false;
+
+	return true;
+}
+
+/* Try to read from cache, return true if cache hit */
+static bool memcg_atomic_cache_read_stats(struct mem_cgroup *memcg, u64 *results)
+{
+	struct memcg_atomic_cache *cache;
+	int i;
+
+	if (!memcg_atomic_cache_is_valid(memcg))
+		return false;
+
+	cache = memcg->atomic_cache;
+	spin_lock(&cache->lock);
+	/* Re-check after acquiring lock */
+	if (!memcg_atomic_cache_is_valid(memcg)) {
+		spin_unlock(&cache->lock);
+		return false;
+	}
+	/* Copy cached stats */
+	for (i = 0; i < MEMCG_VMSTAT_SIZE; i++)
+		results[i] = cache->stats[i];
+	spin_unlock(&cache->lock);
+	return true;
+}
+
+/* Try to read events from cache, return true if cache hit */
+static bool memcg_atomic_cache_read_events(struct mem_cgroup *memcg,
+					    unsigned long *results)
+{
+	struct memcg_atomic_cache *cache;
+	int i;
+
+	if (!memcg_atomic_cache_is_valid(memcg))
+		return false;
+
+	cache = memcg->atomic_cache;
+	spin_lock(&cache->lock);
+	/* Re-check after acquiring lock */
+	if (!memcg_atomic_cache_is_valid(memcg)) {
+		spin_unlock(&cache->lock);
+		return false;
+	}
+	/* Copy cached events */
+	for (i = 0; i < NR_MEMCG_EVENTS; i++)
+		results[i] = cache->events[i];
+	spin_unlock(&cache->lock);
+	return true;
+}
+
+/* Update cache with fresh stats */
+static void memcg_atomic_cache_update_stats(struct mem_cgroup *memcg,
+					     const u64 *results)
+{
+	struct memcg_atomic_cache *cache;
+	int i;
+
+	if (unlikely(!memcg->atomic_cache))
+		return;
+
+	cache = memcg->atomic_cache;
+	spin_lock(&cache->lock);
+	/* Copy stats to cache */
+	for (i = 0; i < MEMCG_VMSTAT_SIZE; i++)
+		cache->stats[i] = results[i];
+	cache->jiffies = jiffies; /* Update timestamp */
+	spin_unlock(&cache->lock);
+}
+
+/* Update cache with fresh events */
+static void memcg_atomic_cache_update_events(struct mem_cgroup *memcg,
+					      const unsigned long *results)
+{
+	struct memcg_atomic_cache *cache;
+	int i;
+
+	if (unlikely(!memcg->atomic_cache))
+		return;
+
+	cache = memcg->atomic_cache;
+	spin_lock(&cache->lock);
+	/* Copy events to cache */
+	for (i = 0; i < NR_MEMCG_EVENTS; i++)
+		cache->events[i] = results[i];
+	cache->jiffies = jiffies; /* Update timestamp */
+	spin_unlock(&cache->lock);
+}
+
 static int memcg_page_state_atomic_counter_batch(struct mem_cgroup *memcg,
 						  u64 *results)
 {
 	int i;
 
+	/* Try cache first */
+	if (memcg_atomic_cache_read_stats(memcg, results))
+		return 0;
+
+	/* Cache miss - read from atomic counters */
 	/* Initialize results array to zero */
 	for (i = 0; i < MEMCG_VMSTAT_SIZE; i++)
 		results[i] = 0;
@@ -927,6 +1046,9 @@ static int memcg_page_state_atomic_counter_batch(struct mem_cgroup *memcg,
 	 * by using a single traversal with direct accumulation.
 	 */
 	memcg_atomic_walk(memcg, memcg_atomic_visit_batch, results);
+
+	/* Update cache with fresh data */
+	memcg_atomic_cache_update_stats(memcg, results);
 
 	return 0;
 }
@@ -957,6 +1079,11 @@ static int memcg_events_atomic_counter_batch(struct mem_cgroup *memcg,
 {
 	int i;
 
+	/* Try cache first */
+	if (memcg_atomic_cache_read_events(memcg, results))
+		return 0;
+
+	/* Cache miss - read from atomic counters */
 	/* Initialize results array to zero */
 	for (i = 0; i < NR_MEMCG_EVENTS; i++)
 		results[i] = 0;
@@ -966,6 +1093,9 @@ static int memcg_events_atomic_counter_batch(struct mem_cgroup *memcg,
 	 * by using a single traversal with direct accumulation.
 	 */
 	memcg_atomic_walk(memcg, memcg_atomic_visit_events_batch, results);
+
+	/* Update cache with fresh data */
+	memcg_atomic_cache_update_events(memcg, results);
 
 	return 0;
 }
@@ -4614,6 +4744,7 @@ static void __mem_cgroup_free(struct mem_cgroup *memcg)
 	 * all readers using list_for_each_entry_rcu() have completed.
 	 */
 	kfree(memcg->atomic_counter);
+	kfree(memcg->atomic_cache);
 #endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
 	kfree(memcg);
 }
@@ -4665,6 +4796,14 @@ static struct mem_cgroup *mem_cgroup_alloc(struct mem_cgroup *parent)
 	INIT_LIST_HEAD(&memcg->atomic_children);
 	INIT_LIST_HEAD(&memcg->atomic_sibling);
 	spin_lock_init(&memcg->atomic_children_lock);
+
+	/* Allocate and initialize atomic cache (2 second TTL) */
+	memcg->atomic_cache = kzalloc(sizeof(struct memcg_atomic_cache),
+				       GFP_KERNEL_ACCOUNT);
+	if (unlikely(!memcg->atomic_cache))
+		goto fail;
+	spin_lock_init(&memcg->atomic_cache->lock);
+	memcg->atomic_cache->jiffies = 0; /* Mark as invalid initially */
 #endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
 
 	if (!memcg1_alloc_events(memcg))
