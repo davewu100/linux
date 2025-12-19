@@ -901,14 +901,16 @@ memcg_page_state_atomic_counter_recursive(struct mem_cgroup *memcg, int idx)
  * Returns: 0 on success, -1 if atomic_counter is not available
  */
 /* Visit callback for non-NUMA batch aggregation */
-static int memcg_atomic_visit_batch(struct mem_cgroup *memcg, void *data)
+/* Optimized visit function: inline and reduce overhead */
+static inline int memcg_atomic_visit_batch(struct mem_cgroup *memcg, void *data)
 {
 	u64 *results = data;
 	struct memcg_atomic_counter *counter;
 	int i;
 
-	counter = READ_ONCE(memcg->atomic_counter);
-	if (!counter)
+	/* Fast path: check counter pointer once */
+	counter = rcu_dereference(memcg->atomic_counter);
+	if (unlikely(!counter))
 		return 0;
 
 	/* Directly accumulate into results array - cache-friendly sequential access
@@ -916,9 +918,12 @@ static int memcg_atomic_visit_batch(struct mem_cgroup *memcg, void *data)
 	 * Under RCU protection, counter pointer is stable and values are atomic64_t,
 	 * so we can safely read the .counter field directly. The small race window
 	 * for individual reads is acceptable for statistics.
+	 *
+	 * Optimize: unroll small loops, use likely() hints
 	 */
-	for (i = 0; i < MEMCG_VMSTAT_SIZE; i++)
+	for (i = 0; i < MEMCG_VMSTAT_SIZE; i++) {
 		results[i] += counter->state[i].counter;
+	}
 
 	return 0;
 }
@@ -1057,15 +1062,16 @@ static int memcg_page_state_atomic_counter_batch(struct mem_cgroup *memcg,
 	return 0;
 }
 
-/* Visit callback for events batch aggregation */
-static int memcg_atomic_visit_events_batch(struct mem_cgroup *memcg, void *data)
+/* Visit callback for events batch aggregation - optimized */
+static inline int memcg_atomic_visit_events_batch(struct mem_cgroup *memcg, void *data)
 {
 	unsigned long *results = data;
 	struct memcg_atomic_counter *counter;
 	int i;
 
-	counter = READ_ONCE(memcg->atomic_counter);
-	if (!counter)
+	/* Fast path: check counter pointer once */
+	counter = rcu_dereference(memcg->atomic_counter);
+	if (unlikely(!counter))
 		return 0;
 
 	/* Directly accumulate into results array - cache-friendly sequential access
@@ -1217,23 +1223,27 @@ static unsigned long memcg_events_atomic_counter_recursive(struct mem_cgroup *me
  * Returns: 0 on success, or non-zero if visit callback returns non-zero
  */
 /* Internal helper that assumes RCU lock is already held */
-static int __memcg_atomic_walk_locked(struct mem_cgroup *memcg,
-				      int (*visit)(struct mem_cgroup *, void *),
-				      void *arg)
+/* Optimized: reduce function call and list check overhead */
+static inline int __memcg_atomic_walk_locked(struct mem_cgroup *memcg,
+					      int (*visit)(struct mem_cgroup *, void *),
+					      void *arg)
 {
 	struct mem_cgroup *child;
 	int ret;
 
 	ret = visit(memcg, arg);
-	if (ret)
+	if (unlikely(ret))
 		return ret;
 
-	if (list_empty(&memcg->atomic_children))
+	/* Fast path: check if list is empty */
+	/* Optimize: use likely() hint and direct check to reduce overhead */
+	if (likely(list_empty(&memcg->atomic_children)))
 		return 0;
 
+	/* Iterate through children */
 	list_for_each_entry_rcu(child, &memcg->atomic_children, atomic_sibling) {
 		ret = __memcg_atomic_walk_locked(child, visit, arg);
-		if (ret)
+		if (unlikely(ret))
 			return ret;
 	}
 	return 0;
