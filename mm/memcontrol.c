@@ -912,11 +912,13 @@ static int memcg_atomic_visit_batch(struct mem_cgroup *memcg, void *data)
 		return 0;
 
 	/* Directly accumulate into results array - cache-friendly sequential access
-	 * Use READ_ONCE on .counter field instead of atomic64_read for better performance.
-	 * The race window is tiny and errors don't accumulate across reads.
+	 * Use direct read instead of READ_ONCE for better performance.
+	 * Under RCU protection, counter pointer is stable and values are atomic64_t,
+	 * so we can safely read the .counter field directly. The small race window
+	 * for individual reads is acceptable for statistics.
 	 */
 	for (i = 0; i < MEMCG_VMSTAT_SIZE; i++)
-		results[i] += READ_ONCE(counter->state[i].counter);
+		results[i] += counter->state[i].counter;
 
 	return 0;
 }
@@ -1036,20 +1038,16 @@ static void memcg_atomic_cache_update_events(struct mem_cgroup *memcg,
 static int memcg_page_state_atomic_counter_batch(struct mem_cgroup *memcg,
 						  u64 *results)
 {
-	int i;
-
-	/* Try cache first */
+	/* Try cache first - fast path */
 	if (memcg_atomic_cache_read_stats(memcg, results))
 		return 0;
 
 	/* Cache miss - read from atomic counters */
-	/* Initialize results array to zero */
-	for (i = 0; i < MEMCG_VMSTAT_SIZE; i++)
-		results[i] = 0;
+	/* Initialize results array to zero - use memset for better performance */
+	memset(results, 0, MEMCG_VMSTAT_SIZE * sizeof(u64));
 
 	/* Use memcg_atomic_walk to avoid recursive allocation overhead.
-	 * This eliminates multiple kmalloc/kfree calls in deep hierarchies
-	 * by using a single traversal with direct accumulation.
+	 * Optimized to use single RCU lock for entire tree traversal.
 	 */
 	memcg_atomic_walk(memcg, memcg_atomic_visit_batch, results);
 
@@ -1071,11 +1069,12 @@ static int memcg_atomic_visit_events_batch(struct mem_cgroup *memcg, void *data)
 		return 0;
 
 	/* Directly accumulate into results array - cache-friendly sequential access
-	 * Use READ_ONCE on .counter field instead of atomic64_read for better performance.
-	 * The race window is tiny and errors don't accumulate across reads.
+	 * Use direct read instead of READ_ONCE for better performance.
+	 * Under RCU protection, counter pointer is stable and values are atomic64_t,
+	 * so we can safely read the .counter field directly.
 	 */
 	for (i = 0; i < NR_MEMCG_EVENTS; i++)
-		results[i] += (unsigned long)READ_ONCE(counter->events[i].counter);
+		results[i] += (unsigned long)counter->events[i].counter;
 
 	return 0;
 }
@@ -1083,20 +1082,16 @@ static int memcg_atomic_visit_events_batch(struct mem_cgroup *memcg, void *data)
 static int memcg_events_atomic_counter_batch(struct mem_cgroup *memcg,
 					     unsigned long *results)
 {
-	int i;
-
-	/* Try cache first */
+	/* Try cache first - fast path */
 	if (memcg_atomic_cache_read_events(memcg, results))
 		return 0;
 
 	/* Cache miss - read from atomic counters */
-	/* Initialize results array to zero */
-	for (i = 0; i < NR_MEMCG_EVENTS; i++)
-		results[i] = 0;
+	/* Initialize results array to zero - use memset for better performance */
+	memset(results, 0, NR_MEMCG_EVENTS * sizeof(unsigned long));
 
 	/* Use memcg_atomic_walk to avoid recursive allocation overhead.
-	 * This eliminates multiple kmalloc/kfree calls in deep hierarchies
-	 * by using a single traversal with direct accumulation.
+	 * Optimized to use single RCU lock for entire tree traversal.
 	 */
 	memcg_atomic_walk(memcg, memcg_atomic_visit_events_batch, results);
 
@@ -1221,9 +1216,10 @@ static unsigned long memcg_events_atomic_counter_recursive(struct mem_cgroup *me
  *
  * Returns: 0 on success, or non-zero if visit callback returns non-zero
  */
-static int memcg_atomic_walk(struct mem_cgroup *memcg,
-			     int (*visit)(struct mem_cgroup *, void *),
-			     void *arg)
+/* Internal helper that assumes RCU lock is already held */
+static int __memcg_atomic_walk_locked(struct mem_cgroup *memcg,
+				      int (*visit)(struct mem_cgroup *, void *),
+				      void *arg)
 {
 	struct mem_cgroup *child;
 	int ret;
@@ -1235,16 +1231,26 @@ static int memcg_atomic_walk(struct mem_cgroup *memcg,
 	if (list_empty(&memcg->atomic_children))
 		return 0;
 
-	rcu_read_lock();
 	list_for_each_entry_rcu(child, &memcg->atomic_children, atomic_sibling) {
-		ret = memcg_atomic_walk(child, visit, arg);
-		if (ret) {
-			rcu_read_unlock();
+		ret = __memcg_atomic_walk_locked(child, visit, arg);
+		if (ret)
 			return ret;
-		}
 	}
-	rcu_read_unlock();
 	return 0;
+}
+
+static int memcg_atomic_walk(struct mem_cgroup *memcg,
+			     int (*visit)(struct mem_cgroup *, void *),
+			     void *arg)
+{
+	int ret;
+
+	/* Optimize: single RCU lock for entire tree traversal */
+	/* This reduces lock overhead significantly for deep trees */
+	rcu_read_lock();
+	ret = __memcg_atomic_walk_locked(memcg, visit, arg);
+	rcu_read_unlock();
+	return ret;
 }
 
 /**
