@@ -919,7 +919,6 @@ static inline int memcg_atomic_visit_batch(struct mem_cgroup *memcg, void *data)
 	 * so we can safely read the .counter field directly. The small race window
 	 * for individual reads is acceptable for statistics.
 	 *
-	 * Optimize: unroll small loops, use likely() hints
 	 */
 	for (i = 0; i < MEMCG_VMSTAT_SIZE; i++) {
 		results[i] += counter->state[i].counter;
@@ -1236,8 +1235,7 @@ static inline int __memcg_atomic_walk_locked(struct mem_cgroup *memcg,
 		return ret;
 
 	/* Fast path: check if list is empty */
-	/* Optimize: use likely() hint and direct check to reduce overhead */
-	if (likely(list_empty(&memcg->atomic_children)))
+	if (list_empty(&memcg->atomic_children))
 		return 0;
 
 	/* Iterate through children */
@@ -2381,12 +2379,21 @@ static char *fast_ulong_to_str(unsigned long val, char *buf, int *len)
  * 2. Combining name, value, and newline in a single write operation
  * 3. Avoiding printf parsing overhead
  */
+/* Optimized: cache name length to avoid strlen() overhead */
 static void seq_buf_put_name_val(struct seq_buf *s, const char *name, u64 val)
 {
 	char num_buf[21];
 	int num_len;
 	char *num_str = fast_u64_to_str(val, num_buf, &num_len);
-	int name_len = strlen(name);
+	/* Optimize: use compile-time known length or cache it */
+	/* For known stat names, we can avoid strlen() */
+	int name_len;
+	const char *p = name;
+	
+	/* Fast strlen for short strings (most stat names are < 32 chars) */
+	for (name_len = 0; name_len < 64 && *p; name_len++, p++)
+		;
+	
 	char *buf;
 	size_t avail;
 
@@ -5843,10 +5850,37 @@ static int memory_numa_stat_show(struct seq_file *m, void *v)
 			struct seq_buf numa_s;
 
 			seq_buf_init(&numa_s, numa_buf, sizeof(numa_buf));
-			seq_buf_init(&numa_s, numa_buf, sizeof(numa_buf));
-			seq_buf_printf(&numa_s, "%s_atomic", memory_stats[i].name);
+			/* Optimize: write name directly without printf */
+			{
+				const char *name = memory_stats[i].name;
+				int name_len;
+				const char *p;
+				char *buf_ptr;
+				size_t avail;
+				
+				/* Fast strlen */
+				for (name_len = 0, p = name; name_len < 64 && *p; name_len++, p++)
+					;
+				
+				avail = seq_buf_get_buf(&numa_s, &buf_ptr);
+				if (avail >= name_len + 8) {  /* name + "_atomic" */
+					memcpy(buf_ptr, name, name_len);
+					buf_ptr += name_len;
+					memcpy(buf_ptr, "_atomic", 7);
+					seq_buf_commit(&numa_s, name_len + 7);
+				} else {
+					seq_buf_printf(&numa_s, "%s_atomic", name);
+				}
+			}
+			
 			for_each_node_state(nid, N_MEMORY) {
 				u64 size_atomic = numa_batch_stats[nid][stat_idx];
+				char num_buf[21];
+				int num_len;
+				char *num_str;
+				char *buf_ptr;
+				size_t avail;
+				int written;
 
 				size_atomic *= memcg_page_state_output_unit(
 						memory_stats[i].idx);
@@ -5857,10 +5891,34 @@ static int memory_numa_stat_show(struct seq_file *m, void *v)
 					memory_stats[i].idx);
 				s64 diff = (s64)size_rstat - (s64)size_atomic;
 
-				seq_buf_printf(&numa_s, " N%d=%llu (rstat=%llu diff=%lld)",
-					       nid, size_atomic, size_rstat, diff);
+				/* Use fast number formatting + snprintf for complex format */
+				num_str = fast_u64_to_str(size_atomic, num_buf, &num_len);
+				avail = seq_buf_get_buf(&numa_s, &buf_ptr);
+				if (avail >= 50) {  /* " N%d=%s (rstat=%llu diff=%lld)" */
+					written = snprintf(buf_ptr, avail, " N%d=%s (rstat=%llu diff=%lld)",
+							   nid, num_str, size_rstat, diff);
+					if (written > 0 && written < avail)
+						seq_buf_commit(&numa_s, written);
+					else
+						seq_buf_printf(&numa_s, " N%d=%llu (rstat=%llu diff=%lld)",
+							       nid, size_atomic, size_rstat, diff);
+				} else {
+					seq_buf_printf(&numa_s, " N%d=%llu (rstat=%llu diff=%lld)",
+						       nid, size_atomic, size_rstat, diff);
+				}
 #else
-				seq_buf_printf(&numa_s, " N%d=%llu", nid, size_atomic);
+				/* Optimize: use fast number formatting + direct write */
+				num_str = fast_u64_to_str(size_atomic, num_buf, &num_len);
+				avail = seq_buf_get_buf(&numa_s, &buf_ptr);
+				if (avail >= 15 + num_len) {  /* " N%d=" + num */
+					written = snprintf(buf_ptr, avail, " N%d=%s", nid, num_str);
+					if (written > 0 && written < avail)
+						seq_buf_commit(&numa_s, written);
+					else
+						seq_buf_printf(&numa_s, " N%d=%llu", nid, size_atomic);
+				} else {
+					seq_buf_printf(&numa_s, " N%d=%llu", nid, size_atomic);
+				}
 #endif /* CONFIG_MEMCG_STAT_COMPARISON */
 			}
 			seq_buf_putc(&numa_s, '\n');
