@@ -954,7 +954,6 @@ static bool memcg_atomic_cache_is_valid(struct mem_cgroup *memcg)
 static bool memcg_atomic_cache_read_stats(struct mem_cgroup *memcg, u64 *results)
 {
 	struct memcg_atomic_cache *cache;
-	int i;
 
 	if (unlikely(!memcg->atomic_cache))
 		return false;
@@ -980,7 +979,6 @@ static bool memcg_atomic_cache_read_events(struct mem_cgroup *memcg,
 					    unsigned long *results)
 {
 	struct memcg_atomic_cache *cache;
-	int i;
 
 	if (unlikely(!memcg->atomic_cache))
 		return false;
@@ -1006,7 +1004,6 @@ static void memcg_atomic_cache_update_stats(struct mem_cgroup *memcg,
 					     const u64 *results)
 {
 	struct memcg_atomic_cache *cache;
-	int i;
 
 	if (unlikely(!memcg->atomic_cache))
 		return;
@@ -1024,7 +1021,6 @@ static void memcg_atomic_cache_update_events(struct mem_cgroup *memcg,
 					      const unsigned long *results)
 {
 	struct memcg_atomic_cache *cache;
-	int i;
 
 	if (unlikely(!memcg->atomic_cache))
 		return;
@@ -1042,7 +1038,7 @@ static bool memcg_atomic_cache_read_numa_batch(struct mem_cgroup *memcg,
 					       u64 (*results)[NR_MEMCG_NODE_STAT_ITEMS])
 {
 	struct memcg_atomic_cache *cache;
-	int nid, i;
+	int nid;
 
 	if (unlikely(!memcg->atomic_cache))
 		return false;
@@ -1071,7 +1067,7 @@ static void memcg_atomic_cache_update_numa_batch(struct mem_cgroup *memcg,
 						 const u64 (*results)[NR_MEMCG_NODE_STAT_ITEMS])
 {
 	struct memcg_atomic_cache *cache;
-	int nid, i;
+	int nid;
 
 	if (unlikely(!memcg->atomic_cache))
 		return;
@@ -1498,7 +1494,6 @@ static int memcg_atomic_counter_all_numa_batch(struct mem_cgroup *memcg,
 					      void *results)
 {
 	u64 (*results_array)[NR_MEMCG_NODE_STAT_ITEMS] = results;
-	int nid, i;
 
 	/* Try cache first - fast path */
 	if (memcg_atomic_cache_read_numa_batch(memcg, results_array))
