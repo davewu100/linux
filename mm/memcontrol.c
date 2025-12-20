@@ -2534,11 +2534,11 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 
 	/* Accumulated memory events */
 #ifdef CONFIG_MEMCG_RSTAT_COUNTER
-	seq_buf_printf(s, "pgscan %lu\n",
-		       memcg_events(memcg, PGSCAN_KSWAPD) +
+	unsigned long pgscan_rstat = memcg_events(memcg, PGSCAN_KSWAPD) +
 		       memcg_events(memcg, PGSCAN_DIRECT) +
 		       memcg_events(memcg, PGSCAN_PROACTIVE) +
-		       memcg_events(memcg, PGSCAN_KHUGEPAGED));
+		       memcg_events(memcg, PGSCAN_KHUGEPAGED);
+	seq_buf_printf(s, "pgscan %lu\n", pgscan_rstat);
 #endif /* CONFIG_MEMCG_RSTAT_COUNTER */
 
 #ifdef CONFIG_MEMCG_ATOMIC_COUNTER
@@ -2550,13 +2550,15 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 			atomic_event_results[memcg_events_index(PGSCAN_KHUGEPAGED)];
 
 #ifdef CONFIG_MEMCG_STAT_COMPARISON
+#ifdef CONFIG_MEMCG_RSTAT_COUNTER
 		/* Show comparison between rstat and atomic counter for pgscan */
-		unsigned long pgscan_rstat = memcg_events(memcg, PGSCAN_KSWAPD) +
-			       memcg_events(memcg, PGSCAN_DIRECT) +
-			       memcg_events(memcg, PGSCAN_PROACTIVE) +
-			       memcg_events(memcg, PGSCAN_KHUGEPAGED);
+		/* Reuse pgscan_rstat computed above to avoid duplicate calls */
 		seq_buf_printf(s, "pgscan_atomic %lu (rstat=%lu diff=%ld)\n",
 			       pgscan_atomic, pgscan_rstat, (long)(pgscan_rstat - pgscan_atomic));
+#else
+		/* RSTAT not available, just show atomic counter */
+		seq_buf_printf(s, "pgscan_atomic %lu\n", pgscan_atomic);
+#endif /* CONFIG_MEMCG_RSTAT_COUNTER */
 #else
 		/* Atomic counter only - output clean format */
 		seq_buf_printf(s, "pgscan %lu\n", pgscan_atomic);
@@ -2565,11 +2567,11 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 #endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
 
 #ifdef CONFIG_MEMCG_RSTAT_COUNTER
-	seq_buf_printf(s, "pgsteal %lu\n",
-		       memcg_events(memcg, PGSTEAL_KSWAPD) +
+	unsigned long pgsteal_rstat = memcg_events(memcg, PGSTEAL_KSWAPD) +
 		       memcg_events(memcg, PGSTEAL_DIRECT) +
 		       memcg_events(memcg, PGSTEAL_PROACTIVE) +
-		       memcg_events(memcg, PGSTEAL_KHUGEPAGED));
+		       memcg_events(memcg, PGSTEAL_KHUGEPAGED);
+	seq_buf_printf(s, "pgsteal %lu\n", pgsteal_rstat);
 #endif /* CONFIG_MEMCG_RSTAT_COUNTER */
 
 #ifdef CONFIG_MEMCG_ATOMIC_COUNTER
@@ -2581,13 +2583,15 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 			atomic_event_results[memcg_events_index(PGSTEAL_KHUGEPAGED)];
 
 #ifdef CONFIG_MEMCG_STAT_COMPARISON
+#ifdef CONFIG_MEMCG_RSTAT_COUNTER
 		/* Show comparison between rstat and atomic counter for pgsteal */
-		unsigned long pgsteal_rstat = memcg_events(memcg, PGSTEAL_KSWAPD) +
-				memcg_events(memcg, PGSTEAL_DIRECT) +
-				memcg_events(memcg, PGSTEAL_PROACTIVE) +
-				memcg_events(memcg, PGSTEAL_KHUGEPAGED);
+		/* Reuse pgsteal_rstat computed above to avoid duplicate calls */
 		seq_buf_printf(s, "pgsteal_atomic %lu (rstat=%lu diff=%ld)\n",
 			       pgsteal_atomic, pgsteal_rstat, (long)(pgsteal_rstat - pgsteal_atomic));
+#else
+		/* RSTAT not available, just show atomic counter */
+		seq_buf_printf(s, "pgsteal_atomic %lu\n", pgsteal_atomic);
+#endif /* CONFIG_MEMCG_RSTAT_COUNTER */
 #else
 		/* Atomic counter only - output clean format */
 		seq_buf_printf(s, "pgsteal %lu\n", pgsteal_atomic);
@@ -2615,11 +2619,9 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 #ifdef CONFIG_MEMCG_STAT_COMPARISON
 			/* Show comparison between rstat and atomic counter */
 			long diff_long = (long)count - (long)count_atomic;
-			char event_name_buf[64];
-			snprintf(event_name_buf, sizeof(event_name_buf), "%s_atomic",
-				 vm_event_name(memcg_vm_event_stat[i]));
-			seq_buf_printf(s, "%s %lu (rstat=%lu diff=%ld)\n",
-				       event_name_buf, count_atomic, count, diff_long);
+			/* Avoid snprintf overhead - format directly */
+			seq_buf_printf(s, "%s_atomic %lu (rstat=%lu diff=%ld)\n",
+				       vm_event_name(memcg_vm_event_stat[i]), count_atomic, count, diff_long);
 #else
 			/* Atomic counter only - output clean format */
 			seq_buf_printf(s, "%s %lu\n",
