@@ -969,9 +969,8 @@ static bool memcg_atomic_cache_read_stats(struct mem_cgroup *memcg, u64 *results
 		spin_unlock(&cache->lock);
 		return false;
 	}
-	/* Fast memory copy - compiler can optimize this */
-	for (i = 0; i < MEMCG_VMSTAT_SIZE; i++)
-		results[i] = cache->stats[i];
+	/* Use memcpy for better performance - compiler can optimize this */
+	memcpy(results, cache->stats, MEMCG_VMSTAT_SIZE * sizeof(u64));
 	spin_unlock(&cache->lock);
 	return true;
 }
@@ -996,9 +995,8 @@ static bool memcg_atomic_cache_read_events(struct mem_cgroup *memcg,
 		spin_unlock(&cache->lock);
 		return false;
 	}
-	/* Fast memory copy - compiler can optimize this */
-	for (i = 0; i < NR_MEMCG_EVENTS; i++)
-		results[i] = cache->events[i];
+	/* Use memcpy for better performance - compiler can optimize this */
+	memcpy(results, cache->events, NR_MEMCG_EVENTS * sizeof(unsigned long));
 	spin_unlock(&cache->lock);
 	return true;
 }
@@ -1015,9 +1013,8 @@ static void memcg_atomic_cache_update_stats(struct mem_cgroup *memcg,
 
 	cache = memcg->atomic_cache;
 	spin_lock(&cache->lock);
-	/* Copy stats to cache */
-	for (i = 0; i < MEMCG_VMSTAT_SIZE; i++)
-		cache->stats[i] = results[i];
+	/* Use memcpy for better performance */
+	memcpy(cache->stats, results, MEMCG_VMSTAT_SIZE * sizeof(u64));
 	cache->jiffies = jiffies; /* Update timestamp */
 	spin_unlock(&cache->lock);
 }
@@ -1034,9 +1031,8 @@ static void memcg_atomic_cache_update_events(struct mem_cgroup *memcg,
 
 	cache = memcg->atomic_cache;
 	spin_lock(&cache->lock);
-	/* Copy events to cache */
-	for (i = 0; i < NR_MEMCG_EVENTS; i++)
-		cache->events[i] = results[i];
+	/* Use memcpy for better performance */
+	memcpy(cache->events, results, NR_MEMCG_EVENTS * sizeof(unsigned long));
 	cache->jiffies = jiffies; /* Update timestamp */
 	spin_unlock(&cache->lock);
 }
@@ -1061,10 +1057,10 @@ static bool memcg_atomic_cache_read_numa_batch(struct mem_cgroup *memcg,
 		spin_unlock(&cache->lock);
 		return false;
 	}
-	/* Fast memory copy - compiler can optimize this */
+	/* Use memcpy for better performance - copy all NUMA stats at once */
 	for_each_node_state(nid, N_MEMORY) {
-		for (i = 0; i < NR_MEMCG_NODE_STAT_ITEMS; i++)
-			results[nid][i] = cache->numa_stats[nid][i];
+		memcpy(results[nid], cache->numa_stats[nid],
+		       NR_MEMCG_NODE_STAT_ITEMS * sizeof(u64));
 	}
 	spin_unlock(&cache->lock);
 	return true;
@@ -1082,10 +1078,10 @@ static void memcg_atomic_cache_update_numa_batch(struct mem_cgroup *memcg,
 
 	cache = memcg->atomic_cache;
 	spin_lock(&cache->lock);
-	/* Copy NUMA stats to cache */
+	/* Use memcpy for better performance - copy all NUMA stats at once */
 	for_each_node_state(nid, N_MEMORY) {
-		for (i = 0; i < NR_MEMCG_NODE_STAT_ITEMS; i++)
-			cache->numa_stats[nid][i] = results[nid][i];
+		memcpy(cache->numa_stats[nid], results[nid],
+		       NR_MEMCG_NODE_STAT_ITEMS * sizeof(u64));
 	}
 	cache->jiffies = jiffies; /* Update timestamp */
 	spin_unlock(&cache->lock);
@@ -1509,12 +1505,8 @@ static int memcg_atomic_counter_all_numa_batch(struct mem_cgroup *memcg,
 		return 0;
 
 	/* Cache miss - read from atomic counters */
-	/* Initialize results array to zero */
-	for_each_node_state(nid, N_MEMORY) {
-		for (i = 0; i < NR_MEMCG_NODE_STAT_ITEMS; i++) {
-			results_array[nid][i] = 0;
-		}
-	}
+	/* Initialize results array to zero - use memset for better performance */
+	memset(results_array, 0, NR_NODE_STATES * NR_MEMCG_NODE_STAT_ITEMS * sizeof(u64));
 
 	/* Directly accumulate into results array to avoid memory allocation
 	 * and copy overhead. This eliminates one kmalloc/kfree pair and the
