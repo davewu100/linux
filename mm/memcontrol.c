@@ -599,6 +599,8 @@ struct memcg_atomic_all_numa_batch_accum {
 struct memcg_atomic_cache {
 	u64 stats[MEMCG_VMSTAT_SIZE];
 	unsigned long events[NR_MEMCG_EVENTS];
+	/* NUMA batch cache: [nid][stat_idx] */
+	u64 numa_stats[NR_NODE_STATES][NR_MEMCG_NODE_STAT_ITEMS];
 	unsigned long jiffies;	/* timestamp when cache was populated */
 	spinlock_t lock;	/* protects cache updates */
 };
@@ -1039,6 +1041,56 @@ static void memcg_atomic_cache_update_events(struct mem_cgroup *memcg,
 	spin_unlock(&cache->lock);
 }
 
+/* Try to read NUMA batch stats from cache, return true if cache hit */
+static bool memcg_atomic_cache_read_numa_batch(struct mem_cgroup *memcg,
+					       u64 (*results)[NR_MEMCG_NODE_STAT_ITEMS])
+{
+	struct memcg_atomic_cache *cache;
+	int nid, i;
+
+	if (unlikely(!memcg->atomic_cache))
+		return false;
+
+	if (!memcg_atomic_cache_is_valid(memcg))
+		return false;
+
+	cache = memcg->atomic_cache;
+	spin_lock(&cache->lock);
+	/* Re-check after acquiring lock */
+	if (!memcg_atomic_cache_is_valid(memcg)) {
+		spin_unlock(&cache->lock);
+		return false;
+	}
+	/* Fast memory copy - compiler can optimize this */
+	for_each_node_state(nid, N_MEMORY) {
+		for (i = 0; i < NR_MEMCG_NODE_STAT_ITEMS; i++)
+			results[nid][i] = cache->numa_stats[nid][i];
+	}
+	spin_unlock(&cache->lock);
+	return true;
+}
+
+/* Update cache with fresh NUMA batch stats */
+static void memcg_atomic_cache_update_numa_batch(struct mem_cgroup *memcg,
+						 const u64 (*results)[NR_MEMCG_NODE_STAT_ITEMS])
+{
+	struct memcg_atomic_cache *cache;
+	int nid, i;
+
+	if (unlikely(!memcg->atomic_cache))
+		return;
+
+	cache = memcg->atomic_cache;
+	spin_lock(&cache->lock);
+	/* Copy NUMA stats to cache */
+	for_each_node_state(nid, N_MEMORY) {
+		for (i = 0; i < NR_MEMCG_NODE_STAT_ITEMS; i++)
+			cache->numa_stats[nid][i] = results[nid][i];
+	}
+	cache->jiffies = jiffies; /* Update timestamp */
+	spin_unlock(&cache->lock);
+}
+
 static int memcg_page_state_atomic_counter_batch(struct mem_cgroup *memcg,
 						  u64 *results)
 {
@@ -1452,6 +1504,11 @@ static int memcg_atomic_counter_all_numa_batch(struct mem_cgroup *memcg,
 	u64 (*results_array)[NR_MEMCG_NODE_STAT_ITEMS] = results;
 	int nid, i;
 
+	/* Try cache first - fast path */
+	if (memcg_atomic_cache_read_numa_batch(memcg, results_array))
+		return 0;
+
+	/* Cache miss - read from atomic counters */
 	/* Initialize results array to zero */
 	for_each_node_state(nid, N_MEMORY) {
 		for (i = 0; i < NR_MEMCG_NODE_STAT_ITEMS; i++) {
@@ -1464,6 +1521,9 @@ static int memcg_atomic_counter_all_numa_batch(struct mem_cgroup *memcg,
 	 * memory copy operation, improving performance.
 	 */
 	memcg_atomic_walk(memcg, memcg_atomic_visit_all_numa_batch, results);
+
+	/* Update cache with fresh data */
+	memcg_atomic_cache_update_numa_batch(memcg, results_array);
 
 	return 0;
 }
