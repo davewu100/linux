@@ -2551,7 +2551,7 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 #ifdef CONFIG_MEMCG_RSTAT_COUNTER
 		u64 size = memcg_page_state_output(memcg, idx);
 
-		seq_buf_put_name_val(s, memory_stats[i].name, size);
+		seq_buf_printf(s, "%s %llu\n", memory_stats[i].name, size);
 #endif /* CONFIG_MEMCG_RSTAT_COUNTER */
 
 #ifdef CONFIG_MEMCG_ATOMIC_COUNTER
@@ -2566,12 +2566,10 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 			s64 diff = (s64)size - (s64)size_atomic;
 			char name_buf[64];
 			snprintf(name_buf, sizeof(name_buf), "%s_atomic", memory_stats[i].name);
-			seq_buf_put_name_val(s, name_buf, size_atomic);
-			/* Note: comparison output still uses printf for complex format */
-			seq_buf_printf(s, " (rstat=%llu diff=%lld)\n", size, diff);
+			seq_buf_printf(s, "%s %llu (rstat=%llu diff=%lld)\n", name_buf, size_atomic, size, diff);
 #else
 			/* Atomic counter only - output clean format without suffix */
-			seq_buf_put_name_val(s, memory_stats[i].name, size_atomic);
+			seq_buf_printf(s, "%s %llu\n", memory_stats[i].name, size_atomic);
 #endif /* CONFIG_MEMCG_STAT_COMPARISON */
 		}
 #endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
@@ -2580,7 +2578,7 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 #ifdef CONFIG_MEMCG_RSTAT_COUNTER
 			u64 slab_reclaimable = memcg_page_state_output(memcg,
 								   NR_SLAB_RECLAIMABLE_B);
-			seq_buf_put_name_val(s, "slab", size + slab_reclaimable);
+			seq_buf_printf(s, "slab %llu\n", size + slab_reclaimable);
 #endif /* CONFIG_MEMCG_RSTAT_COUNTER */
 
 #ifdef CONFIG_MEMCG_ATOMIC_COUNTER
@@ -2605,12 +2603,11 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 				u64 slab_total_rstat = size + slab_reclaimable;
 				s64 diff = (s64)slab_total_rstat - (s64)slab_total_atomic;
 
-				seq_buf_put_name_val(s, "slab_atomic", slab_total_atomic);
-				seq_buf_printf(s, " (rstat=%llu diff=%lld)\n",
-					       slab_total_rstat, diff);
+				seq_buf_printf(s, "slab_atomic %llu (rstat=%llu diff=%lld)\n",
+					       slab_total_atomic, slab_total_rstat, diff);
 #else
 				/* Atomic counter only - output clean format */
-				seq_buf_put_name_val(s, "slab", slab_total_atomic);
+				seq_buf_printf(s, "slab %llu\n", slab_total_atomic);
 #endif /* CONFIG_MEMCG_STAT_COMPARISON */
 			}
 #endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
@@ -2619,7 +2616,7 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 
 	/* Accumulated memory events */
 #ifdef CONFIG_MEMCG_RSTAT_COUNTER
-	seq_buf_put_name_val_ulong(s, "pgscan",
+	seq_buf_printf(s, "pgscan %lu\n",
 		       memcg_events(memcg, PGSCAN_KSWAPD) +
 		       memcg_events(memcg, PGSCAN_DIRECT) +
 		       memcg_events(memcg, PGSCAN_PROACTIVE) +
@@ -2640,18 +2637,17 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 			       memcg_events(memcg, PGSCAN_DIRECT) +
 			       memcg_events(memcg, PGSCAN_PROACTIVE) +
 			       memcg_events(memcg, PGSCAN_KHUGEPAGED);
-		seq_buf_put_name_val_ulong(s, "pgscan_atomic", pgscan_atomic);
-		seq_buf_printf(s, " (rstat=%lu diff=%ld)\n",
-			       pgscan_rstat, (long)(pgscan_rstat - pgscan_atomic));
+		seq_buf_printf(s, "pgscan_atomic %lu (rstat=%lu diff=%ld)\n",
+			       pgscan_atomic, pgscan_rstat, (long)(pgscan_rstat - pgscan_atomic));
 #else
 		/* Atomic counter only - output clean format */
-		seq_buf_put_name_val_ulong(s, "pgscan", pgscan_atomic);
+		seq_buf_printf(s, "pgscan %lu\n", pgscan_atomic);
 #endif /* CONFIG_MEMCG_STAT_COMPARISON */
 	}
 #endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
 
 #ifdef CONFIG_MEMCG_RSTAT_COUNTER
-	seq_buf_put_name_val_ulong(s, "pgsteal",
+	seq_buf_printf(s, "pgsteal %lu\n",
 		       memcg_events(memcg, PGSTEAL_KSWAPD) +
 		       memcg_events(memcg, PGSTEAL_DIRECT) +
 		       memcg_events(memcg, PGSTEAL_PROACTIVE) +
@@ -2672,12 +2668,11 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 				memcg_events(memcg, PGSTEAL_DIRECT) +
 				memcg_events(memcg, PGSTEAL_PROACTIVE) +
 				memcg_events(memcg, PGSTEAL_KHUGEPAGED);
-		seq_buf_put_name_val_ulong(s, "pgsteal_atomic", pgsteal_atomic);
-		seq_buf_printf(s, " (rstat=%lu diff=%ld)\n",
-			       pgsteal_rstat, (long)(pgsteal_rstat - pgsteal_atomic));
+		seq_buf_printf(s, "pgsteal_atomic %lu (rstat=%lu diff=%ld)\n",
+			       pgsteal_atomic, pgsteal_rstat, (long)(pgsteal_rstat - pgsteal_atomic));
 #else
 		/* Atomic counter only - output clean format */
-		seq_buf_put_name_val_ulong(s, "pgsteal", pgsteal_atomic);
+		seq_buf_printf(s, "pgsteal %lu\n", pgsteal_atomic);
 #endif /* CONFIG_MEMCG_STAT_COMPARISON */
 	}
 #endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
@@ -2691,8 +2686,8 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 
 #ifdef CONFIG_MEMCG_RSTAT_COUNTER
 		unsigned long count = memcg_events(memcg, memcg_vm_event_stat[i]);
-		seq_buf_put_name_val_ulong(s, vm_event_name(memcg_vm_event_stat[i]),
-			       count);
+		seq_buf_printf(s, "%s %lu\n",
+			       vm_event_name(memcg_vm_event_stat[i]), count);
 #endif /* CONFIG_MEMCG_RSTAT_COUNTER */
 
 #ifdef CONFIG_MEMCG_ATOMIC_COUNTER
@@ -2705,12 +2700,12 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 			char event_name_buf[64];
 			snprintf(event_name_buf, sizeof(event_name_buf), "%s_atomic",
 				 vm_event_name(memcg_vm_event_stat[i]));
-			seq_buf_put_name_val_ulong(s, event_name_buf, count_atomic);
-			seq_buf_printf(s, " (rstat=%lu diff=%ld)\n", count, diff_long);
+			seq_buf_printf(s, "%s %lu (rstat=%lu diff=%ld)\n",
+				       event_name_buf, count_atomic, count, diff_long);
 #else
 			/* Atomic counter only - output clean format */
-			seq_buf_put_name_val_ulong(s, vm_event_name(memcg_vm_event_stat[i]),
-				       count_atomic);
+			seq_buf_printf(s, "%s %lu\n",
+				       vm_event_name(memcg_vm_event_stat[i]), count_atomic);
 #endif /* CONFIG_MEMCG_STAT_COMPARISON */
 		}
 #endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
