@@ -566,19 +566,31 @@ struct memcg_vmstats_percpu {
 /*
  * Per-cgroup atomic counter based stats (experimental alternative to rstat)
  *
- * Single atomic counter per cgroup (not per-CPU). Each stat update uses
- * atomic64_add() to update the counter, and reads can directly access the
- * value with atomic64_read(). Hierarchical stats are computed by recursively
- * aggregating all children using RCU-protected tree traversal.
- *
- * Trade-offs:
- * - Pros: Fast reads (no per-CPU aggregation), lock-free recursive queries
- * - Cons: Potential cache line bouncing on writes, higher write overhead
+ * Two modes supported:
+ * 1. Global mode (default): Single atomic counter per cgroup
+ *    - Fast reads (no per-CPU aggregation)
+ *    - Potential cache line bouncing on writes
+ * 2. Sharded mode (CONFIG_MEMCG_ATOMIC_COUNTER_SHARD): Per-CPU counters
+ *    - Fast writes (no cache line bouncing)
+ *    - Requires aggregation on reads (similar to rstat)
  */
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER_SHARD
+/* Per-CPU sharded version - reduces cache line bouncing on writes */
+struct memcg_atomic_counter_percpu {
+	long			state[MEMCG_VMSTAT_SIZE];
+	unsigned long		events[NR_MEMCG_EVENTS];
+} ____cacheline_aligned;
+
+struct memcg_atomic_counter {
+	struct memcg_atomic_counter_percpu __percpu *percpu;
+} ____cacheline_aligned_in_smp;
+#else
+/* Global atomic version - fast reads, potential cache line bouncing on writes */
 struct memcg_atomic_counter {
 	atomic64_t		state[MEMCG_VMSTAT_SIZE];
 	atomic64_t		events[NR_MEMCG_EVENTS];
 } ____cacheline_aligned_in_smp;
+#endif /* CONFIG_MEMCG_ATOMIC_COUNTER_SHARD */
 
 struct memcg_atomic_node_accum {
 	int nid;
@@ -815,8 +827,16 @@ void mod_memcg_state(struct mem_cgroup *memcg, enum memcg_stat_item idx,
 #ifdef CONFIG_MEMCG_ATOMIC_COUNTER
 	struct memcg_atomic_counter *counter = memcg->atomic_counter;
 
-	if (likely(counter))
+	if (likely(counter)) {
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER_SHARD
+		/* Per-CPU sharded: update current CPU's counter, no cache line bouncing */
+		struct memcg_atomic_counter_percpu *pcpu = this_cpu_ptr(counter->percpu);
+		pcpu->state[i] += val;
+#else
+		/* Global atomic: all CPUs update same counter, potential cache line bouncing */
 		atomic64_add(val, &counter->state[i]);
+#endif /* CONFIG_MEMCG_ATOMIC_COUNTER_SHARD */
+	}
 #endif
 
 	trace_mod_memcg_state(memcg, idx, val_pages);
@@ -874,7 +894,17 @@ memcg_page_state_atomic_counter_recursive(struct mem_cgroup *memcg, int idx)
 	 * We trade perfect snapshot consistency for lock-free performance.
 	 * Use READ_ONCE on .counter field instead of atomic64_read for better performance.
 	 */
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER_SHARD
+	/* Per-CPU sharded: aggregate all CPUs */
+	int cpu;
+	for_each_possible_cpu(cpu) {
+		struct memcg_atomic_counter_percpu *pcpu = per_cpu_ptr(counter->percpu, cpu);
+		total += READ_ONCE(pcpu->state[i]);
+	}
+#else
+	/* Global atomic: direct read */
 	total = READ_ONCE(counter->state[i].counter);
+#endif /* CONFIG_MEMCG_ATOMIC_COUNTER_SHARD */
 
 	/* Early exit if no children to avoid RCU overhead */
 	if (list_empty(&memcg->atomic_children))
@@ -915,16 +945,27 @@ static inline int memcg_atomic_visit_batch(struct mem_cgroup *memcg, void *data)
 	if (unlikely(!counter))
 		return 0;
 
-	/* Directly accumulate into results array - cache-friendly sequential access
-	 * Use direct read instead of READ_ONCE for better performance.
+	/* Directly accumulate into results array - cache-friendly sequential access */
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER_SHARD
+	/* Per-CPU sharded: aggregate all CPUs */
+	int cpu;
+	for_each_possible_cpu(cpu) {
+		struct memcg_atomic_counter_percpu *pcpu = per_cpu_ptr(counter->percpu, cpu);
+		for (i = 0; i < MEMCG_VMSTAT_SIZE; i++) {
+			results[i] += READ_ONCE(pcpu->state[i]);
+		}
+	}
+#else
+	/* Global atomic: direct read */
+	/* Use direct read instead of READ_ONCE for better performance.
 	 * Under RCU protection, counter pointer is stable and values are atomic64_t,
 	 * so we can safely read the .counter field directly. The small race window
 	 * for individual reads is acceptable for statistics.
-	 *
 	 */
 	for (i = 0; i < MEMCG_VMSTAT_SIZE; i++) {
 		results[i] += counter->state[i].counter;
 	}
+#endif /* CONFIG_MEMCG_ATOMIC_COUNTER_SHARD */
 
 	return 0;
 }
@@ -1117,13 +1158,25 @@ static inline int memcg_atomic_visit_events_batch(struct mem_cgroup *memcg, void
 	if (unlikely(!counter))
 		return 0;
 
-	/* Directly accumulate into results array - cache-friendly sequential access
-	 * Use direct read instead of READ_ONCE for better performance.
+	/* Directly accumulate into results array - cache-friendly sequential access */
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER_SHARD
+	/* Per-CPU sharded: aggregate all CPUs */
+	int cpu;
+	for_each_possible_cpu(cpu) {
+		struct memcg_atomic_counter_percpu *pcpu = per_cpu_ptr(counter->percpu, cpu);
+		for (i = 0; i < NR_MEMCG_EVENTS; i++) {
+			results[i] += READ_ONCE(pcpu->events[i]);
+		}
+	}
+#else
+	/* Global atomic: direct read */
+	/* Use direct read instead of READ_ONCE for better performance.
 	 * Under RCU protection, counter pointer is stable and values are atomic64_t,
 	 * so we can safely read the .counter field directly.
 	 */
 	for (i = 0; i < NR_MEMCG_EVENTS; i++)
 		results[i] += (unsigned long)counter->events[i].counter;
+#endif /* CONFIG_MEMCG_ATOMIC_COUNTER_SHARD */
 
 	return 0;
 }
@@ -1166,6 +1219,42 @@ static void memcg_atomic_transfer_to_parent(struct mem_cgroup *memcg)
 	if (unlikely(!child_counter || !parent_counter))
 		return;
 
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER_SHARD
+	/* Per-CPU sharded: aggregate all CPUs from child, then add to parent */
+	int cpu;
+	s64 total_delta;
+
+	for (i = 0; i < MEMCG_VMSTAT_SIZE; i++) {
+		total_delta = 0;
+		for_each_possible_cpu(cpu) {
+			struct memcg_atomic_counter_percpu *child_pcpu =
+				per_cpu_ptr(child_counter->percpu, cpu);
+			total_delta += child_pcpu->state[i];
+			child_pcpu->state[i] = 0;
+		}
+		if (total_delta) {
+			struct memcg_atomic_counter_percpu *parent_pcpu =
+				this_cpu_ptr(parent_counter->percpu);
+			parent_pcpu->state[i] += total_delta;
+		}
+	}
+
+	for (i = 0; i < NR_MEMCG_EVENTS; i++) {
+		total_delta = 0;
+		for_each_possible_cpu(cpu) {
+			struct memcg_atomic_counter_percpu *child_pcpu =
+				per_cpu_ptr(child_counter->percpu, cpu);
+			total_delta += child_pcpu->events[i];
+			child_pcpu->events[i] = 0;
+		}
+		if (total_delta) {
+			struct memcg_atomic_counter_percpu *parent_pcpu =
+				this_cpu_ptr(parent_counter->percpu);
+			parent_pcpu->events[i] += total_delta;
+		}
+	}
+#else
+	/* Global atomic: use atomic operations */
 	for (i = 0; i < MEMCG_VMSTAT_SIZE; i++) {
 		s64 delta = atomic64_xchg(&child_counter->state[i], 0);
 
@@ -1179,6 +1268,7 @@ static void memcg_atomic_transfer_to_parent(struct mem_cgroup *memcg)
 		if (delta)
 			atomic64_add(delta, &parent_counter->events[i]);
 	}
+#endif /* CONFIG_MEMCG_ATOMIC_COUNTER_SHARD */
 
 	for_each_node_state(i, N_MEMORY) {
 		struct mem_cgroup_per_node *pn = memcg->nodeinfo[i];
@@ -1234,10 +1324,19 @@ static unsigned long memcg_events_atomic_counter_recursive(struct mem_cgroup *me
 
 	i = memcg_events_index(idx);
 
-	/* Read single atomic value for this memcg
-	 * Use READ_ONCE on .counter field instead of atomic64_read for better performance.
-	 */
+	/* Read value for this memcg */
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER_SHARD
+	/* Per-CPU sharded: aggregate all CPUs */
+	int cpu;
+	for_each_possible_cpu(cpu) {
+		struct memcg_atomic_counter_percpu *pcpu = per_cpu_ptr(counter->percpu, cpu);
+		total += READ_ONCE(pcpu->events[i]);
+	}
+#else
+	/* Global atomic: direct read */
+	/* Use READ_ONCE on .counter field instead of atomic64_read for better performance. */
 	total = READ_ONCE(counter->events[i].counter);
+#endif /* CONFIG_MEMCG_ATOMIC_COUNTER_SHARD */
 
 	/* Early exit if no children to avoid RCU overhead */
 	if (list_empty(&memcg->atomic_children))
@@ -1573,7 +1672,14 @@ static void mod_memcg_lruvec_state(struct lruvec *lruvec,
 	/* Use READ_ONCE to avoid unnecessary memory barriers on the pointer */
 	/* Update both counters if available - group writes together for better cache behavior */
 	if (likely(counter)) {
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER_SHARD
+		/* Per-CPU sharded: update current CPU's counter */
+		struct memcg_atomic_counter_percpu *pcpu = this_cpu_ptr(counter->percpu);
+		pcpu->state[i] += val;
+#else
+		/* Global atomic: all CPUs update same counter */
 		atomic64_add(val, &counter->state[i]);
+#endif /* CONFIG_MEMCG_ATOMIC_COUNTER_SHARD */
 		if (likely(node_counter))
 			atomic64_add(val, &node_counter->state[i]);
 	} else if (unlikely(node_counter)) {
@@ -1680,8 +1786,16 @@ void count_memcg_events(struct mem_cgroup *memcg, enum vm_event_item idx,
 #ifdef CONFIG_MEMCG_ATOMIC_COUNTER
 	struct memcg_atomic_counter *counter = memcg->atomic_counter;
 
-	if (likely(counter))
+	if (likely(counter)) {
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER_SHARD
+		/* Per-CPU sharded: update current CPU's counter, no cache line bouncing */
+		struct memcg_atomic_counter_percpu *pcpu = this_cpu_ptr(counter->percpu);
+		pcpu->events[i] += count;
+#else
+		/* Global atomic: all CPUs update same counter, potential cache line bouncing */
 		atomic64_add(count, &counter->events[i]);
+#endif /* CONFIG_MEMCG_ATOMIC_COUNTER_SHARD */
+	}
 #endif
 }
 
@@ -2328,8 +2442,16 @@ static void memcg_atomic_flush_pending_only(struct mem_cgroup *memcg)
 		struct memcg_atomic_counter *counter =
 			READ_ONCE(memcg->atomic_counter);
 
-		if (kmem && likely(counter))
+		if (kmem && likely(counter)) {
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER_SHARD
+			/* Per-CPU sharded: update current CPU's counter */
+			struct memcg_atomic_counter_percpu *pcpu = this_cpu_ptr(counter->percpu);
+			pcpu->state[index] += kmem;
+#else
+			/* Global atomic: all CPUs update same counter */
 			atomic64_add(kmem, &counter->state[index]);
+#endif /* CONFIG_MEMCG_ATOMIC_COUNTER_SHARD */
+		}
 	}
 
 	/* slab: fold per-node deferred deltas into per-node and cgroup atomics */
@@ -2345,8 +2467,16 @@ static void memcg_atomic_flush_pending_only(struct mem_cgroup *memcg)
 			int index = memcg_stats_index(NR_SLAB_RECLAIMABLE_B);
 
 			if (slab) {
-				if (likely(counter))
+				if (likely(counter)) {
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER_SHARD
+					/* Per-CPU sharded: update current CPU's counter */
+					struct memcg_atomic_counter_percpu *pcpu = this_cpu_ptr(counter->percpu);
+					pcpu->state[index] += slab;
+#else
+					/* Global atomic: all CPUs update same counter */
 					atomic64_add(slab, &counter->state[index]);
+#endif /* CONFIG_MEMCG_ATOMIC_COUNTER_SHARD */
+				}
 				if (likely(node_counter))
 					atomic64_add(slab, &node_counter->state[index]);
 			}
@@ -2356,8 +2486,16 @@ static void memcg_atomic_flush_pending_only(struct mem_cgroup *memcg)
 			int index = memcg_stats_index(NR_SLAB_UNRECLAIMABLE_B);
 
 			if (slab) {
-				if (likely(counter))
+				if (likely(counter)) {
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER_SHARD
+					/* Per-CPU sharded: update current CPU's counter */
+					struct memcg_atomic_counter_percpu *pcpu = this_cpu_ptr(counter->percpu);
+					pcpu->state[index] += slab;
+#else
+					/* Global atomic: all CPUs update same counter */
 					atomic64_add(slab, &counter->state[index]);
+#endif /* CONFIG_MEMCG_ATOMIC_COUNTER_SHARD */
+				}
 				if (likely(node_counter))
 					atomic64_add(slab, &node_counter->state[index]);
 			}
@@ -4842,7 +4980,15 @@ static void __mem_cgroup_free(struct mem_cgroup *memcg)
 	 * Safe to free atomic_counter here - RCU grace period has passed,
 	 * all readers using list_for_each_entry_rcu() have completed.
 	 */
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER_SHARD
+	if (memcg->atomic_counter) {
+		if (memcg->atomic_counter->percpu)
+			free_percpu(memcg->atomic_counter->percpu);
+		kfree(memcg->atomic_counter);
+	}
+#else
 	kfree(memcg->atomic_counter);
+#endif /* CONFIG_MEMCG_ATOMIC_COUNTER_SHARD */
 	kfree(memcg->atomic_cache);
 #endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
 	kfree(memcg);
@@ -4886,10 +5032,26 @@ static struct mem_cgroup *mem_cgroup_alloc(struct mem_cgroup *parent)
 
 #ifdef CONFIG_MEMCG_ATOMIC_COUNTER
 	/* Allocate per-cgroup atomic counter stats (experimental) */
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER_SHARD
+	/* Per-CPU sharded: allocate per-CPU structure */
 	memcg->atomic_counter = kzalloc(sizeof(struct memcg_atomic_counter),
 						  GFP_KERNEL_ACCOUNT);
 	if (unlikely(!memcg->atomic_counter))
 		goto fail;
+	memcg->atomic_counter->percpu = alloc_percpu_gfp(
+			struct memcg_atomic_counter_percpu, GFP_KERNEL_ACCOUNT);
+	if (unlikely(!memcg->atomic_counter->percpu)) {
+		kfree(memcg->atomic_counter);
+		memcg->atomic_counter = NULL;
+		goto fail;
+	}
+#else
+	/* Global atomic: allocate single structure */
+	memcg->atomic_counter = kzalloc(sizeof(struct memcg_atomic_counter),
+						  GFP_KERNEL_ACCOUNT);
+	if (unlikely(!memcg->atomic_counter))
+		goto fail;
+#endif /* CONFIG_MEMCG_ATOMIC_COUNTER_SHARD */
 
 	/* Initialize atomic counter children list for hierarchical aggregation */
 	INIT_LIST_HEAD(&memcg->atomic_children);
