@@ -736,7 +736,6 @@ static void flush_memcg_stats_dwork(struct work_struct *w)
 }
 
 static int memcg_page_state_unit(int item);
-static int memcg_page_state_output_unit(int item);
 #ifdef CONFIG_MEMCG_ATOMIC_COUNTER
 static int memcg_atomic_walk(struct mem_cgroup *memcg,
 			     int (*visit)(struct mem_cgroup *, void *),
@@ -2237,39 +2236,6 @@ static const struct memory_stat memory_stats[] = {
 #endif
 };
 
-#ifdef CONFIG_MEMCG_ATOMIC_COUNTER
-/* Pre-computed stat indices and output units for atomic counter optimization */
-static int memcg_stat_indices[ARRAY_SIZE(memory_stats)] __read_mostly;
-static int memcg_output_units[ARRAY_SIZE(memory_stats)] __read_mostly;
-static bool memcg_stat_indices_initialized __read_mostly;
-
-/* Initialize pre-computed arrays - called once at module init */
-static void __init memcg_init_stat_indices(void)
-{
-	int i;
-
-	for (i = 0; i < ARRAY_SIZE(memory_stats); i++) {
-		memcg_stat_indices[i] = memcg_stats_index(memory_stats[i].idx);
-		memcg_output_units[i] = memcg_page_state_output_unit(memory_stats[i].idx);
-	}
-	memcg_stat_indices_initialized = true;
-}
-
-/* Pre-computed slab stat indices and units */
-static int slab_unreclaimable_stat_idx __read_mostly;
-static int slab_reclaimable_stat_idx __read_mostly;
-static int slab_unreclaimable_unit __read_mostly;
-static int slab_reclaimable_unit __read_mostly;
-
-static void __init memcg_init_slab_indices(void)
-{
-	slab_unreclaimable_stat_idx = memcg_stats_index(NR_SLAB_UNRECLAIMABLE_B);
-	slab_reclaimable_stat_idx = memcg_stats_index(NR_SLAB_RECLAIMABLE_B);
-	slab_unreclaimable_unit = memcg_page_state_output_unit(NR_SLAB_UNRECLAIMABLE_B);
-	slab_reclaimable_unit = memcg_page_state_output_unit(NR_SLAB_RECLAIMABLE_B);
-}
-#endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
-
 /* The actual unit of the state item, not the same as the output unit */
 static int memcg_page_state_unit(int item)
 {
@@ -2476,11 +2442,6 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 		atomic_events_available = (memcg_events_atomic_counter_batch(
 					memcg, atomic_event_results) == 0);
 	}
-	/* Use pre-computed stat indices and output units to avoid repeated function calls */
-	if (unlikely(!memcg_stat_indices_initialized)) {
-		memcg_init_stat_indices();
-		memcg_init_slab_indices();
-	}
 #endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
 
 	for (i = 0; i < ARRAY_SIZE(memory_stats); i++) {
@@ -2500,10 +2461,10 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 
 #ifdef CONFIG_MEMCG_ATOMIC_COUNTER
 		if (atomic_available) {
-			/* Use pre-computed values to avoid function call overhead */
-			u64 size_atomic = atomic_results[memcg_stat_indices[i]];
+			int stat_idx = memcg_stats_index(idx);
+			u64 size_atomic = atomic_results[stat_idx];
 
-			size_atomic *= memcg_output_units[i];
+			size_atomic *= memcg_page_state_output_unit(idx);
 
 #ifdef CONFIG_MEMCG_STAT_COMPARISON
 			/* Show comparison between rstat and atomic counter */
@@ -2527,13 +2488,18 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 
 #ifdef CONFIG_MEMCG_ATOMIC_COUNTER
 			if (atomic_available) {
-				/* Use pre-computed values to avoid function call overhead */
+				int slab_unreclaimable_idx =
+					memcg_stats_index(NR_SLAB_UNRECLAIMABLE_B);
+				int slab_reclaimable_idx =
+					memcg_stats_index(NR_SLAB_RECLAIMABLE_B);
 				u64 slab_unreclaimable_atomic =
-					atomic_results[slab_unreclaimable_stat_idx];
+					atomic_results[slab_unreclaimable_idx];
 				u64 slab_reclaimable_atomic =
-					atomic_results[slab_reclaimable_stat_idx];
-				slab_unreclaimable_atomic *= slab_unreclaimable_unit;
-				slab_reclaimable_atomic *= slab_reclaimable_unit;
+					atomic_results[slab_reclaimable_idx];
+				slab_unreclaimable_atomic *=
+					memcg_page_state_output_unit(NR_SLAB_UNRECLAIMABLE_B);
+				slab_reclaimable_atomic *=
+					memcg_page_state_output_unit(NR_SLAB_RECLAIMABLE_B);
 				u64 slab_total_atomic = slab_unreclaimable_atomic +
 						    slab_reclaimable_atomic;
 
@@ -6511,12 +6477,6 @@ int __init mem_cgroup_init(void)
 {
 	unsigned int memcg_size;
 	int cpu;
-
-#ifdef CONFIG_MEMCG_ATOMIC_COUNTER
-	/* Initialize pre-computed stat indices and output units */
-	memcg_init_stat_indices();
-	memcg_init_slab_indices();
-#endif
 
 	/*
 	 * Currently s32 type (can refer to struct batched_lruvec_stat) is
