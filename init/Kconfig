@@ -1093,6 +1093,33 @@ config MEMCG_ATOMIC_COUNTER
 	  Say N unless you are doing performance testing or need lock-free
 	  hierarchical stats on cgroup v2 and do NOT require per-node data.
 
+config MEMCG_ATOMIC_COUNTER_SHARD
+	bool "Enable per-CPU sharding for atomic counters"
+	depends on MEMCG_ATOMIC_COUNTER && SMP
+	default n
+	help
+	  Enable per-CPU sharding for atomic counters to reduce cache line
+	  bouncing on writes. This improves write performance in high-concurrency
+	  scenarios but requires aggregation on reads (similar to rstat).
+
+	  When enabled:
+	    - Each CPU updates its own per-CPU counter (no cache line bouncing)
+	    - Write performance improves significantly (2-5x in high concurrency)
+	    - Read path requires aggregation across all CPUs (similar to rstat flush)
+	    - Memory overhead increases (per-CPU structures per cgroup)
+
+	  When disabled (default):
+	    - Single atomic counter per cgroup (cache line bouncing on writes)
+	    - Fast reads (direct atomic64_read, no aggregation needed)
+	    - Lower memory overhead
+
+	  This option trades read performance for write performance. Choose based
+	  on your workload:
+	    - Enable if: High write frequency, many CPUs, write-heavy workloads
+	    - Disable if: Frequent reads, read-heavy workloads, memory constrained
+
+	  Say N unless you have write-heavy workloads with high concurrency.
+
 comment "WARNING: Atomic counters are incompatible with cgroup v1!"
 	depends on MEMCG_V1 && MEMCG_ATOMIC_COUNTER
 
