@@ -2415,88 +2415,6 @@ static char *fast_u64_to_str(u64 val, char *buf, int *len)
 	return p;
 }
 
-/**
- * fast_ulong_to_str - Fast conversion of unsigned long to decimal string
- * @val: value to convert
- * @buf: buffer to write to (must be at least 21 bytes)
- * @len: pointer to store the length of the string (excluding null terminator)
- *
- * Returns: pointer to the start of the number string in buf
- */
-static char *fast_ulong_to_str(unsigned long val, char *buf, int *len)
-{
-	return fast_u64_to_str((u64)val, buf, len);
-}
-
-/**
- * seq_buf_put_name_val - Optimized formatting: name + value + newline
- * @s: seq_buf to write to
- * @name: stat name (null-terminated string)
- * @val: stat value (u64)
- *
- * This function reduces formatting overhead by:
- * 1. Using fast number-to-string conversion
- * 2. Combining name, value, and newline in a single write operation
- * 3. Avoiding printf parsing overhead
- */
-/* Optimized: cache name length to avoid strlen() overhead */
-static void seq_buf_put_name_val(struct seq_buf *s, const char *name, u64 val)
-{
-	char num_buf[21];
-	int num_len;
-	char *num_str = fast_u64_to_str(val, num_buf, &num_len);
-	/* Optimize: use compile-time known length or cache it */
-	/* For known stat names, we can avoid strlen() */
-	int name_len;
-	const char *p = name;
-	
-	/* Fast strlen for short strings (most stat names are < 32 chars) */
-	for (name_len = 0; name_len < 64 && *p; name_len++, p++)
-		;
-	
-	char *buf;
-	size_t avail;
-
-	/* Reserve space: name + space + number + newline */
-	if (seq_buf_has_overflowed(s))
-		return;
-
-	avail = seq_buf_get_buf(s, &buf);
-	if (avail < name_len + 1 + num_len + 1) {
-		seq_buf_set_overflow(s);
-		return;
-	}
-
-	/* Write name */
-	memcpy(buf, name, name_len);
-	buf += name_len;
-
-	/* Write space */
-	*buf++ = ' ';
-
-	/* Write number */
-	memcpy(buf, num_str, num_len);
-	buf += num_len;
-
-	/* Write newline */
-	*buf++ = '\n';
-
-	/* Commit the written bytes */
-	seq_buf_commit(s, name_len + 1 + num_len + 1);
-}
-
-/**
- * seq_buf_put_name_val_ulong - Optimized formatting for unsigned long
- * @s: seq_buf to write to
- * @name: stat name
- * @val: stat value (unsigned long)
- */
-static void seq_buf_put_name_val_ulong(struct seq_buf *s, const char *name,
-				       unsigned long val)
-{
-	seq_buf_put_name_val(s, name, (u64)val);
-}
-
 static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 {
 	int i;
@@ -2564,9 +2482,9 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 #ifdef CONFIG_MEMCG_STAT_COMPARISON
 			/* Show comparison between rstat and atomic counter */
 			s64 diff = (s64)size - (s64)size_atomic;
-			char name_buf[64];
-			snprintf(name_buf, sizeof(name_buf), "%s_atomic", memory_stats[i].name);
-			seq_buf_printf(s, "%s %llu (rstat=%llu diff=%lld)\n", name_buf, size_atomic, size, diff);
+			/* Avoid snprintf overhead - format directly */
+			seq_buf_printf(s, "%s_atomic %llu (rstat=%llu diff=%lld)\n",
+				       memory_stats[i].name, size_atomic, size, diff);
 #else
 			/* Atomic counter only - output clean format without suffix */
 			seq_buf_printf(s, "%s %llu\n", memory_stats[i].name, size_atomic);
