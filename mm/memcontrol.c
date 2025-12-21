@@ -921,9 +921,17 @@ static inline int memcg_atomic_visit_batch(struct mem_cgroup *memcg, void *data)
 	 * so we can safely read the .counter field directly. The small race window
 	 * for individual reads is acceptable for statistics.
 	 *
+	 * Compiler auto-vectorization: The compiler can automatically generate SIMD
+	 * instructions (SSE/AVX on x86, NEON on ARM64) for this loop, providing
+	 * cross-platform performance optimization without architecture-specific code.
 	 */
+	/* Hint compiler to optimize: restrict pointer, unroll loop */
+	u64 * __restrict res = results;
+	const struct memcg_atomic_counter * __restrict cnt = counter;
+
+	/* Compiler will auto-vectorize this loop on supported architectures */
 	for (i = 0; i < MEMCG_VMSTAT_SIZE; i++) {
-		results[i] += counter->state[i].counter;
+		res[i] += cnt->state[i].counter;
 	}
 
 	return 0;
@@ -1121,9 +1129,17 @@ static inline int memcg_atomic_visit_events_batch(struct mem_cgroup *memcg, void
 	 * Use direct read instead of READ_ONCE for better performance.
 	 * Under RCU protection, counter pointer is stable and values are atomic64_t,
 	 * so we can safely read the .counter field directly.
+	 *
+	 * Compiler auto-vectorization: The compiler can automatically generate SIMD
+	 * instructions for this loop, providing cross-platform optimization.
 	 */
+	/* Hint compiler to optimize: restrict pointer, unroll loop */
+	unsigned long * __restrict res = results;
+	const struct memcg_atomic_counter * __restrict cnt = counter;
+
+	/* Compiler will auto-vectorize this loop on supported architectures */
 	for (i = 0; i < NR_MEMCG_EVENTS; i++)
-		results[i] += (unsigned long)counter->events[i].counter;
+		res[i] += (unsigned long)cnt->events[i].counter;
 
 	return 0;
 }
@@ -2253,7 +2269,8 @@ static int memcg_page_state_unit(int item)
 }
 
 /* Translate stat items to the correct unit for memory.stat output */
-static int memcg_page_state_output_unit(int item)
+/* Inline for performance - called frequently in hot path */
+static inline int memcg_page_state_output_unit(int item)
 {
 	/*
 	 * Workingset state is actually in pages, but we export it to userspace
@@ -2261,26 +2278,27 @@ static int memcg_page_state_output_unit(int item)
 	 *
 	 * Demotion and promotion activities are exported in pages, consistent
 	 * with their global counterparts.
+	 *
+	 * Optimized: Most items return PAGE_SIZE, so we check common case first.
 	 */
-	switch (item) {
-	case WORKINGSET_REFAULT_ANON:
-	case WORKINGSET_REFAULT_FILE:
-	case WORKINGSET_ACTIVATE_ANON:
-	case WORKINGSET_ACTIVATE_FILE:
-	case WORKINGSET_RESTORE_ANON:
-	case WORKINGSET_RESTORE_FILE:
-	case WORKINGSET_NODERECLAIM:
-	case PGDEMOTE_KSWAPD:
-	case PGDEMOTE_DIRECT:
-	case PGDEMOTE_KHUGEPAGED:
-	case PGDEMOTE_PROACTIVE:
+	if (likely(item != WORKINGSET_REFAULT_ANON &&
+		   item != WORKINGSET_REFAULT_FILE &&
+		   item != WORKINGSET_ACTIVATE_ANON &&
+		   item != WORKINGSET_ACTIVATE_FILE &&
+		   item != WORKINGSET_RESTORE_ANON &&
+		   item != WORKINGSET_RESTORE_FILE &&
+		   item != WORKINGSET_NODERECLAIM &&
+		   item != PGDEMOTE_KSWAPD &&
+		   item != PGDEMOTE_DIRECT &&
+		   item != PGDEMOTE_KHUGEPAGED &&
+		   item != PGDEMOTE_PROACTIVE
 #ifdef CONFIG_NUMA_BALANCING
-	case PGPROMOTE_SUCCESS:
+		   && item != PGPROMOTE_SUCCESS
 #endif
-		return 1;
-	default:
+		   )) {
 		return memcg_page_state_unit(item);
 	}
+	return 1;
 }
 
 unsigned long memcg_page_state_output(struct mem_cgroup *memcg, int item)
@@ -2370,38 +2388,6 @@ static void memcg_atomic_flush_pending_only(struct mem_cgroup *memcg)
 }
 #endif
 
-/**
- * fast_u64_to_str - Fast conversion of u64 to decimal string
- * @val: value to convert
- * @buf: buffer to write to (must be at least 21 bytes)
- * @len: pointer to store the length of the string (excluding null terminator)
- *
- * Returns: pointer to the start of the number string in buf
- *
- * This is optimized for performance-critical paths where we need to convert
- * numbers to strings frequently. Avoids the overhead of full printf formatting.
- */
-static char *fast_u64_to_str(u64 val, char *buf, int *len)
-{
-	char *p = buf + 20;  /* Start from the end */
-	*p = '\0';
-	*len = 0;
-
-	if (val == 0) {
-		*--p = '0';
-		*len = 1;
-		return p;
-	}
-
-	while (val > 0) {
-		*--p = '0' + (val % 10);
-		val /= 10;
-		(*len)++;
-	}
-
-	return p;
-}
-
 static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 {
 	int i;
@@ -2446,6 +2432,7 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 
 	for (i = 0; i < ARRAY_SIZE(memory_stats); i++) {
 		int idx = memory_stats[i].idx;
+		int output_unit;  /* Cache output unit to avoid repeated calls */
 
 #ifdef CONFIG_HUGETLB_PAGE
 		if (unlikely(idx == NR_HUGETLB) &&
@@ -2453,10 +2440,17 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 			continue;
 #endif
 
+		/* Pre-compute output unit once per stat item to reduce function calls */
+		output_unit = memcg_page_state_output_unit(idx);
+
 #ifdef CONFIG_MEMCG_RSTAT_COUNTER
 		u64 size = memcg_page_state_output(memcg, idx);
 
-		seq_buf_printf(s, "%s %llu\n", memory_stats[i].name, size);
+		/* Use kernel's seq_buf APIs directly for better maintainability */
+		seq_buf_puts(s, memory_stats[i].name);
+		seq_buf_putc(s, ' ');
+		seq_buf_printf(s, "%llu", size);
+		seq_buf_putc(s, '\n');
 #endif /* CONFIG_MEMCG_RSTAT_COUNTER */
 
 #ifdef CONFIG_MEMCG_ATOMIC_COUNTER
@@ -2464,7 +2458,7 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 			int stat_idx = memcg_stats_index(idx);
 			u64 size_atomic = atomic_results[stat_idx];
 
-			size_atomic *= memcg_page_state_output_unit(idx);
+			size_atomic *= output_unit;
 
 #ifdef CONFIG_MEMCG_STAT_COMPARISON
 			/* Show comparison between rstat and atomic counter */
@@ -2474,16 +2468,28 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 				       memory_stats[i].name, size_atomic, size, diff);
 #else
 			/* Atomic counter only - output clean format without suffix */
-			seq_buf_printf(s, "%s %llu\n", memory_stats[i].name, size_atomic);
+			/* Use kernel's seq_buf APIs directly */
+			seq_buf_puts(s, memory_stats[i].name);
+			seq_buf_putc(s, ' ');
+			seq_buf_printf(s, "%llu", size_atomic);
+			seq_buf_putc(s, '\n');
 #endif /* CONFIG_MEMCG_STAT_COMPARISON */
 		}
 #endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
 
 		if (unlikely(idx == NR_SLAB_UNRECLAIMABLE_B)) {
+			/* Pre-compute slab output units once */
+			int slab_unreclaimable_unit = output_unit;  /* Already computed above */
+			int slab_reclaimable_unit = memcg_page_state_output_unit(NR_SLAB_RECLAIMABLE_B);
+
 #ifdef CONFIG_MEMCG_RSTAT_COUNTER
 			u64 slab_reclaimable = memcg_page_state_output(memcg,
 								   NR_SLAB_RECLAIMABLE_B);
-			seq_buf_printf(s, "slab %llu\n", size + slab_reclaimable);
+			/* Use kernel's seq_buf APIs directly */
+			seq_buf_puts(s, "slab");
+			seq_buf_putc(s, ' ');
+			seq_buf_printf(s, "%llu", size + slab_reclaimable);
+			seq_buf_putc(s, '\n');
 #endif /* CONFIG_MEMCG_RSTAT_COUNTER */
 
 #ifdef CONFIG_MEMCG_ATOMIC_COUNTER
@@ -2496,10 +2502,9 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 					atomic_results[slab_unreclaimable_idx];
 				u64 slab_reclaimable_atomic =
 					atomic_results[slab_reclaimable_idx];
-				slab_unreclaimable_atomic *=
-					memcg_page_state_output_unit(NR_SLAB_UNRECLAIMABLE_B);
-				slab_reclaimable_atomic *=
-					memcg_page_state_output_unit(NR_SLAB_RECLAIMABLE_B);
+				/* Use pre-computed output units */
+				slab_unreclaimable_atomic *= slab_unreclaimable_unit;
+				slab_reclaimable_atomic *= slab_reclaimable_unit;
 				u64 slab_total_atomic = slab_unreclaimable_atomic +
 						    slab_reclaimable_atomic;
 
@@ -2512,7 +2517,11 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 					       slab_total_atomic, slab_total_rstat, diff);
 #else
 				/* Atomic counter only - output clean format */
-				seq_buf_printf(s, "slab %llu\n", slab_total_atomic);
+				/* Use kernel's seq_buf APIs directly */
+				seq_buf_puts(s, "slab");
+				seq_buf_putc(s, ' ');
+				seq_buf_printf(s, "%llu", slab_total_atomic);
+				seq_buf_putc(s, '\n');
 #endif /* CONFIG_MEMCG_STAT_COMPARISON */
 			}
 #endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
@@ -2525,7 +2534,11 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 		       memcg_events(memcg, PGSCAN_DIRECT) +
 		       memcg_events(memcg, PGSCAN_PROACTIVE) +
 		       memcg_events(memcg, PGSCAN_KHUGEPAGED);
-	seq_buf_printf(s, "pgscan %lu\n", pgscan_rstat);
+	/* Use kernel's seq_buf APIs directly */
+	seq_buf_puts(s, "pgscan");
+	seq_buf_putc(s, ' ');
+	seq_buf_printf(s, "%lu", pgscan_rstat);
+	seq_buf_putc(s, '\n');
 #endif /* CONFIG_MEMCG_RSTAT_COUNTER */
 
 #ifdef CONFIG_MEMCG_ATOMIC_COUNTER
@@ -2548,7 +2561,11 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 #endif /* CONFIG_MEMCG_RSTAT_COUNTER */
 #else
 		/* Atomic counter only - output clean format */
-		seq_buf_printf(s, "pgscan %lu\n", pgscan_atomic);
+		/* Use kernel's seq_buf APIs directly */
+		seq_buf_puts(s, "pgscan");
+		seq_buf_putc(s, ' ');
+		seq_buf_printf(s, "%lu", pgscan_atomic);
+		seq_buf_putc(s, '\n');
 #endif /* CONFIG_MEMCG_STAT_COMPARISON */
 	}
 #endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
@@ -2558,7 +2575,11 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 		       memcg_events(memcg, PGSTEAL_DIRECT) +
 		       memcg_events(memcg, PGSTEAL_PROACTIVE) +
 		       memcg_events(memcg, PGSTEAL_KHUGEPAGED);
-	seq_buf_printf(s, "pgsteal %lu\n", pgsteal_rstat);
+	/* Use kernel's seq_buf APIs directly */
+	seq_buf_puts(s, "pgsteal");
+	seq_buf_putc(s, ' ');
+	seq_buf_printf(s, "%lu", pgsteal_rstat);
+	seq_buf_putc(s, '\n');
 #endif /* CONFIG_MEMCG_RSTAT_COUNTER */
 
 #ifdef CONFIG_MEMCG_ATOMIC_COUNTER
@@ -2581,7 +2602,11 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 #endif /* CONFIG_MEMCG_RSTAT_COUNTER */
 #else
 		/* Atomic counter only - output clean format */
-		seq_buf_printf(s, "pgsteal %lu\n", pgsteal_atomic);
+		/* Use kernel's seq_buf APIs directly */
+		seq_buf_puts(s, "pgsteal");
+		seq_buf_putc(s, ' ');
+		seq_buf_printf(s, "%lu", pgsteal_atomic);
+		seq_buf_putc(s, '\n');
 #endif /* CONFIG_MEMCG_STAT_COMPARISON */
 	}
 #endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
@@ -2595,8 +2620,11 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 
 #ifdef CONFIG_MEMCG_RSTAT_COUNTER
 		unsigned long count = memcg_events(memcg, memcg_vm_event_stat[i]);
-		seq_buf_printf(s, "%s %lu\n",
-			       vm_event_name(memcg_vm_event_stat[i]), count);
+		/* Use kernel's seq_buf APIs directly */
+		seq_buf_puts(s, vm_event_name(memcg_vm_event_stat[i]));
+		seq_buf_putc(s, ' ');
+		seq_buf_printf(s, "%lu", count);
+		seq_buf_putc(s, '\n');
 #endif /* CONFIG_MEMCG_RSTAT_COUNTER */
 
 #ifdef CONFIG_MEMCG_ATOMIC_COUNTER
@@ -2611,8 +2639,11 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 				       vm_event_name(memcg_vm_event_stat[i]), count_atomic, count, diff_long);
 #else
 			/* Atomic counter only - output clean format */
-			seq_buf_printf(s, "%s %lu\n",
-				       vm_event_name(memcg_vm_event_stat[i]), count_atomic);
+			/* Use kernel's seq_buf APIs directly */
+			seq_buf_puts(s, vm_event_name(memcg_vm_event_stat[i]));
+			seq_buf_putc(s, ' ');
+			seq_buf_printf(s, "%lu", count_atomic);
+			seq_buf_putc(s, '\n');
 #endif /* CONFIG_MEMCG_STAT_COMPARISON */
 		}
 #endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
@@ -5837,12 +5868,6 @@ static int memory_numa_stat_show(struct seq_file *m, void *v)
 			
 			for_each_node_state(nid, N_MEMORY) {
 				u64 size_atomic = numa_batch_stats[nid][stat_idx];
-				char num_buf[21];
-				int num_len;
-				char *num_str;
-				char *buf_ptr;
-				size_t avail;
-				int written;
 
 				size_atomic *= memcg_page_state_output_unit(
 						memory_stats[i].idx);
@@ -5853,34 +5878,12 @@ static int memory_numa_stat_show(struct seq_file *m, void *v)
 					memory_stats[i].idx);
 				s64 diff = (s64)size_rstat - (s64)size_atomic;
 
-				/* Use fast number formatting + snprintf for complex format */
-				num_str = fast_u64_to_str(size_atomic, num_buf, &num_len);
-				avail = seq_buf_get_buf(&numa_s, &buf_ptr);
-				if (avail >= 50) {  /* " N%d=%s (rstat=%llu diff=%lld)" */
-					written = snprintf(buf_ptr, avail, " N%d=%s (rstat=%llu diff=%lld)",
-							   nid, num_str, size_rstat, diff);
-					if (written > 0 && written < avail)
-						seq_buf_commit(&numa_s, written);
-					else
-						seq_buf_printf(&numa_s, " N%d=%llu (rstat=%llu diff=%lld)",
-							       nid, size_atomic, size_rstat, diff);
-				} else {
-					seq_buf_printf(&numa_s, " N%d=%llu (rstat=%llu diff=%lld)",
-						       nid, size_atomic, size_rstat, diff);
-				}
+				/* Use kernel's seq_buf APIs directly */
+				seq_buf_printf(&numa_s, " N%d=%llu (rstat=%llu diff=%lld)",
+					       nid, size_atomic, size_rstat, diff);
 #else
-				/* Optimize: use fast number formatting + direct write */
-				num_str = fast_u64_to_str(size_atomic, num_buf, &num_len);
-				avail = seq_buf_get_buf(&numa_s, &buf_ptr);
-				if (avail >= 15 + num_len) {  /* " N%d=" + num */
-					written = snprintf(buf_ptr, avail, " N%d=%s", nid, num_str);
-					if (written > 0 && written < avail)
-						seq_buf_commit(&numa_s, written);
-					else
-						seq_buf_printf(&numa_s, " N%d=%llu", nid, size_atomic);
-				} else {
-					seq_buf_printf(&numa_s, " N%d=%llu", nid, size_atomic);
-				}
+				/* Use kernel's seq_buf APIs directly */
+				seq_buf_printf(&numa_s, " N%d=%llu", nid, size_atomic);
 #endif /* CONFIG_MEMCG_STAT_COMPARISON */
 			}
 			seq_buf_putc(&numa_s, '\n');
