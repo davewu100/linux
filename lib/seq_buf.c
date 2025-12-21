@@ -27,6 +27,12 @@
 #include <linux/types.h>
 #include <linux/uaccess.h>
 
+/* Local buffer size for seq_buf_vprintf optimization.
+ * Most printf outputs are < 256 bytes, so this provides good cache locality
+ * while handling the common case efficiently.
+ */
+ #define SEQ_BUF_VPRINTF_LOCAL_BUF_SIZE 256
+
 /**
  * seq_buf_can_fit - can the new data fit in the current buffer?
  * @s: the seq_buf descriptor
@@ -64,22 +70,51 @@ int seq_buf_print_seq(struct seq_file *m, struct seq_buf *s)
  *
  * Returns: zero on success, -1 on overflow.
  */
-int seq_buf_vprintf(struct seq_buf *s, const char *fmt, va_list args)
-{
-	int len;
+ int seq_buf_vprintf(struct seq_buf *s, const char *fmt, va_list args)
+ {
+	 int len;
+	 char buf[SEQ_BUF_VPRINTF_LOCAL_BUF_SIZE];
+	 va_list args_copy;
 
-	WARN_ON(s->size == 0);
+	 WARN_ON(s->size == 0);
 
-	if (s->len < s->size) {
-		len = vsnprintf(s->buffer + s->len, s->size - s->len, fmt, args);
-		if (s->len + len < s->size) {
-			s->len += len;
-			return 0;
-		}
-	}
-	seq_buf_set_overflow(s);
-	return -1;
-}
+	 if (s->len >= s->size) {
+		 seq_buf_set_overflow(s);
+		 return -1;
+	 }
+
+	 /* Use local buffer for better cache locality and to avoid
+	  * repeated boundary checks. Format into local buffer first,
+	  * then memcpy to seq_buf.
+	  */
+	 va_copy(args_copy, args);
+	 len = vsnprintf(buf, sizeof(buf), fmt, args_copy);
+	 va_end(args_copy);
+
+	 if (len < 0)
+		 return -1;
+
+	 /* Check if result fits in local buffer */
+	 if (len >= (int)sizeof(buf)) {
+		 /* Result truncated, use direct vsnprintf to seq_buf */
+		 len = vsnprintf(s->buffer + s->len, s->size - s->len, fmt, args);
+		 if (s->len + len < s->size) {
+			 s->len += len;
+			 return 0;
+		 }
+		 seq_buf_set_overflow(s);
+		 return -1;
+	 }
+
+	 /* Result fits in local buffer, copy it */
+	 if (s->len + len < s->size) {
+		 memcpy(s->buffer + s->len, buf, len);
+		 s->len += len;
+		 return 0;
+	 }
+	 seq_buf_set_overflow(s);
+	 return -1;
+ }
 
 /**
  * seq_buf_printf - sequence printing of information
