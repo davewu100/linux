@@ -56,6 +56,9 @@ enum memcg_memory_event {
 	MEMCG_NR_MEMORY_EVENTS,
 };
 
+/* Get the number of VM event items for memcg */
+int memcg_nr_vm_events(void);
+
 struct mem_cgroup_reclaim_cookie {
 	pg_data_t *pgdat;
 	int generation;

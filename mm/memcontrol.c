@@ -37,6 +37,7 @@
 #include <linux/pagevec.h>
 #include <linux/vm_event_item.h>
 #include <linux/smp.h>
+#include <linux/nodemask.h>
 #include <linux/page-flags.h>
 #include <linux/backing-dev.h>
 #include <linux/bit_spinlock.h>
@@ -71,6 +72,15 @@
 
 #include <linux/uaccess.h>
 
+#include "tlv_stats.h"
+
+// Memory stats buffer size (fits well within SEQ_BUF_SIZE)
+static size_t mem_stat_buffer_size;
+
+// Shared buffer pool for NUMA stats (large, infrequently accessed)
+static struct kmem_cache *numa_stat_cache;
+static size_t numa_stat_buffer_size_max; // Maximum possible NUMA buffer size
+
 #define CREATE_TRACE_POINTS
 #include <trace/events/memcg.h>
 #undef CREATE_TRACE_POINTS
@@ -98,6 +108,8 @@ static bool cgroup_memory_nobpf __ro_after_init;
 
 static struct kmem_cache *memcg_cachep;
 static struct kmem_cache *memcg_pn_cachep;
+
+static void __init memcg_cleanup_tlv_buffers(void);
 
 #ifdef CONFIG_CGROUP_WRITEBACK
 static DECLARE_WAIT_QUEUE_HEAD(memcg_cgwb_frn_waitq);
@@ -478,8 +490,19 @@ static const unsigned int memcg_vm_event_stat[] = {
 #endif
 };
 
+int memcg_nr_vm_events(void)
+{
+	return ARRAY_SIZE(memcg_vm_event_stat);
+}
+
 #define NR_MEMCG_EVENTS ARRAY_SIZE(memcg_vm_event_stat)
+
 static u8 mem_cgroup_events_index[NR_VM_EVENT_ITEMS] __read_mostly;
+
+enum vm_event_item memcg_tlv_event_item(int idx)
+{
+	return memcg_vm_event_stat[idx];
+}
 
 static void init_memcg_events(void)
 {
@@ -1327,12 +1350,7 @@ static unsigned long mem_cgroup_margin(struct mem_cgroup *memcg)
 	return margin;
 }
 
-struct memory_stat {
-	const char *name;
-	unsigned int idx;
-};
-
-static const struct memory_stat memory_stats[] = {
+const struct memory_stat memory_stats[] = {
 	{ "anon",			NR_ANON_MAPPED			},
 	{ "file",			NR_FILE_PAGES			},
 	{ "kernel",			MEMCG_KMEM			},
@@ -1386,6 +1404,9 @@ static const struct memory_stat memory_stats[] = {
 	{ "pgpromote_success",		PGPROMOTE_SUCCESS	},
 #endif
 };
+
+// Export count for tlv_stats.c
+const int memory_stats_count = ARRAY_SIZE(memory_stats);
 
 /* The actual unit of the state item, not the same as the output unit */
 static int memcg_page_state_unit(int item)
@@ -4523,6 +4544,27 @@ int memory_stat_show(struct seq_file *m, void *v)
 	return 0;
 }
 
+static int memory_stat_bin_show(struct seq_file *m, void *v)
+{
+	struct mem_cgroup *memcg = mem_cgroup_from_seq(m);
+	char *buf;
+	size_t available = seq_get_buf(m, &buf);
+	int encoded_size;
+
+	// Use seq_file's internal buffer directly (zero-allocation approach)
+	// Buffer size is ~544B, seq_file buffer is typically 4KB - always enough
+	if (available < mem_stat_buffer_size || !buf)
+		return -ENOMEM;
+
+	mem_cgroup_flush_stats(memcg);
+	encoded_size = encode_memory_stats_tlv(memcg, buf, mem_stat_buffer_size);
+	if (encoded_size < 0)
+		return encoded_size;
+
+	seq_commit(m, encoded_size);
+	return 0;
+}
+
 #ifdef CONFIG_NUMA
 static inline unsigned long lruvec_page_state_output(struct lruvec *lruvec,
 						     int item)
@@ -4557,6 +4599,33 @@ static int memory_numa_stat_show(struct seq_file *m, void *v)
 		seq_putc(m, '\n');
 	}
 
+	return 0;
+}
+
+static int memory_numa_stat_bin_show(struct seq_file *m, void *v)
+{
+	struct mem_cgroup *memcg = mem_cgroup_from_seq(m);
+	int num_nodes = num_possible_nodes();
+	void *buffer;
+	int encoded_size;
+
+	// Allocate buffer from cache (efficient for large NUMA buffers)
+	buffer = kmem_cache_alloc(numa_stat_cache, GFP_KERNEL);
+	if (!buffer)
+		return -ENOMEM;
+
+	mem_cgroup_flush_stats(memcg);
+
+	// Call the C TLV encoding function for NUMA stats
+	encoded_size = encode_memory_numa_stats_tlv(memcg, buffer, numa_stat_buffer_size_max, num_nodes);
+	if (encoded_size < 0) {
+		kmem_cache_free(numa_stat_cache, buffer);
+		return encoded_size;
+	}
+
+	// Write the binary TLV data directly to seq_file
+	seq_write(m, buffer, encoded_size);
+	kmem_cache_free(numa_stat_cache, buffer);
 	return 0;
 }
 #endif
@@ -4659,10 +4728,18 @@ static struct cftype memory_files[] = {
 		.name = "stat",
 		.seq_show = memory_stat_show,
 	},
+	{
+		.name = "stat_bin",
+		.seq_show = memory_stat_bin_show,
+	},
 #ifdef CONFIG_NUMA
 	{
 		.name = "numa_stat",
 		.seq_show = memory_numa_stat_show,
+	},
+	{
+		.name = "numa_stat_bin",
+		.seq_show = memory_numa_stat_bin_show,
 	},
 #endif
 	{
@@ -5168,7 +5245,39 @@ int __init mem_cgroup_init(void)
 	memcg_pn_cachep = KMEM_CACHE(mem_cgroup_per_node,
 				     SLAB_PANIC | SLAB_HWCACHE_ALIGN);
 
+	// Calculate buffer sizes using runtime-derived counts
+	mem_stat_buffer_size = TLV_HEADER_SIZE +
+		((size_t)tlv_mem_stat_count() * TLV_ENTRY_SIZE);
+	numa_stat_buffer_size_max = TLV_HEADER_SIZE +
+		((size_t)num_possible_nodes() * tlv_numa_stat_count() * TLV_ENTRY_SIZE);
+	pr_info("memcg: NUMA buffer sized for %d detected nodes\n",
+		num_possible_nodes());
+
+	// Create memory cache for NUMA buffers (allocated on demand)
+	numa_stat_cache = kmem_cache_create("numa_stat_tlv",
+					    numa_stat_buffer_size_max,
+					    0, SLAB_HWCACHE_ALIGN, NULL);
+	if (!numa_stat_cache) {
+		pr_err("memcg: Failed to create NUMA stat cache\n");
+		memcg_cleanup_tlv_buffers();
+		return -ENOMEM;
+	}
+
+	// No global buffer needed - allocate per-read like memory_stat_show
+
+	pr_info("memcg: Global memory buffer allocated (%zu bytes), NUMA cache created (%zu bytes)\n",
+		mem_stat_buffer_size, numa_stat_buffer_size_max);
+
 	return 0;
+}
+
+static void __init memcg_cleanup_tlv_buffers(void)
+{
+	// Destroy NUMA stat cache
+	if (numa_stat_cache)
+		kmem_cache_destroy(numa_stat_cache);
+
+	pr_info("memcg: TLV cache freed\n");
 }
 
 #ifdef CONFIG_SWAP
