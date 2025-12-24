@@ -38,17 +38,17 @@ After building the kernel with the integrated TLV support:
 
 ```bash
 # Each memory cgroup automatically has binary files
-ls -la /sys/fs/cgroup/memory/
+ls -la /sys/fs/cgroup/
 # memory.stat  memory.stat_bin  memory.numa_stat  memory.numa_stat_bin
 
 # Read root cgroup's binary stats
-cat /sys/fs/cgroup/memory/memory.stat_bin > root_stats.tlv
+cat /sys/fs/cgroup/memory.stat_bin > root_stats.tlv
 
 # Read specific cgroup's binary stats
-cat /sys/fs/cgroup/memory/my_container/memory.stat_bin > container_stats.tlv
+cat /sys/fs/cgroup/my_container/memory.stat_bin > container_stats.tlv
 
 # Read nested cgroup's binary stats
-cat /sys/fs/cgroup/memory/a/b/c/memory.stat_bin > nested_stats.tlv
+cat /sys/fs/cgroup/a/b/c/memory.stat_bin > nested_stats.tlv
 
 # Parse the binary data
 python3 test_usage.py root_stats.tlv
