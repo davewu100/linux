@@ -1,0 +1,16 @@
+[package]
+name = "tlv-to-json"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "tlv"
+path = "tlv.rs"
+
+[[bin]]
+name = "tlv_to_json"
+path = "tlv_to_json.rs"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
