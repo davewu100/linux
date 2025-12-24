@@ -15,6 +15,14 @@ static inline void put_u16_be(uint8_t *buf, uint16_t val)
 	buf[1] = val & 0xFF;
 }
 
+static inline void put_u32_be(uint8_t *buf, uint32_t val)
+{
+	buf[0] = (val >> 24) & 0xFF;
+	buf[1] = (val >> 16) & 0xFF;
+	buf[2] = (val >> 8) & 0xFF;
+	buf[3] = val & 0xFF;
+}
+
 static inline void put_u64_be(uint8_t *buf, uint64_t val)
 {
 	buf[0] = (val >> 56) & 0xFF;
@@ -227,13 +235,13 @@ int encode_memory_stats_tlv(struct mem_cgroup *memcg, void *buffer, size_t buffe
 	size_t container_start;
 
 	// Write container header (type + length placeholder)
-	if (!tlv_can_write(&enc, 4))
+	if (!tlv_can_write(&enc, TLV_CONTAINER_HEADER_SIZE))
 		return -1;
 
 	put_u16_be(&enc.buf[enc.pos], TLV_TYPE_MEMORY_STATS_CONTAINER);
 	enc.pos += 2;
-	put_u16_be(&enc.buf[enc.pos], 0); // length placeholder
-	enc.pos += 2;
+	put_u32_be(&enc.buf[enc.pos], 0); // length placeholder
+	enc.pos += 4;
 	container_start = enc.pos;
 
 	mem_cgroup_flush_stats(memcg);
@@ -247,10 +255,10 @@ int encode_memory_stats_tlv(struct mem_cgroup *memcg, void *buffer, size_t buffe
 
 	// Fill in container length
 	size_t data_len = enc.pos - container_start;
-	if (data_len > 65535)
+	if (data_len > 0xFFFFFFFFu)
 		return -1;
 
-	put_u16_be(&enc.buf[container_start - 2], data_len);
+	put_u32_be(&enc.buf[container_start - 4], data_len);
 
 	return enc.pos;
 }
@@ -267,13 +275,13 @@ int encode_memory_numa_stats_tlv(struct mem_cgroup *memcg, void *buffer, size_t 
 	int i;
 
 	// Write container header
-	if (!tlv_can_write(&enc, 4))
+	if (!tlv_can_write(&enc, TLV_CONTAINER_HEADER_SIZE))
 		return -1;
 
 	put_u16_be(&enc.buf[enc.pos], TLV_TYPE_NUMA_STATS_CONTAINER);
 	enc.pos += 2;
-	put_u16_be(&enc.buf[enc.pos], 0); // length placeholder
-	enc.pos += 2;
+	put_u32_be(&enc.buf[enc.pos], 0); // length placeholder
+	enc.pos += 4;
 	container_start = enc.pos;
 
 	mem_cgroup_flush_stats(memcg);
@@ -286,10 +294,10 @@ int encode_memory_numa_stats_tlv(struct mem_cgroup *memcg, void *buffer, size_t 
 
 	// Fill in container length
 	size_t data_len = enc.pos - container_start;
-	if (data_len > 65535)
+	if (data_len > 0xFFFFFFFFu)
 		return -1;
 
-	put_u16_be(&enc.buf[container_start - 2], data_len);
+	put_u32_be(&enc.buf[container_start - 4], data_len);
 
 	return enc.pos;
 }

@@ -5219,9 +5219,9 @@ int __init mem_cgroup_init(void)
 				     SLAB_PANIC | SLAB_HWCACHE_ALIGN);
 
 	// Calculate buffer sizes using runtime-derived counts
-	mem_stat_buffer_size = TLV_HEADER_SIZE +
+	mem_stat_buffer_size = TLV_CONTAINER_HEADER_SIZE +
 		((size_t)tlv_mem_stat_count() * TLV_ENTRY_SIZE);
-	numa_stat_buffer_size_max = TLV_HEADER_SIZE +
+	numa_stat_buffer_size_max = TLV_CONTAINER_HEADER_SIZE +
 		((size_t)num_possible_nodes() * tlv_numa_stat_count() * TLV_ENTRY_SIZE);
 	pr_info("memcg: NUMA buffer sized for %d detected nodes\n",
 		num_possible_nodes());

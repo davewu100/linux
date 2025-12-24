@@ -4,7 +4,8 @@
 #include <linux/memcontrol.h>
 
 /* Shared TLV layout constants */
-#define TLV_HEADER_SIZE     4   /* 2 bytes type + 2 bytes length */
+#define TLV_HEADER_SIZE     4   /* Entry headers use 2-byte type + 2-byte length */
+#define TLV_CONTAINER_HEADER_SIZE 6 /* Container headers use 2-byte type + 4-byte length */
 #define TLV_U64_DATA_SIZE   8   /* u64 data size */
 #define TLV_ENTRY_SIZE      (TLV_HEADER_SIZE + TLV_U64_DATA_SIZE)  /* 12 bytes */
 
