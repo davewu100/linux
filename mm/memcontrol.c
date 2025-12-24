@@ -4609,16 +4609,25 @@ static int memory_numa_stat_bin_show(struct seq_file *m, void *v)
 	void *buffer;
 	int encoded_size;
 
+	// Check if cache is initialized
+	if (!numa_stat_cache) {
+		pr_err("memcg: numa_stat_cache not initialized\n");
+		return -ENODEV;
+	}
+
 	// Allocate buffer from cache (efficient for large NUMA buffers)
 	buffer = kmem_cache_alloc(numa_stat_cache, GFP_KERNEL);
-	if (!buffer)
+	if (!buffer) {
+		pr_err("memcg: Failed to allocate NUMA stat buffer\n");
 		return -ENOMEM;
+	}
 
 	mem_cgroup_flush_stats(memcg);
 
 	// Call the C TLV encoding function for NUMA stats
 	encoded_size = encode_memory_numa_stats_tlv(memcg, buffer, numa_stat_buffer_size_max, num_nodes);
 	if (encoded_size < 0) {
+		pr_err("memcg: Failed to encode NUMA stats TLV: %d\n", encoded_size);
 		kmem_cache_free(numa_stat_cache, buffer);
 		return encoded_size;
 	}

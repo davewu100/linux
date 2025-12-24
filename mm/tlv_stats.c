@@ -1,6 +1,7 @@
 #include <linux/memcontrol.h>
 #include <linux/slab.h>
 #include <linux/nodemask.h>
+#include <linux/printk.h>
 #include "tlv_stats.h"
 
 // TLV type constants
@@ -204,8 +205,10 @@ static int encode_numa_node_stats(struct tlv_encoder *enc, struct mem_cgroup *me
 
 		u64 value = lruvec_page_state(lruvec, stat->idx);
 
-		if (!tlv_can_write(enc, 14))
-			return -1;
+		if (!tlv_can_write(enc, 14)) {
+			pr_err("memcg: TLV buffer too small for NUMA stat entry\n");
+			return -EINVAL;
+		}
 
 		// Write TLV entry: type(2) + length(2) + node_id(2) + value(8)
 		tlv_write_u16(enc, get_tlv_type_for_stat(stat->idx, i), 10);  // Length includes node_id + value
@@ -267,8 +270,10 @@ int encode_memory_numa_stats_tlv(struct mem_cgroup *memcg, void *buffer, size_t 
 	int i;
 
 	// Write container header
-	if (!tlv_can_write(&enc, 4))
-		return -1;
+	if (!tlv_can_write(&enc, 4)) {
+		pr_err("memcg: TLV buffer too small for container header\n");
+		return -EINVAL;
+	}
 
 	put_u16_be(&enc.buf[enc.pos], TLV_TYPE_NUMA_STATS_CONTAINER);
 	enc.pos += 2;
@@ -280,14 +285,18 @@ int encode_memory_numa_stats_tlv(struct mem_cgroup *memcg, void *buffer, size_t 
 
 	// Encode statistics for each NUMA node
 	for (i = 0; i < num_nodes; i++) {
-		if (encode_numa_node_stats(&enc, memcg, i) < 0)
-			return -1;
+		if (encode_numa_node_stats(&enc, memcg, i) < 0) {
+			pr_err("memcg: Failed to encode NUMA node %d stats\n", i);
+			return -EINVAL;
+		}
 	}
 
 	// Fill in container length
 	size_t data_len = enc.pos - container_start;
-	if (data_len > 65535)
-		return -1;
+	if (data_len > 65535) {
+		pr_err("memcg: NUMA stats data too large: %zu bytes\n", data_len);
+		return -EINVAL;
+	}
 
 	put_u16_be(&enc.buf[container_start - 2], data_len);
 
