@@ -8,6 +8,8 @@
 #define TLV_CONTAINER_HEADER_SIZE 6 /* Container headers use 2-byte type + 4-byte length */
 #define TLV_U64_DATA_SIZE   8   /* u64 data size */
 #define TLV_ENTRY_SIZE      (TLV_HEADER_SIZE + TLV_U64_DATA_SIZE)  /* 12 bytes */
+#define TLV_NODE_ID_FIELD_SIZE 2 /* NUMA TLVs embed node_id as u16 */
+#define TLV_NUMA_ENTRY_SIZE (TLV_HEADER_SIZE + TLV_NODE_ID_FIELD_SIZE + TLV_U64_DATA_SIZE)
 
 struct memory_stat {
 	const char *name;

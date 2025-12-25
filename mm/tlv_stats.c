@@ -212,13 +212,14 @@ static int encode_numa_node_stats(struct tlv_encoder *enc, struct mem_cgroup *me
 
 		u64 value = lruvec_page_state(lruvec, stat->idx);
 
-		if (!tlv_can_write(enc, 14))
+		if (!tlv_can_write(enc, TLV_NUMA_ENTRY_SIZE))
 			return -1;
 
-		// Write TLV entry: type(2) + length(2) + node_id(2) + value(8)
-		tlv_write_u16(enc, get_tlv_type_for_stat(stat->idx, i), 10);  // Length includes node_id + value
+		// Write TLV entry: type + length + node_id + value
+		tlv_write_u16(enc, get_tlv_type_for_stat(stat->idx, i),
+			      TLV_NODE_ID_FIELD_SIZE + TLV_U64_DATA_SIZE);  // Length excludes header
 		put_u16_be(&enc->buf[enc->pos], node_id);  // Node ID
-		enc->pos += 2;
+		enc->pos += TLV_NODE_ID_FIELD_SIZE;
 		tlv_write_u64(enc, value);
 	}
 
