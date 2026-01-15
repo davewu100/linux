@@ -42,6 +42,31 @@ enum memcg_stat_item {
 	MEMCG_NR_STAT,
 };
 
+/*
+ * Fixed array sizes for structures that need compile-time constants.
+ *
+ * NOTE: This is a workaround to allow memcontrol.c, mm/memcontrol-atomic.c
+ * and kernel/cgroup/atomic.c to use these array sizes. The actual arrays (memcg_node_stat_items,
+ * memcg_stat_items, memcg_vm_event_stat) are defined in mm/memcontrol.c with
+ * the precise elements for the current config, but their sizes need to be
+ * available as compile-time constants for struct declarations in the header.
+ *
+ * These values must be large enough to accommodate all possible CONFIG
+ * combinations.
+ *
+ * Current actual sizes (as of this update):
+ *   - memcg_node_stat_items: ~40 items (varies by CONFIG)
+ *   - memcg_stat_items: 7 items (fixed)
+ *   - MEMCG_VMSTAT_SIZE: 40 + 7 = 47
+ *   - memcg_vm_event_stat: ~31 items (varies by CONFIG)
+ *
+ * We use slightly larger fixed values with static_assert checks in
+ * memcontrol.c to catch any future additions that exceed these limits.
+ */
+#define MEMCG_VMSTAT_SIZE 48
+#define NR_MEMCG_EVENTS 32
+#define BAD_STAT_IDX(index) ((u32)(index) >= U8_MAX)
+
 enum memcg_memory_event {
 	MEMCG_LOW,
 	MEMCG_HIGH,
@@ -75,6 +100,9 @@ struct memcg1_events_percpu;
 struct memcg_vmstats;
 struct lruvec_stats_percpu;
 struct lruvec_stats;
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER
+struct memcg_atomic_counter_per_node;
+#endif
 
 struct mem_cgroup_reclaim_iter {
 	struct mem_cgroup *position;
@@ -93,6 +121,10 @@ struct mem_cgroup_per_node {
 	struct lruvec_stats_percpu __percpu	*lruvec_stats_percpu;
 	struct lruvec_stats			*lruvec_stats;
 	struct shrinker_info __rcu	*shrinker_info;
+
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER
+	struct memcg_atomic_counter_per_node	*atomic_counter_per_node;
+#endif
 
 #ifdef CONFIG_MEMCG_V1
 	/*
@@ -242,6 +274,27 @@ struct mem_cgroup {
 	/* memory.events */
 	atomic_long_t		memory_events[MEMCG_NR_MEMORY_EVENTS];
 	atomic_long_t		memory_events_local[MEMCG_NR_MEMORY_EVENTS];
+
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER
+	/*
+	 * Per-cgroup atomic counter stats (experimental alternative to rstat).
+	 * Each memcg maintains its own atomic counter data. The parent maintains
+	 * a list of child memcgs (not counters) for hierarchical aggregation.
+	 */
+	struct memcg_atomic_counter *atomic_counter;
+
+	/* List of child cgroups for recursive aggregation (RCU protected) */
+	struct list_head atomic_children;	/* list of child memcgs */
+	struct list_head atomic_sibling;	/* linked to parent's atomic_children */
+	spinlock_t atomic_children_lock;	/* for list add/remove; traversal uses RCU */
+
+	/* Lightweight cache for batch-read stats */
+	struct memcg_atomic_cache *atomic_cache;
+
+	/* Atomic counter update tracking (separate for stats and events) */
+	atomic_t atomic_stats_updates;
+	atomic_t atomic_events_updates;
+#endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
 
 #ifdef CONFIG_MEMCG_NMI_SAFETY_REQUIRES_ATOMIC
 	/* MEMCG_KMEM for nmi context */
@@ -953,6 +1006,14 @@ unsigned long memcg_page_state(struct mem_cgroup *memcg, int idx);
 unsigned long lruvec_page_state(struct lruvec *lruvec, enum node_stat_item idx);
 unsigned long lruvec_page_state_local(struct lruvec *lruvec,
 				      enum node_stat_item idx);
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER
+unsigned long lruvec_page_state_atomic_counter(struct lruvec *lruvec,
+						enum node_stat_item idx);
+#endif
+
+/* Helper functions for stats/events indexing */
+int memcg_stats_index(int idx);
+int memcg_events_index(enum vm_event_item idx);
 
 void mem_cgroup_flush_stats(struct mem_cgroup *memcg);
 void mem_cgroup_flush_stats_ratelimited(struct mem_cgroup *memcg);
