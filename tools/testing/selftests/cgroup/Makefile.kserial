@@ -1,0 +1,57 @@
+# Makefile for k-serial userspace tools
+# 
+# Usage:
+#   make -f Makefile.kserial          # Build all
+#   make -f Makefile.kserial clean    # Clean
+#   make -f Makefile.kserial test     # Run tests
+
+CC = gcc
+CFLAGS = -Wall -Wextra -O2
+LDFLAGS =
+
+# Targets
+TARGETS = test_kserial test_kserial_real example_monitor
+
+all: $(TARGETS)
+
+# Demo version (with simulated data)
+test_kserial: test_kserial.c
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+
+# Real version (requires kernel module)
+test_kserial_real: test_kserial_real.c
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+
+# Example monitoring application
+example_monitor: example_monitor.c
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+
+# Make Python client executable
+python-client:
+	chmod +x kserial_client.py
+
+# Install (copy to /usr/local/bin)
+install: all python-client
+	install -m 755 test_kserial_real /usr/local/bin/kserial-query
+	install -m 755 kserial_client.py /usr/local/bin/kserial-query-py
+
+# Tests
+test: test_kserial
+	@echo "=== Running k-serial tests ==="
+	@echo ""
+	@echo "Test 1: Single field"
+	./test_kserial level
+	@echo ""
+	@echo "Test 2: Multiple fields"
+	./test_kserial level nr_descendants
+	@echo ""
+	@echo "Test 3: All whitelisted fields"
+	./test_kserial level max_depth nr_descendants nr_dying_descendants max_descendants
+	@echo ""
+	@echo "=== All tests passed ==="
+
+# Clean
+clean:
+	rm -f $(TARGETS) *.o
+
+.PHONY: all clean test install python-client
