@@ -18,10 +18,27 @@ TEST_GEN_PROGS += test_memcontrol
 TEST_GEN_PROGS += test_pids
 TEST_GEN_PROGS += test_zswap
 
+# test_memcg_perf is handled separately with custom rules
+TEST_GEN_PROGS += test_memcg_perf
+
 LOCAL_HDRS += $(selfdir)/clone3/clone3_selftests.h $(selfdir)/pidfd/pidfd.h
+
+# Function profiler for test_memcg_perf - Define before including lib.mk
+FUNC_PROFILER_C := func_profiler.c
+FUNC_PROFILER_O := $(OUTPUT)/func_profiler.o
 
 include ../lib.mk
 include lib/libcgroup.mk
+
+$(FUNC_PROFILER_O): func_profiler.c func_profiler.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(TARGET_ARCH) -c $< -o $@
+
+# Explicit rule for test_memcg_perf with multiple object files
+test_memcg_perf: test_memcg_perf.c func_profiler.c lib/cgroup_util.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(TARGET_ARCH) $^ $(LDLIBS) -o $@
+
+$(OUTPUT)/test_memcg_perf: test_memcg_perf.c func_profiler.c $(LIBCGROUP_O) func_profiler.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(TARGET_ARCH) $(filter %.c,$^) $(filter %.o,$^) $(LDLIBS) -o $@
 
 $(OUTPUT)/test_core: $(LIBCGROUP_O)
 $(OUTPUT)/test_cpu: $(LIBCGROUP_O)
