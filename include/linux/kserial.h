@@ -7,6 +7,7 @@
 /*
  * k-serial: Dynamic field subscription for kernel structs
  * Phase 2: Supports nested struct fields (e.g., "css_set.dfl_cgrp.level")
+ * Phase 3: Supports array indexing (e.g., "subsys[0]", "nr_dying_subsys[2]")
  */
 
 #define KS_MAX_FIELDS 16
@@ -44,7 +45,7 @@ struct ks_result {
 
 /*
  * Whitelist of allowed fields for struct cgroup
- * Supports both simple fields and nested paths (e.g., "css_set.dfl_cgrp.level")
+ * Supports simple fields, nested paths, and arrays (Phase 3)
  */
 static const char *ks_cgroup_whitelist[] = {
 	/* Simple fields */
@@ -53,12 +54,17 @@ static const char *ks_cgroup_whitelist[] = {
 	"nr_descendants",
 	"nr_dying_descendants",
 	"max_descendants",
+	"nr_populated_csets",
 	
 	/* Nested paths (Phase 2) */
 	"self.id",                    /* cgrp->self.id */
 	"self.serial_nr",             /* cgrp->self.serial_nr */
 	"root.kf",                    /* cgrp->root->kf (ptr) */
 	"dom_cgrp.level",             /* cgrp->dom_cgrp->level */
+	
+	/* Array fields (Phase 3) */
+	"nr_dying_subsys",            /* cgrp->nr_dying_subsys[idx] - int array */
+	"subsys",                     /* cgrp->subsys[idx] - pointer array */
 	
 	NULL
 };

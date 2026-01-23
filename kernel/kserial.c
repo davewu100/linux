@@ -2,11 +2,13 @@
 /*
  * k-serial: Dynamic field subscription for kernel structs
  * Phase 2: Supports nested struct fields
+ * Phase 3: Supports array indexing
  * 
  * This implementation allows userspace to query fields using paths like:
  * - Simple: "level"
  * - Nested: "self.id"
  * - Deep: "css_set.dfl_cgrp.level"
+ * - Array: "subsys[0]", "nr_dying_subsys[2]"
  * 
  * Fields are validated against a whitelist and returned in TLV format.
  */
@@ -86,8 +88,59 @@ static int ks_get_field_size(const struct btf *btf, u32 type_id)
 		return sizeof(void *);
 	}
 
-	/* Reject arrays and other complex types */
+	/* Phase 3: For arrays, return element size */
+	if (btf_type_is_array(t)) {
+		const struct btf_array *arr = btf_array(t);
+		return ks_get_field_size(btf, arr->type);
+	}
+
+	/* Reject other complex types */
 	return -EINVAL;
+}
+
+/**
+ * ks_parse_array_syntax - Parse array syntax from field name
+ * @field: Field name (e.g., "subsys[0]" or "level")
+ * @base_name: Output buffer for base field name
+ * @index: Output pointer for array index (-1 if not an array)
+ * 
+ * Returns: 0 on success, negative error code on failure
+ */
+static int ks_parse_array_syntax(const char *field, char *base_name, int *index)
+{
+	const char *bracket = strchr(field, '[');
+	int len;
+	
+	if (!bracket) {
+		/* No array syntax */
+		strcpy(base_name, field);
+		*index = -1;
+		return 0;
+	}
+	
+	/* Extract base name */
+	len = bracket - field;
+	if (len >= 32 || len == 0)
+		return -EINVAL;
+	
+	strncpy(base_name, field, len);
+	base_name[len] = '\0';
+	
+	/* Parse index */
+	bracket++; /* Skip '[' */
+	if (*bracket == '\0' || *bracket == ']')
+		return -EINVAL;
+	
+	*index = 0;
+	while (*bracket >= '0' && *bracket <= '9') {
+		*index = (*index) * 10 + (*bracket - '0');
+		bracket++;
+	}
+	
+	if (*bracket != ']')
+		return -EINVAL;
+	
+	return 0;
 }
 
 /**
@@ -245,6 +298,66 @@ static int ks_resolve_field_path(const struct btf *btf, s32 start_type_id,
 }
 
 /**
+ * ks_resolve_array_element - Resolve array element address and type
+ * @btf: BTF object
+ * @array_type_id: BTF type ID of the array field
+ * @array_addr: Base address of the array
+ * @index: Array index
+ * @elem_addr: Output pointer to element address
+ * @elem_type_id: Output pointer to element type ID
+ * 
+ * Returns: 0 on success, negative error code on failure
+ */
+static int ks_resolve_array_element(const struct btf *btf, u32 array_type_id,
+				     void *array_addr, int index,
+				     void **elem_addr, u32 *elem_type_id)
+{
+	const struct btf_type *t;
+	const struct btf_array *arr;
+	u32 elem_size;
+	int ret;
+	
+	t = btf_type_by_id(btf, array_type_id);
+	if (!t)
+		return -EINVAL;
+	
+	/* Follow modifiers */
+	while (btf_type_is_modifier(t)) {
+		array_type_id = t->type;
+		t = btf_type_by_id(btf, array_type_id);
+		if (!t)
+			return -EINVAL;
+	}
+	
+	/* Must be an array type */
+	if (!btf_type_is_array(t)) {
+		pr_warn("k-serial: field is not an array\n");
+		return -EINVAL;
+	}
+	
+	arr = btf_array(t);
+	
+	/* Bounds check */
+	if (index < 0 || (u32)index >= arr->nelems) {
+		pr_warn("k-serial: array index %d out of bounds (0-%u)\n",
+			index, arr->nelems - 1);
+		return -ERANGE;
+	}
+	
+	/* Get element size */
+	ret = ks_get_field_size(btf, arr->type);
+	if (ret < 0)
+		return ret;
+	elem_size = ret;
+	
+	/* Calculate element address */
+	*elem_addr = (char *)array_addr + (index * elem_size);
+	*elem_type_id = arr->type;
+	
+	return 0;
+}
+
+/**
  * ks_write_tlv - Write a TLV entry to output buffer
  * @result: Output buffer
  * @field_id: Field index in schema
@@ -320,26 +433,48 @@ int ks_query_cgroup(struct cgroup *cgrp, const struct ks_schema *schema,
 	/* Process each requested field/path */
 	for (i = 0; i < schema->nr_fields; i++) {
 		const char *field_path = schema->field_names[i];
+		char base_name[64];
+		int array_index;
 		void *field_addr;
 		u32 field_type_id;
 		u64 value;
 		int field_size;
 
-		/* Validate field path against whitelist */
-		if (!ks_validate_field(field_path)) {
-			pr_warn("k-serial: field '%s' not in whitelist\n",
+		/* Parse array syntax (e.g., "subsys[0]") */
+		ret = ks_parse_array_syntax(field_path, base_name, &array_index);
+		if (ret) {
+			pr_warn("k-serial: invalid array syntax in '%s'\n",
 				field_path);
+			return ret;
+		}
+
+		/* Validate base field name against whitelist */
+		if (!ks_validate_field(base_name)) {
+			pr_warn("k-serial: field '%s' not in whitelist\n",
+				base_name);
 			return -EPERM;
 		}
 
 		/* Resolve field path (handles nesting and pointers) */
 		ret = ks_resolve_field_path(btf, cgroup_type_id, cgrp,
-					     field_path, schema->flags,
+					     base_name, schema->flags,
 					     &field_addr, &field_type_id);
 		if (ret) {
 			pr_warn("k-serial: failed to resolve path '%s'\n",
-				field_path);
+				base_name);
 			return ret;
+		}
+
+		/* If array access, resolve the element */
+		if (array_index >= 0) {
+			ret = ks_resolve_array_element(btf, field_type_id,
+						        field_addr, array_index,
+						        &field_addr, &field_type_id);
+			if (ret) {
+				pr_warn("k-serial: failed to access array element '%s'\n",
+					field_path);
+				return ret;
+			}
 		}
 
 		/* Handle NULL pointer case (if flag set) */

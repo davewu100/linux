@@ -10,7 +10,7 @@ CFLAGS = -Wall -Wextra -O2
 LDFLAGS =
 
 # Targets
-TARGETS = test_kserial test_kserial_real test_kserial_phase2 example_monitor
+TARGETS = test_kserial test_kserial_real test_kserial_phase2 test_kserial_phase3 example_monitor
 
 all: $(TARGETS)
 
@@ -24,6 +24,13 @@ test_kserial_real: test_kserial_real.c
 
 # Phase 2 test (nested fields)
 test_kserial_phase2: test_kserial_phase2.c
+	$(CC) $(CFLAGS) -o $@ $<
+
+test_kserial_phase3: test_kserial_phase3.c
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+
+# Phase 3 test (array indexing)
+test_kserial_phase3: test_kserial_phase3.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
 # Example monitoring application
