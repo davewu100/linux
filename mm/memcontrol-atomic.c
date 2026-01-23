@@ -25,6 +25,10 @@ void css_atomic_mod_state(struct mem_cgroup *memcg, int idx, int val)
 {
 	struct memcg_atomic_counter *counter = READ_ONCE(memcg->atomic_counter);
 
+	/* Safety: counter might be NULL during initialization/cleanup */
+	if (unlikely(!counter))
+		return;
+
 	/* Update hierarchical counter */
 	atomic64_add(val, &counter->state[idx]);
 
@@ -49,6 +53,10 @@ void css_atomic_mod_lruvec_state(struct mem_cgroup *memcg,
 	struct memcg_atomic_counter_per_node *node_counter =
 		READ_ONCE(pn->atomic_counter_per_node);
 
+	/* Safety: counters might be NULL during initialization/cleanup */
+	if (unlikely(!counter || !node_counter))
+		return;
+
 	/* Update hierarchical counter */
 	atomic64_add(val, &counter->state[idx]);
 
@@ -70,6 +78,10 @@ void css_atomic_count_events(struct mem_cgroup *memcg, int idx,
 			     unsigned long count)
 {
 	struct memcg_atomic_counter *counter = READ_ONCE(memcg->atomic_counter);
+
+	/* Safety: counter might be NULL during initialization/cleanup */
+	if (unlikely(!counter))
+		return;
 
 	/* Update hierarchical event counter */
 	atomic64_add(count, &counter->events[idx]);

@@ -81,6 +81,16 @@ static u64 css_atomic_page_state_recursive(struct mem_cgroup *memcg, int idx)
 	struct memcg_atomic_counter *counter;
 	u64 total = 0;
 
+	/*
+	 * BOOT SAFETY: Skip non-online memcgs to avoid reading partial state.
+	 * During early boot, memcgs may exist in the tree but not be fully
+	 * initialized. Accessing their state before online could be unsafe.
+	 * This is especially important for root memcg which is accessed very
+	 * early during boot (before it's marked online).
+	 */
+	if (unlikely(!mem_cgroup_online(memcg)))
+		return 0;
+
 	/* Early exit if no atomic counter */
 	counter = READ_ONCE(memcg->atomic_counter);
 	if (unlikely(!counter))
@@ -156,6 +166,13 @@ unsigned long css_atomic_events_recursive(struct mem_cgroup *memcg,
 	struct memcg_atomic_counter *counter;
 	unsigned long total = 0;
 	int i;
+
+	/*
+	 * BOOT SAFETY: Skip non-online memcgs to avoid reading partial state.
+	 * Same rationale as css_atomic_page_state_recursive().
+	 */
+	if (unlikely(!mem_cgroup_online(memcg)))
+		return 0;
 
 	/* Early exit if no atomic counter */
 	counter = READ_ONCE(memcg->atomic_counter);
