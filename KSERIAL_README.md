@@ -241,12 +241,23 @@ Tests include:
 - Python client
 - Monitor application
 
-## Future Plans
+## Current Status
 
-### Phase 2: Nested Structs
-```c
-query_field("css_set.dfl_cgrp.level", &value);
-```
+### ✅ Phase 1 (MVP): Complete
+- Simple field queries
+- BTF-based resolution
+- Whitelist security
+- TLV output format
+
+### ✅ Phase 2: Complete
+- Nested field paths (`self.id`, `dom_cgrp.level`)
+- Pointer dereferencing
+- NULL pointer handling
+- Up to 4 levels deep
+
+See `KSERIAL_PHASE2.md` for Phase 2 details.
+
+## Future Plans
 
 ### Phase 3: Arrays
 ```c

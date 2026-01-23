@@ -6,16 +6,21 @@
 
 /*
  * k-serial: Dynamic field subscription for kernel structs
- * MVP: Only supports struct cgroup, scalar fields, read-only access
+ * Phase 2: Supports nested struct fields (e.g., "css_set.dfl_cgrp.level")
  */
 
 #define KS_MAX_FIELDS 16
-#define KS_FIELD_NAME_LEN 32
+#define KS_FIELD_NAME_LEN 64  /* Increased for nested paths */
 #define KS_MAX_OUTPUT_SIZE 4096
+#define KS_MAX_PATH_DEPTH 4   /* Maximum nesting depth */
 
-/* User space schema: list of field names to query */
+/* Schema flags */
+#define KS_FLAG_ALLOW_NULL 0x01  /* Return 0 for NULL pointers instead of error */
+
+/* User space schema: list of field names/paths to query */
 struct ks_schema {
 	__u32 nr_fields;
+	__u32 flags;
 	char field_names[KS_MAX_FIELDS][KS_FIELD_NAME_LEN];
 };
 
@@ -37,13 +42,24 @@ struct ks_result {
 #include <linux/btf.h>
 #include <linux/cgroup.h>
 
-/* Whitelist of allowed fields for struct cgroup */
+/*
+ * Whitelist of allowed fields for struct cgroup
+ * Supports both simple fields and nested paths (e.g., "css_set.dfl_cgrp.level")
+ */
 static const char *ks_cgroup_whitelist[] = {
+	/* Simple fields */
 	"level",
 	"max_depth",
 	"nr_descendants",
 	"nr_dying_descendants",
 	"max_descendants",
+	
+	/* Nested paths (Phase 2) */
+	"self.id",                    /* cgrp->self.id */
+	"self.serial_nr",             /* cgrp->self.serial_nr */
+	"root.kf",                    /* cgrp->root->kf (ptr) */
+	"dom_cgrp.level",             /* cgrp->dom_cgrp->level */
+	
 	NULL
 };
 
