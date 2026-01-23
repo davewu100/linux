@@ -25,6 +25,10 @@ void css_atomic_mod_state(struct mem_cgroup *memcg, int idx, int val)
 {
 	struct memcg_atomic_counter *counter = READ_ONCE(memcg->atomic_counter);
 
+	/* Safety: counter might be NULL during initialization/cleanup */
+	if (unlikely(!counter))
+		return;
+
 	/* Update hierarchical counter */
 	atomic64_add(val, &counter->state[idx]);
 
@@ -56,6 +60,10 @@ void css_atomic_mod_lruvec_state(struct mem_cgroup *memcg,
 	struct memcg_atomic_counter_per_node *node_counter =
 		READ_ONCE(pn->atomic_counter_per_node);
 
+	/* Safety: counters might be NULL during initialization/cleanup */
+	if (unlikely(!counter || !node_counter))
+		return;
+
 	/* Update hierarchical counter */
 	atomic64_add(val, &counter->state[idx]);
 
@@ -77,6 +85,10 @@ void css_atomic_count_events(struct mem_cgroup *memcg, int idx,
 			     unsigned long count)
 {
 	struct memcg_atomic_counter *counter = READ_ONCE(memcg->atomic_counter);
+
+	/* Safety: counter might be NULL during initialization/cleanup */
+	if (unlikely(!counter))
+		return;
 
 	/* Update hierarchical event counter */
 	atomic64_add(count, &counter->events[idx]);
@@ -210,7 +222,27 @@ int css_atomic_init(struct mem_cgroup *memcg)
 	}
 	seqlock_init(&memcg->atomic_cache->stats_seqlock);
 	seqlock_init(&memcg->atomic_cache->events_seqlock);
-	memcg->atomic_cache->valid = false; /* Mark as invalid initially */
+
+	/*
+	 * BOOT SAFETY: Pre-validate cache for root memcg to avoid first-read flush.
+	 * Root memcg is accessed very early during boot (often before it's online),
+	 * and forcing a tree traversal on first read would cause boot hangs.
+	 *
+	 * For root cgroup:
+	 * - Mark cache as valid immediately (no children yet, so zeros are correct)
+	 * - This prevents css_atomic_page_state() from triggering css_atomic_flush()
+	 * - First flush will occur naturally when update threshold is exceeded
+	 *
+	 * For non-root cgroups:
+	 * - Keep cache invalid until first flush (normal behavior)
+	 * - They won't be accessed before being fully online
+	 */
+	if (mem_cgroup_is_root(memcg)) {
+		/* Initialize all stats/events to 0 (already done by kzalloc) */
+		memcg->atomic_cache->valid = true;
+	} else {
+		memcg->atomic_cache->valid = false;
+	}
 
 	return 0;
 }

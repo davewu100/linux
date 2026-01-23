@@ -59,7 +59,7 @@ static double get_cycles_to_microseconds(void) {
 void func_profiler_init(void) {
     memset(&g_state, 0, sizeof(g_state));
     g_state.enabled = false;
-    
+
     for (int i = 0; i < MAX_PROFILED_FUNCTIONS; i++) {
         g_state.data[i].number = -1;
         g_state.data[i].call_count = 0;
@@ -102,7 +102,7 @@ void func_profiler_add_data(int number, uint64_t duration) {
         return;
 
     profiling_data_t* data_slot = &g_state.data[slot_index];
-    
+
     data_slot->call_count++;
     data_slot->call_duration_ns += duration;
 

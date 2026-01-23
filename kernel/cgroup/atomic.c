@@ -101,9 +101,29 @@ u64 css_atomic_page_state(struct mem_cgroup *memcg, int idx, bool force)
 	u64 value;
 	int i = memcg_stats_index(idx);
 	bool flushed = false;
+	struct memcg_atomic_counter *counter;
 
 	if (WARN_ONCE(BAD_STAT_IDX(i), "%s: missing stat item %d\n", __func__, idx))
 		return 0;
+
+	/*
+	 * BOOT SAFETY: Check if memcg is fully online before allowing
+	 * tree traversal. During early boot (css_alloc/css_online phase),
+	 * the cgroup tree is not fully initialized and tree traversal
+	 * via mem_cgroup_iter() could cause infinite loops or deadlocks.
+	 *
+	 * For non-online memcgs, return local counter only (no hierarchy).
+	 * This is safe because:
+	 * - Before online, no children exist yet
+	 * - Local accounting is already active
+	 * - Hierarchical reads can wait until online completes
+	 */
+	if (!mem_cgroup_online(memcg)) {
+		counter = READ_ONCE(memcg->atomic_counter);
+		if (counter && i >= 0)
+			return atomic64_read(&counter->state[i]);
+		return 0;
+	}
 
 	/* Fast path: try to read from cache without flushing */
 	/* Threshold check is now done inside cache read function */
@@ -185,6 +205,10 @@ static u64 css_atomic_page_state_recursive(struct mem_cgroup *memcg, int idx)
 	struct mem_cgroup *child;
 	struct memcg_atomic_counter *counter;
 	u64 total = 0;
+
+	/* BOOT SAFETY: Skip non-online memcgs to avoid reading partial state */
+	if (unlikely(!mem_cgroup_online(memcg)))
+		return 0;
 
 	/* Early exit if no atomic counter */
 	counter = READ_ONCE(memcg->atomic_counter);
@@ -296,6 +320,14 @@ static bool css_atomic_events_need_flush(struct mem_cgroup *memcg)
  */
 void css_atomic_flush(struct mem_cgroup *memcg, bool force)
 {
+	/*
+	 * BOOT SAFETY: Don't flush until memcg is fully online.
+	 * Tree traversal during flush requires a stable cgroup hierarchy.
+	 * Before online, local counters are sufficient (no children yet).
+	 */
+	if (!mem_cgroup_online(memcg))
+		return;
+
 	if (!force && !css_atomic_stats_need_flush(memcg) && !css_atomic_events_need_flush(memcg))
 		return;
 
@@ -487,9 +519,21 @@ unsigned long css_atomic_events(struct mem_cgroup *memcg, enum vm_event_item idx
 	unsigned long value;
 	int i = memcg_events_index(idx);
 	bool flushed = false;
+	struct memcg_atomic_counter *counter;
 
 	if (WARN_ONCE(BAD_STAT_IDX(i), "%s: missing event item %d\n", __func__, idx))
 		return 0;
+
+	/*
+	 * BOOT SAFETY: Check if memcg is fully online before allowing
+	 * tree traversal. Same rationale as css_atomic_page_state().
+	 */
+	if (!mem_cgroup_online(memcg)) {
+		counter = READ_ONCE(memcg->atomic_counter);
+		if (counter && i >= 0)
+			return (unsigned long)atomic64_read(&counter->events[i]);
+		return 0;
+	}
 
 	/* Fast path: try to read from cache without flushing */
 	/* Threshold check is now done inside cache read function */
@@ -557,6 +601,10 @@ unsigned long css_atomic_events_recursive(struct mem_cgroup *memcg,
 	unsigned long total = 0;
 	int i;
 
+	/* BOOT SAFETY: Skip non-online memcgs to avoid reading partial state */
+	if (unlikely(!mem_cgroup_online(memcg)))
+		return 0;
+
 	/* Early exit if no atomic counter */
 	counter = READ_ONCE(memcg->atomic_counter);
 	if (unlikely(!counter))
@@ -610,6 +658,15 @@ static int __css_atomic_walk_locked(struct mem_cgroup *memcg,
 	 * (kernel stack is only 8-16KB, deep recursion would overflow).
 	 */
 	for (iter = memcg; iter; iter = mem_cgroup_iter(memcg, iter, NULL)) {
+		/*
+		 * BOOT SAFETY: Skip memcgs that aren't fully online yet.
+		 * During boot/initialization, some memcgs may be in the tree
+		 * but not fully initialized. Accessing their atomic_counter
+		 * or other fields could be unsafe.
+		 */
+		if (!mem_cgroup_online(iter))
+			continue;
+
 		ret = visit(iter, arg);
 		if (unlikely(ret))
 			return ret;
