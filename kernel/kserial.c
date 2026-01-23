@@ -110,6 +110,7 @@ static int ks_parse_array_syntax(const char *field, char *base_name, int *index)
 {
 	const char *bracket = strchr(field, '[');
 	int len;
+	int digit_count = 0;
 	
 	if (!bracket) {
 		/* No array syntax */
@@ -133,12 +134,40 @@ static int ks_parse_array_syntax(const char *field, char *base_name, int *index)
 	
 	*index = 0;
 	while (*bracket >= '0' && *bracket <= '9') {
-		*index = (*index) * 10 + (*bracket - '0');
+		int digit = *bracket - '0';
+		
+		/* Prevent integer overflow: check before multiplication
+		 * Max safe value: INT_MAX / 10 = 214748364
+		 * If index > INT_MAX/10, next multiplication will overflow
+		 * If index == INT_MAX/10, check if digit would cause overflow
+		 */
+		if (*index > INT_MAX / 10 ||
+		    (*index == INT_MAX / 10 && digit > INT_MAX % 10)) {
+			pr_warn("k-serial: array index too large in '%s'\n", field);
+			return -ERANGE;
+		}
+		
+		*index = (*index) * 10 + digit;
 		bracket++;
+		digit_count++;
+		
+		/* Sanity check: reject unreasonably long numbers (>10 digits)
+		 * This prevents DoS by parsing extremely long number strings
+		 */
+		if (digit_count > 10) {
+			pr_warn("k-serial: array index too many digits in '%s'\n", field);
+			return -EINVAL;
+		}
 	}
 	
 	if (*bracket != ']')
 		return -EINVAL;
+	
+	/* Additional sanity check: reject negative results from overflow */
+	if (*index < 0) {
+		pr_warn("k-serial: array index invalid in '%s'\n", field);
+		return -ERANGE;
+	}
 	
 	return 0;
 }
@@ -350,7 +379,15 @@ static int ks_resolve_array_element(const struct btf *btf, u32 array_type_id,
 		return ret;
 	elem_size = ret;
 	
-	/* Calculate element address */
+	/* Prevent address calculation overflow
+	 * Check if (index * elem_size) would overflow before calculating
+	 */
+	if (elem_size > 0 && index > (INT_MAX / elem_size)) {
+		pr_warn("k-serial: array offset calculation would overflow\n");
+		return -ERANGE;
+	}
+	
+	/* Calculate element address (now safe from overflow) */
 	*elem_addr = (char *)array_addr + (index * elem_size);
 	*elem_type_id = arr->type;
 	
