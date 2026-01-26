@@ -132,27 +132,26 @@ unsigned long css_atomic_events_recursive(struct mem_cgroup *memcg,
 }
 
 /**
- * css_atomic_flush - flush cache if needed (rstat-like threshold + rate limit)
+ * css_atomic_flush - flush cache if needed (EXACTLY like rstat)
  * @memcg: the memory cgroup
- * @force: if true, bypass threshold and rate limit checks
+ * @force: if true, bypass threshold check
  *
- * RSTAT-LIKE FLUSH LOGIC (same as __mem_cgroup_flush_stats):
- * - force=false: Check threshold + rate limit before flushing
+ * EXACTLY LIKE RSTAT's __mem_cgroup_flush_stats():
+ * - force=false: ONLY check threshold (NO time check!)
  *   1. Check threshold: stats_updates > THRESHOLD * num_online_cpus()
- *   2. Check rate limit: last flush > 2s ago
- *   3. Only flush if both conditions met
+ *   2. If exceeded → flush immediately
  * - force=true: Flush immediately, skip all checks
  *
  * This is called:
- * - From memory.stat read (force=false): normal flush with checks
+ * - From memory.stat read (force=false): threshold check only
  * - From OOM/comparison (force=true): immediate flush
  *
- * Similar to rstat's __mem_cgroup_flush_stats(memcg, force).
+ * Rate limiting is ONLY in css_atomic_flush_ratelimited(), not here!
+ * This matches rstat's mem_cgroup_flush_stats() behavior exactly.
  */
 void css_atomic_flush(struct mem_cgroup *memcg, bool force)
 {
 	struct memcg_atomic_cache *cache;
-	unsigned long now;
 	int threshold;
 	int updates;
 
@@ -170,13 +169,16 @@ void css_atomic_flush(struct mem_cgroup *memcg, bool force)
 	}
 
 	/*
-	 * Normal flush: check threshold and rate limit.
+	 * Normal flush: ONLY check threshold (exactly like rstat).
 	 *
 	 * Calculate threshold like rstat:
 	 * MEMCG_CHARGE_BATCH * num_online_cpus()
 	 *
 	 * We use ATOMIC_FLUSH_THRESHOLD (64) as our base, similar to
 	 * rstat's MEMCG_CHARGE_BATCH.
+	 *
+	 * NO rate limit here! That's only in css_atomic_flush_ratelimited().
+	 * This matches rstat's mem_cgroup_flush_stats() which doesn't check time.
 	 */
 	threshold = ATOMIC_FLUSH_THRESHOLD * num_online_cpus();
 	updates = atomic_read(&cache->stats_updates);
@@ -185,20 +187,56 @@ void css_atomic_flush(struct mem_cgroup *memcg, bool force)
 	if (updates == 0)
 		return;
 
-	/* Threshold check: only flush if exceeded (like rstat) */
+	/* Threshold check: only flush if exceeded (exactly like rstat) */
 	if (updates < threshold)
 		return;
 
+	/* Threshold exceeded: flush immediately (like rstat) */
+	css_atomic_refresh_cache(memcg);
+}
+
+/**
+ * css_atomic_flush_ratelimited - rate-limited flush (stricter than normal)
+ * @memcg: the memory cgroup
+ *
+ * More aggressive rate limiting than css_atomic_flush().
+ * Only flush if last flush was > 4s ago (2 * FLUSH_TIME).
+ *
+ * This is used in hot paths where we want stats but can tolerate
+ * more staleness. Matches rstat's mem_cgroup_flush_stats_ratelimited().
+ */
+void css_atomic_flush_ratelimited(struct mem_cgroup *memcg)
+{
+	struct memcg_atomic_cache *cache;
+	unsigned long now;
+	int threshold;
+	int updates;
+
+	if (unlikely(!mem_cgroup_online(memcg)))
+		return;
+
+	cache = memcg->atomic_cache;
+	if (unlikely(!cache))
+		return;
+
 	/*
-	 * Rate limit: avoid flushing too frequently.
-	 * Even if threshold is exceeded, skip if we flushed recently.
-	 * This is optional but helps reduce flush storms.
+	 * Check threshold first (like normal flush)
+	 */
+	threshold = ATOMIC_FLUSH_THRESHOLD * num_online_cpus();
+	updates = atomic_read(&cache->stats_updates);
+
+	if (updates == 0 || updates < threshold)
+		return;
+
+	/*
+	 * Stricter rate limit: only flush if > 4s (2 * FLUSH_TIME)
+	 * This is more conservative than normal flush (2s).
 	 */
 	now = jiffies;
-	if (time_before(now, READ_ONCE(cache->flush_time) + ATOMIC_FLUSH_TIME))
-		return;  /* Too soon since last flush */
+	if (time_before(now, READ_ONCE(cache->flush_time) + 2 * ATOMIC_FLUSH_TIME))
+		return;  /* Too soon, need to wait longer */
 
-	/* Threshold exceeded and rate limit passed: do the flush */
+	/* Both threshold and stricter rate limit passed: flush */
 	css_atomic_refresh_cache(memcg);
 }
 

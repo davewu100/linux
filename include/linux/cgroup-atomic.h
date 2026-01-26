@@ -100,6 +100,7 @@ unsigned long css_atomic_events_recursive(struct mem_cgroup *memcg,
 
 /* Cache flush - rstat-like threshold + rate limit check */
 void css_atomic_flush(struct mem_cgroup *memcg, bool force);
+void css_atomic_flush_ratelimited(struct mem_cgroup *memcg);
 
 #else /* !CONFIG_MEMCG_ATOMIC_COUNTER */
 
@@ -119,6 +120,7 @@ static inline unsigned long css_atomic_events_recursive(struct mem_cgroup *memcg
 	return 0;
 }
 static inline void css_atomic_flush(struct mem_cgroup *memcg, bool force) { }
+static inline void css_atomic_flush_ratelimited(struct mem_cgroup *memcg) { }
 
 #endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
 
