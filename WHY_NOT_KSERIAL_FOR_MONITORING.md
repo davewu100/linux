@@ -340,6 +340,42 @@ sudo ./monitor_bpftrace.sh 1000
 
 ---
 
+## 🔄 但是！kserial 有独特优势
+
+### 当系统不支持 BPF 时
+
+很多场景下 BPF 不可用：
+1. **老内核**（< 4.x）不支持 BPF
+2. **嵌入式系统**可能禁用 BPF（CONFIG_BPF=n）
+3. **安全限制**的环境禁用 BPF（企业策略）
+4. **没有安装工具**（bpftrace, BCC）且不能安装
+
+**这时 kserial 就非常有价值！**
+
+```bash
+# 检查 BPF 支持
+if command -v bpftrace &> /dev/null; then
+    # 使用 BPF（最优）
+    bpftrace -e 'interval:s:1 { ... }'
+else
+    # 回退到 kserial（仍然可用！）
+    while true; do
+        kserial -m anon file kernel
+        sleep 1
+    done
+fi
+```
+
+### kserial 的独特优势
+
+| 维度 | kserial | BPF |
+|------|---------|-----|
+| **依赖** | ✅ 仅需内核模块 | ❌ 需要 bpftrace/BCC |
+| **内核要求** | ✅ 任何支持 BTF 的内核 | ❌ 需要较新内核 + CONFIG_BPF=y |
+| **安装** | ✅ 内核模块，编译即可 | ❌ 需要安装用户空间工具 |
+| **权限** | ✅ 读 /proc 文件 | ⚠️ 加载 BPF 程序（更敏感） |
+| **受限环境** | ✅ 可用 | ❌ 可能被禁用 |
+
 ## 💡 总结
 
 | 维度 | kserial | BPF |
@@ -349,8 +385,9 @@ sudo ./monitor_bpftrace.sh 1000
 | **上下文切换** | 非常频繁 | 极少 |
 | **时间精度** | 差（累积误差） | 精确（内核定时器） |
 | **CPU 开销** | 高 | 极低 |
-| **适用场景** | 一次性查询 | 持续监控 |
+| **适用场景** | 一次性查询 **+ 回退方案** | 持续监控 |
 | **命令复杂度** | 简单 | 中等 |
+| **环境兼容性** | ✅ 广泛 | ⚠️ 有限制 |
 
 **实时监控不用 kserial 的原因**：
 1. ❌ 每次查询需要 4 次系统调用
@@ -368,5 +405,11 @@ sudo ./monitor_bpftrace.sh 1000
 
 **结论**：
 - **快速查看** → 用 `cat` 或 `kserial -m`
-- **持续监控** → 用 `bpftrace` 或 `BCC`
+- **持续监控** → 用 `bpftrace` 或 `BCC`（如果可用）
+- **BPF 不可用** → 用 `kserial` 循环（重要的回退方案！）
 - **两者配合** → 最佳实践！
+
+**重要：kserial 不是 BPF 的竞争对手，而是互补工具**
+- 理想情况：用 BPF 做实时监控
+- 受限环境：用 kserial 也能完成任务
+- 日常查询：kserial 更简单直接
