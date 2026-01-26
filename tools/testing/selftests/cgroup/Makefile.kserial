@@ -10,7 +10,7 @@ CFLAGS = -Wall -Wextra -O2
 LDFLAGS =
 
 # Targets
-TARGETS = test_kserial test_kserial_real test_kserial_phase2 test_kserial_phase3 test_kserial_security example_monitor kserial_tool
+TARGETS = test_kserial test_kserial_real test_kserial_phase2 test_kserial_phase3 test_kserial_security test_memcg_query example_monitor kserial_tool
 
 all: $(TARGETS)
 
@@ -43,6 +43,10 @@ example_monitor: example_monitor.c
 
 # k-serial command-line tool
 kserial_tool: kserial_tool.c
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+
+# mem_cgroup query test
+test_memcg_query: test_memcg_query.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
 # Make Python client executable

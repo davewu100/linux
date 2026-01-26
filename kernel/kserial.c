@@ -422,33 +422,33 @@ static int ks_write_tlv(struct ks_result *result, u16 field_id,
 }
 
 /**
- * ks_query_cgroup - Query fields from a cgroup using BTF
- * @cgrp: Target cgroup
+ * ks_query_struct - Query fields from any kernel struct using BTF
+ * @struct_addr: Address of target struct
+ * @struct_name: Name of struct type (e.g., "cgroup", "mem_cgroup", "task_struct")
  * @schema: User-provided field list (may contain nested paths)
  * @result: Output buffer for TLV-encoded data
  * 
- * This function supports both simple fields and nested paths:
- * - Simple: "level" 
- * - Nested: "self.id"
- * - Deep: "dom_cgrp.level" (with pointer dereferencing)
+ * This function supports querying any BTF-visible kernel struct:
+ * - Simple fields: "level", "nr_descendants"
+ * - Nested fields: "self.id", "dom_cgrp.level"
+ * - Array elements: "subsys[0]", "nr_dying_subsys[1]"
  * 
- * Steps:
- * 1. Validates each field path against whitelist
- * 2. Uses BTF to resolve the path (handles nesting and pointers)
- * 3. Extracts the value from the final field
- * 4. Encodes the result in TLV format
+ * Security:
+ * - BTF type checking ensures field exists
+ * - Only scalar types (int, u64, pointer) are returned
+ * - Array bounds checked automatically
  * 
  * Returns: 0 on success, negative error code on failure
  */
-int ks_query_cgroup(struct cgroup *cgrp, const struct ks_schema *schema,
-		    struct ks_result *result)
+int ks_query_struct(void *struct_addr, const char *struct_name,
+		    const struct ks_schema *schema, struct ks_result *result)
 {
 	const struct btf *btf;
-	s32 cgroup_type_id;
+	s32 struct_type_id;
 	u32 i;
 	int ret;
 
-	if (!cgrp || !schema || !result)
+	if (!struct_addr || !struct_name || !schema || !result)
 		return -EINVAL;
 
 	if (schema->nr_fields == 0 || schema->nr_fields > KS_MAX_FIELDS)
@@ -462,10 +462,12 @@ int ks_query_cgroup(struct cgroup *cgrp, const struct ks_schema *schema,
 	if (!btf)
 		return -ENOENT;
 
-	/* Find struct cgroup in BTF */
-	cgroup_type_id = btf_find_by_name_kind(btf, "cgroup", BTF_KIND_STRUCT);
-	if (cgroup_type_id < 0)
-		return cgroup_type_id;
+	/* Find target struct in BTF */
+	struct_type_id = btf_find_by_name_kind(btf, struct_name, BTF_KIND_STRUCT);
+	if (struct_type_id < 0) {
+		pr_warn("k-serial: struct '%s' not found in BTF\n", struct_name);
+		return struct_type_id;
+	}
 
 	/* Process each requested field/path */
 	for (i = 0; i < schema->nr_fields; i++) {
@@ -494,7 +496,7 @@ int ks_query_cgroup(struct cgroup *cgrp, const struct ks_schema *schema,
 		 */
 
 		/* Resolve field path (handles nesting and pointers) */
-		ret = ks_resolve_field_path(btf, cgroup_type_id, cgrp,
+		ret = ks_resolve_field_path(btf, struct_type_id, struct_addr,
 					     base_name, schema->flags,
 					     &field_addr, &field_type_id);
 		if (ret) {
@@ -545,4 +547,4 @@ int ks_query_cgroup(struct cgroup *cgrp, const struct ks_schema *schema,
 
 	return 0;
 }
-EXPORT_SYMBOL_GPL(ks_query_cgroup);
+EXPORT_SYMBOL_GPL(ks_query_struct);

@@ -22,6 +22,7 @@
 struct ks_schema {
 	__u32 nr_fields;
 	__u32 flags;
+	char struct_name[KS_FIELD_NAME_LEN];  /* Target struct type (e.g. "cgroup", "mem_cgroup") */
 	char field_names[KS_MAX_FIELDS][KS_FIELD_NAME_LEN];
 };
 
@@ -59,15 +60,30 @@ struct ks_result {
  */
 
 /**
- * ks_query_cgroup - Query fields from a cgroup using BTF
+ * ks_query_struct - Query fields from any kernel struct using BTF
+ * @struct_addr: Address of target struct
+ * @struct_name: Name of struct type (e.g., "cgroup", "mem_cgroup")
+ * @schema: User-provided field list
+ * @result: Output buffer for TLV-encoded data
+ * 
+ * Returns: 0 on success, negative error code on failure
+ */
+int ks_query_struct(void *struct_addr, const char *struct_name,
+		    const struct ks_schema *schema, struct ks_result *result);
+
+/**
+ * ks_query_cgroup - Query fields from a cgroup using BTF (legacy wrapper)
  * @cgrp: Target cgroup
  * @schema: User-provided field list
  * @result: Output buffer for TLV-encoded data
  * 
  * Returns: 0 on success, negative error code on failure
  */
-int ks_query_cgroup(struct cgroup *cgrp, const struct ks_schema *schema,
-		    struct ks_result *result);
+static inline int ks_query_cgroup(struct cgroup *cgrp, const struct ks_schema *schema,
+				   struct ks_result *result)
+{
+	return ks_query_struct(cgrp, "cgroup", schema, result);
+}
 
 #endif /* __KERNEL__ */
 

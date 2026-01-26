@@ -8,6 +8,7 @@
  *   kserial-tool [options] <field1> [field2] [...]
  * 
  * Options:
+ *   -s, --struct     Struct type (default: cgroup)
  *   -j, --json       Output in JSON format
  *   -r, --raw        Output raw values only
  *   -v, --verbose    Verbose output
@@ -37,6 +38,7 @@
 struct ks_schema {
 	uint32_t nr_fields;
 	uint32_t flags;
+	char struct_name[KS_FIELD_NAME_LEN];
 	char field_names[KS_MAX_FIELDS][KS_FIELD_NAME_LEN];
 };
 
@@ -223,22 +225,28 @@ static void print_raw(const struct ks_result *result, const struct ks_schema *sc
 static void print_usage(const char *prog)
 {
 	printf("Usage: %s [options] <field1> [field2] [...]\n\n", prog);
-	printf("Query cgroup fields using k-serial.\n\n");
+	printf("Query kernel struct fields using k-serial.\n\n");
 	printf("Options:\n");
-	printf("  -j, --json       Output in JSON format\n");
-	printf("  -r, --raw        Output raw values only\n");
-	printf("  -v, --verbose    Verbose output (show hex)\n");
-	printf("  -h, --help       Show this help\n\n");
+	printf("  -s, --struct=TYPE Struct type (default: cgroup)\n");
+	printf("  -j, --json        Output in JSON format\n");
+	printf("  -r, --raw         Output raw values only\n");
+	printf("  -v, --verbose     Verbose output (show hex)\n");
+	printf("  -h, --help        Show this help\n\n");
 	printf("Examples:\n");
 	printf("  %s level nr_descendants\n", prog);
-	printf("  %s -j self.id dom_cgrp.level\n", prog);
-	printf("  %s subsys[0] subsys[1] subsys[2]\n", prog);
+	printf("  %s -s cgroup -j self.id dom_cgrp.level\n", prog);
+	printf("  %s -s mem_cgroup vmstats.state[0]\n", prog);
 	printf("  %s -r level  # Output: 2\n", prog);
-	printf("\nSupported field examples:\n");
+	printf("\nSupported struct types:\n");
+	printf("  cgroup      - struct cgroup (default)\n");
+	printf("  mem_cgroup  - struct mem_cgroup\n");
+	printf("  task_struct - struct task_struct\n");
+	printf("\nField examples:\n");
 	printf("  Simple:    level, nr_descendants, max_depth\n");
 	printf("  Nested:    self.id, dom_cgrp.level\n");
 	printf("  Array:     subsys[0], nr_dying_subsys[1]\n");
-	printf("\nFor full list, see: /proc/kserial (whitelist in kernel)\n");
+	printf("\nExplore available fields:\n");
+	printf("  bpftool btf dump file /sys/kernel/btf/vmlinux | grep 'struct cgroup {'\n");
 }
 
 int main(int argc, char *argv[])
@@ -247,8 +255,10 @@ int main(int argc, char *argv[])
 	struct ks_result result = {0};
 	int opt;
 	int field_start;
+	const char *struct_type = "cgroup";  /* Default */
 
 	static struct option long_options[] = {
+		{"struct",  required_argument, 0, 's'},
 		{"json",    no_argument, 0, 'j'},
 		{"raw",     no_argument, 0, 'r'},
 		{"verbose", no_argument, 0, 'v'},
@@ -257,8 +267,11 @@ int main(int argc, char *argv[])
 	};
 
 	/* Parse options */
-	while ((opt = getopt_long(argc, argv, "jrvh", long_options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "s:jrvh", long_options, NULL)) != -1) {
 		switch (opt) {
+		case 's':
+			struct_type = optarg;
+			break;
 		case 'j':
 			format = FORMAT_JSON;
 			break;
@@ -289,6 +302,7 @@ int main(int argc, char *argv[])
 	/* Build schema from arguments */
 	schema.nr_fields = 0;
 	schema.flags = 0;
+	strncpy(schema.struct_name, struct_type, KS_FIELD_NAME_LEN - 1);
 
 	for (int i = field_start; i < argc && schema.nr_fields < KS_MAX_FIELDS; i++) {
 		if (strlen(argv[i]) >= KS_FIELD_NAME_LEN) {

@@ -14,6 +14,7 @@
 #include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/cgroup.h>
+#include <linux/memcontrol.h>
 #include <linux/sched.h>
 #include <linux/uaccess.h>
 
@@ -55,12 +56,14 @@ static int ks_proc_open(struct inode *inode, struct file *file)
  * ks_proc_write - Accept schema from userspace
  * 
  * User writes struct ks_schema to specify which fields to query
+ * The schema can specify different struct types via struct_name field
  */
 static ssize_t ks_proc_write(struct file *file, const char __user *buf,
 			      size_t count, loff_t *ppos)
 {
 	struct ks_proc_data *data = file->private_data;
-	struct cgroup *cgrp;
+	void *target_struct = NULL;
+	const char *struct_name;
 	int ret;
 
 	if (count != sizeof(struct ks_schema))
@@ -70,20 +73,46 @@ static ssize_t ks_proc_write(struct file *file, const char __user *buf,
 	if (copy_from_user(data->schema, buf, sizeof(*data->schema)))
 		return -EFAULT;
 
-	/* Get current task's cgroup */
+	/* Determine target struct type (default to "cgroup" if not specified) */
+	if (data->schema->struct_name[0] == '\0') {
+		strncpy(data->schema->struct_name, "cgroup", KS_FIELD_NAME_LEN - 1);
+	}
+	struct_name = data->schema->struct_name;
+
+	/* Get target struct based on type */
 	rcu_read_lock();
-	cgrp = task_dfl_cgroup(current);
-	if (!cgrp) {
+	
+	if (!strcmp(struct_name, "cgroup")) {
+		/* Query current task's cgroup */
+		target_struct = task_dfl_cgroup(current);
+		if (!target_struct) {
+			rcu_read_unlock();
+			pr_warn("k-serial: failed to get cgroup for current task\n");
+			return -ENOENT;
+		}
+	} else if (!strcmp(struct_name, "mem_cgroup")) {
+		/* Query current task's mem_cgroup */
+		target_struct = mem_cgroup_from_task(current);
+		if (!target_struct) {
+			rcu_read_unlock();
+			pr_warn("k-serial: failed to get mem_cgroup for current task\n");
+			return -ENOENT;
+		}
+	} else if (!strcmp(struct_name, "task_struct")) {
+		/* Query current task itself */
+		target_struct = current;
+	} else {
 		rcu_read_unlock();
-		return -ENOENT;
+		pr_warn("k-serial: unsupported struct type '%s'\n", struct_name);
+		return -EINVAL;
 	}
 
-	/* Query the cgroup using k-serial */
-	ret = ks_query_cgroup(cgrp, data->schema, data->result);
+	/* Query the struct using k-serial */
+	ret = ks_query_struct(target_struct, struct_name, data->schema, data->result);
 	rcu_read_unlock();
 
 	if (ret) {
-		pr_warn("k-serial: query failed: %d\n", ret);
+		pr_warn("k-serial: query of struct '%s' failed: %d\n", struct_name, ret);
 		return ret;
 	}
 
