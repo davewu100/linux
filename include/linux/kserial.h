@@ -71,6 +71,20 @@ struct ks_result {
 int ks_query_struct(void *struct_addr, const char *struct_name,
 		    const struct ks_schema *schema, struct ks_result *result);
 
+/* Cache management */
+struct ks_cache_entry;
+struct ks_cache_stats;
+
+int ks_cache_init(void);
+void ks_cache_cleanup(void);
+struct ks_cache_entry *ks_cache_lookup(const char *struct_name,
+				       const char *field_path);
+int ks_cache_insert(const char *struct_name, const char *field_path,
+		    u32 offset, u32 size, u32 type_id, u8 flags);
+void ks_cache_invalidate(void);
+void ks_cache_get_stats(struct ks_cache_stats *stats);
+void ks_cache_print_stats(struct seq_file *m);
+
 /**
  * ks_query_cgroup - Query fields from a cgroup using BTF (legacy wrapper)
  * @cgrp: Target cgroup
