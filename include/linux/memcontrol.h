@@ -289,12 +289,10 @@ struct mem_cgroup {
 	spinlock_t atomic_children_lock;	/* for list add/remove; traversal uses RCU */
 
 	/*
-	 * HIERARCHICAL VERSION: No cache needed!
-	 * counter->state[] already contains hierarchical values.
-	 * Update tracking kept for monitoring/debugging only.
+	 * TIME-BASED CACHE: Similar to rstat, cache is valid for 2s.
+	 * Refreshed on explicit reads (memory.stat) or when TTL expires.
 	 */
-	atomic_t atomic_stats_updates;
-	atomic_t atomic_events_updates;
+	struct memcg_atomic_cache *atomic_cache;
 #endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
 
 #ifdef CONFIG_MEMCG_NMI_SAFETY_REQUIRES_ATOMIC
