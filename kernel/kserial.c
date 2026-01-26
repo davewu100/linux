@@ -16,6 +16,7 @@
 #include <linux/kserial.h>
 #include <linux/btf.h>
 #include <linux/btf_ids.h>
+#include <linux/bpf.h>
 #include <linux/cgroup.h>
 #include <linux/errno.h>
 #include <linux/string.h>
@@ -65,18 +66,12 @@ static int ks_find_field_by_name(const struct btf *btf, s32 type_id,
 static int ks_get_field_size(const struct btf *btf, u32 type_id)
 {
 	const struct btf_type *t;
+	u32 resolved_id;
 
-	t = btf_type_by_id(btf, type_id);
+	/* Skip modifiers (const, volatile, etc.) */
+	t = btf_type_skip_modifiers(btf, type_id, &resolved_id);
 	if (!t)
 		return -EINVAL;
-
-	/* Follow modifiers (const, volatile, etc.) */
-	while (btf_type_is_modifier(t)) {
-		type_id = t->type;
-		t = btf_type_by_id(btf, type_id);
-		if (!t)
-			return -EINVAL;
-	}
 
 	/* Support integer types */
 	if (btf_type_is_int(t)) {
@@ -263,16 +258,9 @@ static int ks_resolve_field_path(const struct btf *btf, s32 start_type_id,
 		current_type_id = m->type;
 
 		/* Get the actual type (follow modifiers) */
-		t = btf_type_by_id(btf, current_type_id);
+		t = btf_type_skip_modifiers(btf, current_type_id, &current_type_id);
 		if (!t)
 			return -EINVAL;
-
-		while (btf_type_is_modifier(t)) {
-			current_type_id = t->type;
-			t = btf_type_by_id(btf, current_type_id);
-			if (!t)
-				return -EINVAL;
-		}
 
 		/* If not the last component, it must be a pointer or struct */
 		if (i < depth - 1) {
@@ -293,19 +281,11 @@ static int ks_resolve_field_path(const struct btf *btf, s32 start_type_id,
 
 				current_addr = ptr;
 				
-				/* Get the pointed-to type */
+				/* Get the pointed-to type and skip modifiers */
 				current_type_id = t->type;
-				t = btf_type_by_id(btf, current_type_id);
+				t = btf_type_skip_modifiers(btf, current_type_id, &current_type_id);
 				if (!t)
 					return -EINVAL;
-
-				/* Follow modifiers again */
-				while (btf_type_is_modifier(t)) {
-					current_type_id = t->type;
-					t = btf_type_by_id(btf, current_type_id);
-					if (!t)
-						return -EINVAL;
-				}
 
 				/* Must be a struct after dereferencing */
 				if (!btf_type_is_struct(t))
@@ -346,17 +326,10 @@ static int ks_resolve_array_element(const struct btf *btf, u32 array_type_id,
 	u32 elem_size;
 	int ret;
 	
-	t = btf_type_by_id(btf, array_type_id);
+	/* Skip modifiers */
+	t = btf_type_skip_modifiers(btf, array_type_id, &array_type_id);
 	if (!t)
 		return -EINVAL;
-	
-	/* Follow modifiers */
-	while (btf_type_is_modifier(t)) {
-		array_type_id = t->type;
-		t = btf_type_by_id(btf, array_type_id);
-		if (!t)
-			return -EINVAL;
-	}
 	
 	/* Must be an array type */
 	if (!btf_type_is_array(t)) {
@@ -458,8 +431,8 @@ int ks_query_struct(void *struct_addr, const char *struct_name,
 	result->total_len = 0;
 
 	/* Get BTF for vmlinux */
-	btf = btf_get_module_btf(NULL);
-	if (!btf)
+	btf = bpf_get_btf_vmlinux();
+	if (IS_ERR(btf) || !btf)
 		return -ENOENT;
 
 	/* Find target struct in BTF */
