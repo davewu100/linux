@@ -60,8 +60,31 @@ enum output_format {
 	FORMAT_RAW
 };
 
+/* Memory stat field mapping */
+struct memcg_stat_field {
+	const char *name;
+	const char *path;
+};
+
+/* Mapping from memory.stat names to k-serial field paths
+ * These indices are approximate and may need adjustment based on kernel version
+ */
+static const struct memcg_stat_field memcg_stat_fields[] = {
+	{"anon",         "vmstats.state[9]"},    /* NR_ANON_MAPPED (approx) */
+	{"file",         "vmstats.state[10]"},   /* NR_FILE_PAGES (approx) */
+	{"kernel",       "vmstats.state[40]"},   /* MEMCG_KMEM (approx) */
+	{"kernel_stack", "vmstats.state[20]"},   /* NR_KERNEL_STACK_KB (approx) */
+	{"pagetables",   "vmstats.state[25]"},   /* NR_PAGETABLE (approx) */
+	{"sock",         "vmstats.state[41]"},   /* MEMCG_SOCK (approx) */
+	{"percpu",       "vmstats.state[42]"},   /* MEMCG_PERCPU_B (approx) */
+	{"vmalloc",      "vmstats.state[43]"},   /* MEMCG_VMALLOC (approx) */
+	{"shmem",        "vmstats.state[15]"},   /* NR_SHMEM (approx) */
+	{NULL, NULL}
+};
+
 static bool verbose = false;
 static enum output_format format = FORMAT_DEFAULT;
+static bool memcg_stat_mode = false;
 
 /* Query cgroup via /proc/kserial */
 static int query_cgroup(const struct ks_schema *schema, struct ks_result *result)
@@ -227,25 +250,38 @@ static void print_usage(const char *prog)
 	printf("Usage: %s [options] <field1> [field2] [...]\n\n", prog);
 	printf("Query kernel struct fields using k-serial.\n\n");
 	printf("Options:\n");
-	printf("  -s, --struct=TYPE Struct type (default: cgroup)\n");
-	printf("  -j, --json        Output in JSON format\n");
-	printf("  -r, --raw         Output raw values only\n");
-	printf("  -v, --verbose     Verbose output (show hex)\n");
-	printf("  -h, --help        Show this help\n\n");
+	printf("  -s, --struct=TYPE  Struct type (default: cgroup)\n");
+	printf("  -m, --memcg-stat   Query memory.stat fields by name\n");
+	printf("  -j, --json         Output in JSON format\n");
+	printf("  -r, --raw          Output raw values only\n");
+	printf("  -v, --verbose      Verbose output (show hex)\n");
+	printf("  -h, --help         Show this help\n\n");
 	printf("Examples:\n");
 	printf("  %s level nr_descendants\n", prog);
 	printf("  %s -s cgroup -j self.id dom_cgrp.level\n", prog);
 	printf("  %s -s mem_cgroup vmstats.state[0]\n", prog);
-	printf("  %s -r level  # Output: 2\n", prog);
-	printf("\nSupported struct types:\n");
+	printf("  %s -r level  # Output: 2\n\n", prog);
+	
+	printf("Memory.stat quick query:\n");
+	printf("  %s --memcg-stat anon file kernel\n", prog);
+	printf("  %s -m anon file kernel_stack pagetables\n", prog);
+	printf("  %s -mj anon file  # JSON output\n\n", prog);
+	
+	printf("Supported struct types:\n");
 	printf("  cgroup      - struct cgroup (default)\n");
 	printf("  mem_cgroup  - struct mem_cgroup\n");
-	printf("  task_struct - struct task_struct\n");
-	printf("\nField examples:\n");
+	printf("  task_struct - struct task_struct\n\n");
+	
+	printf("Field examples:\n");
 	printf("  Simple:    level, nr_descendants, max_depth\n");
 	printf("  Nested:    self.id, dom_cgrp.level\n");
-	printf("  Array:     subsys[0], nr_dying_subsys[1]\n");
-	printf("\nExplore available fields:\n");
+	printf("  Array:     subsys[0], nr_dying_subsys[1]\n\n");
+	
+	printf("Memory.stat fields (use with -m):\n");
+	printf("  anon, file, kernel, kernel_stack, pagetables,\n");
+	printf("  sock, percpu, vmalloc, shmem\n\n");
+	
+	printf("Explore available fields:\n");
 	printf("  bpftool btf dump file /sys/kernel/btf/vmlinux | grep 'struct cgroup {'\n");
 }
 
@@ -258,19 +294,24 @@ int main(int argc, char *argv[])
 	const char *struct_type = "cgroup";  /* Default */
 
 	static struct option long_options[] = {
-		{"struct",  required_argument, 0, 's'},
-		{"json",    no_argument, 0, 'j'},
-		{"raw",     no_argument, 0, 'r'},
-		{"verbose", no_argument, 0, 'v'},
-		{"help",    no_argument, 0, 'h'},
+		{"struct",     required_argument, 0, 's'},
+		{"memcg-stat", no_argument,       0, 'm'},
+		{"json",       no_argument,       0, 'j'},
+		{"raw",        no_argument,       0, 'r'},
+		{"verbose",    no_argument,       0, 'v'},
+		{"help",       no_argument,       0, 'h'},
 		{0, 0, 0, 0}
 	};
 
 	/* Parse options */
-	while ((opt = getopt_long(argc, argv, "s:jrvh", long_options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "s:mjrvh", long_options, NULL)) != -1) {
 		switch (opt) {
 		case 's':
 			struct_type = optarg;
+			break;
+		case 'm':
+			memcg_stat_mode = true;
+			struct_type = "mem_cgroup";
 			break;
 		case 'j':
 			format = FORMAT_JSON;
@@ -305,11 +346,30 @@ int main(int argc, char *argv[])
 	strncpy(schema.struct_name, struct_type, KS_FIELD_NAME_LEN - 1);
 
 	for (int i = field_start; i < argc && schema.nr_fields < KS_MAX_FIELDS; i++) {
-		if (strlen(argv[i]) >= KS_FIELD_NAME_LEN) {
-			fprintf(stderr, "Error: Field name too long: %s\n", argv[i]);
+		const char *field_name = argv[i];
+		
+		/* If in memcg-stat mode, translate field names */
+		if (memcg_stat_mode) {
+			bool found = false;
+			for (int j = 0; memcg_stat_fields[j].name != NULL; j++) {
+				if (strcmp(field_name, memcg_stat_fields[j].name) == 0) {
+					field_name = memcg_stat_fields[j].path;
+					found = true;
+					break;
+				}
+			}
+			if (!found) {
+				fprintf(stderr, "Error: Unknown memory.stat field: %s\n", argv[i]);
+				fprintf(stderr, "Supported: anon, file, kernel, kernel_stack, pagetables, sock, percpu, vmalloc, shmem\n");
+				return 1;
+			}
+		}
+		
+		if (strlen(field_name) >= KS_FIELD_NAME_LEN) {
+			fprintf(stderr, "Error: Field name too long: %s\n", field_name);
 			return 1;
 		}
-		strncpy(schema.field_names[schema.nr_fields], argv[i], KS_FIELD_NAME_LEN - 1);
+		strncpy(schema.field_names[schema.nr_fields], field_name, KS_FIELD_NAME_LEN - 1);
 		schema.nr_fields++;
 	}
 
@@ -335,17 +395,47 @@ int main(int argc, char *argv[])
 	}
 
 	/* Print result */
-	switch (format) {
-	case FORMAT_JSON:
-		print_json(&result, &schema);
-		break;
-	case FORMAT_RAW:
-		print_raw(&result, &schema);
-		break;
-	case FORMAT_DEFAULT:
-	default:
-		print_default(&result, &schema);
-		break;
+	if (memcg_stat_mode && format == FORMAT_DEFAULT) {
+		/* Special formatting for memcg-stat mode */
+		const uint8_t *p = result.data;
+		const uint8_t *end = result.data + result.total_len;
+		
+		printf("memory.stat equivalent:\n");
+		
+		for (uint32_t i = 0; i < schema.nr_fields; i++) {
+			/* Find corresponding original field name */
+			const char *display_name = argv[field_start + i];
+			
+			/* Find TLV for this field */
+			const uint8_t *scan = result.data;
+			while (scan < end) {
+				const struct ks_tlv *tlv = (const struct ks_tlv *)scan;
+				if (scan + sizeof(*tlv) > end)
+					break;
+				
+				if (tlv->field_id == i) {
+					uint64_t value = 0;
+					if (tlv->len <= sizeof(value))
+						memcpy(&value, tlv->data, tlv->len);
+					printf("%-15s %llu\n", display_name, (unsigned long long)value);
+					break;
+				}
+				scan += sizeof(*tlv) + tlv->len;
+			}
+		}
+	} else {
+		switch (format) {
+		case FORMAT_JSON:
+			print_json(&result, &schema);
+			break;
+		case FORMAT_RAW:
+			print_raw(&result, &schema);
+			break;
+		case FORMAT_DEFAULT:
+		default:
+			print_default(&result, &schema);
+			break;
+		}
 	}
 
 	return 0;

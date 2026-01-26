@@ -1,0 +1,30 @@
+#!/usr/bin/env bpftrace
+/*
+ * Query memory cgroup statistics using bpftrace
+ * 
+ * Usage: sudo bpftrace query_memcg_stats.bt
+ */
+
+BEGIN
+{
+    // Get current task's mem_cgroup
+    $task = (struct task_struct *)curtask;
+    $memcg = (struct mem_cgroup *)$task->memcg;
+    
+    if ($memcg != 0) {
+        $vmstats = $memcg->vmstats;
+        
+        // Print memory.stat equivalent values
+        // Note: These indices are approximate - need to verify with kernel headers
+        printf("Memory cgroup statistics:\n");
+        printf("─────────────────────────\n");
+        printf("anon           = %ld\n", $vmstats->state[9]);   // NR_ANON_MAPPED (approx)
+        printf("file           = %ld\n", $vmstats->state[10]);  // NR_FILE_PAGES (approx)
+        printf("kernel         = %ld\n", $vmstats->state[40]);  // MEMCG_KMEM (approx)
+        printf("kernel_stack   = %ld\n", $vmstats->state[20]);  // NR_KERNEL_STACK_KB (approx)
+    } else {
+        printf("Error: Could not get mem_cgroup for current task\n");
+    }
+    
+    exit();
+}
