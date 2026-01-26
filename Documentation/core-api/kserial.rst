@@ -32,7 +32,7 @@ Data Flow
     Userspace                 Kernel
     =========                 ======
     
-    ks_schema                 /proc/cgroup_query
+    ks_schema                 /proc/kserial
         |                            |
         | write()                    v
         |                     ks_proc_write()

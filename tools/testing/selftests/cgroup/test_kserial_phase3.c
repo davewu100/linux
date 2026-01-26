@@ -76,16 +76,16 @@ static void parse_tlv_result(const struct ks_result *result,
 	}
 }
 
-/* Query cgroup via /proc/cgroup_query */
+/* Query cgroup via /proc/kserial */
 static int query_cgroup_via_procfs(const struct ks_schema *schema,
 				    struct ks_result *result)
 {
 	int fd;
 	ssize_t n;
 
-	fd = open("/proc/cgroup_query", O_RDWR);
+	fd = open("/proc/kserial", O_RDWR);
 	if (fd < 0) {
-		perror("open /proc/cgroup_query");
+		perror("open /proc/kserial");
 		return -1;
 	}
 
@@ -245,8 +245,8 @@ int main(void)
 	printf("============================\n\n");
 
 	/* Check if procfs entry exists */
-	if (access("/proc/cgroup_query", F_OK) != 0) {
-		fprintf(stderr, "Error: /proc/cgroup_query not found\n");
+	if (access("/proc/kserial", F_OK) != 0) {
+		fprintf(stderr, "Error: /proc/kserial not found\n");
 		fprintf(stderr, "Make sure k-serial module is loaded\n");
 		return 1;
 	}

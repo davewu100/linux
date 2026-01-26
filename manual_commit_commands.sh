@@ -1,0 +1,20 @@
+#!/bin/bash
+# Manual git commands for committing the boot hang fix
+
+echo "=== Manual Git Commit Commands ==="
+echo ""
+echo "Option 1: Use the helper script (recommended):"
+echo "  bash commit_and_show.sh"
+echo ""
+echo "Option 2: Manual commands with detailed commit message:"
+echo "  git add kernel/cgroup/atomic.c mm/memcontrol-atomic.c"
+echo "  git commit -F BOOT_HANG_FIX_COMMIT_MSG.txt"
+echo ""
+echo "Option 3: Manual commands with short commit message:"
+echo "  git add kernel/cgroup/atomic.c mm/memcontrol-atomic.c"
+echo "  git commit -F BOOT_HANG_FIX_COMMIT_MSG_SHORT.txt"
+echo ""
+echo "After committing:"
+echo "  - View commit: git show HEAD"
+echo "  - Create patch: git format-patch -1 HEAD"
+echo "  - Amend message: git commit --amend"

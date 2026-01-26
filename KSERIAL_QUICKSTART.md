@@ -110,7 +110,7 @@ struct ks_schema schema = {
 };
 
 // 2. Open interface
-int fd = open("/proc/cgroup_query", O_RDWR);
+int fd = open("/proc/kserial", O_RDWR);
 
 // 3. Send query
 write(fd, &schema, sizeof(schema));
@@ -194,7 +194,7 @@ ERROR: Too many fields (max 16)
 
 # Kernel module not loaded
 $ ./test_kserial_real level
-ERROR: Cannot open /proc/cgroup_query
+ERROR: Cannot open /proc/kserial
 Make sure the k-serial kernel module is loaded.
 ```
 

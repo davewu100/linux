@@ -2,7 +2,7 @@
 /*
  * k-serial real userspace test using procfs interface
  * 
- * This program actually communicates with the kernel via /proc/cgroup_query
+ * This program actually communicates with the kernel via /proc/kserial
  */
 
 #define _GNU_SOURCE
@@ -36,7 +36,7 @@ struct ks_result {
 };
 
 /* Procfs interface path */
-#define KS_PROCFS_PATH "/proc/cgroup_query"
+#define KS_PROCFS_PATH "/proc/kserial"
 
 /**
  * parse_tlv_result - Parse and display TLV-encoded result

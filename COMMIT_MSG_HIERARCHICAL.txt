@@ -1,0 +1,125 @@
+mm/memcg: implement pure hierarchical atomic counter (experimental)
+
+Convert atomic counter from local-value-with-cache design to pure
+hierarchical-value design for performance comparison.
+
+DESIGN CHANGE
+-------------
+
+Previous design (local value + cache):
+- counter->state[i] stores local value (this cgroup only)
+- Write: Update 1 node (O(1))
+- Read: From cache (O(1) if valid) or traverse tree to aggregate (O(N))
+- Cache needed to amortize tree traversal cost
+
+New design (hierarchical value):
+- counter->state[i] stores hierarchical value (self + all descendants)
+- Write: Propagate up to all ancestors (O(depth) atomic ops)
+- Read: Direct atomic64_read(), always O(1)
+- No cache, no seqlock, simpler code
+
+PERFORMANCE TRADE-OFF
+---------------------
+
+Advantages:
+1. Instant reads: O(1) direct atomic read, no tree traversal
+2. Simpler code: No cache management, no flush logic, no seqlock
+3. Lower memory: Save ~1.5KB/cgroup (removed cache structure)
+
+Disadvantages:
+1. Slower writes: O(depth) atomic operations vs O(1)
+2. Root cgroup hotspot: All writes contend on root counter
+3. Cache line bouncing: Root counter bounces between all CPUs
+4. Write amplification: Each write updates D counters (D=tree depth)
+
+EXPECTED PERFORMANCE
+-------------------
+
+Write-heavy workload (10000 write : 1 read):
+- Write latency: 50 cycles → 450 cycles (9x slower)
+- Root cgroup: Severe cache line bouncing across 128 CPUs
+- Overall: ~9x slower due to write amplification + contention
+
+Read-heavy workload (1 write : 100 read):
+- Read latency: 50 cycles → 20 cycles (2.5x faster)
+- Overall: ~20% faster
+
+Linux typical workload is WRITE-HEAVY (memory allocation/free far
+exceeds stat reads), making this design unsuitable for production.
+
+CODE CHANGES
+-----------
+
+Removed components:
+- struct memcg_atomic_cache (seqlock + cached arrays)
+- css_atomic_flush() and related functions
+- css_atomic_walk() tree traversal
+- Cache allocation/free in css_atomic_init/exit()
+- DEFINE_CACHE_READER macro and seqlock logic
+
+Modified components:
+- css_atomic_mod_state(): Propagate to all ancestors
+- css_atomic_mod_lruvec_state(): Same propagation
+- css_atomic_count_events(): Same propagation
+- css_atomic_page_state(): Direct read, no cache
+- css_atomic_events(): Direct read, no cache
+
+Simplified:
+- kernel/cgroup/atomic.c: 542 lines → 118 lines (~78% reduction)
+- include/linux/cgroup-atomic.h: Removed cache structure
+- mm/memcontrol-atomic.c: Removed cache init/cleanup
+
+VALIDATION
+----------
+
+Functional correctness:
+1. Hierarchical aggregation: Parent values = sum of all descendants
+2. Consistency: atomic64_t ensures atomic reads
+3. Boot safety: Preserved mem_cgroup_online() checks
+
+Performance testing required:
+- Write-heavy: Expected 8-10x slowdown
+- Cache analysis: Root counter cache line bouncing
+- CPU hotspot: atomic64_add on root should dominate profile
+
+RATIONALE FOR EXPERIMENTAL STATUS
+---------------------------------
+
+This patch implements hierarchical atomic counter design for
+COMPARISON PURPOSES with the original local-value-with-cache design.
+
+While hierarchical design has simpler code and faster reads, it
+suffers from fundamental scalability issues:
+- Root cgroup becomes single point of contention
+- Write amplification (O(depth) atomic ops per write)
+- Cache coherency protocol breakdown under high concurrency
+
+This design violates Linux kernel scalability principles:
+- Avoid all CPUs updating same variable
+- Per-CPU design preferred for write-heavy paths
+- Delayed aggregation beats immediate aggregation
+
+Expected outcome: Confirm local-value-with-cache design is superior
+for Linux's write-heavy memory management workload.
+
+Testing:
+  sudo ./test_hierarchical_performance.sh
+  perf stat -e cache-misses,cycles your_workload
+
+References:
+- Documentation: HIERARCHICAL_VALUE_IMPLEMENTATION.md
+- Comparison: COMPARISON_SUMMARY.md
+
+Signed-off-by: [Your Name] <[Your Email]>
+---
+ include/linux/cgroup-atomic.h | ~50 lines changed (removed cache structure)
+ include/linux/memcontrol.h    |   7 +- (removed atomic_cache pointer)
+ kernel/cgroup/atomic.c        | 542 → 118 lines (removed cache logic)
+ mm/memcontrol-atomic.c        |  42 +++---- (simplified init/exit)
+ 4 files changed, ~500 lines removed
+
+Changes summary:
+- Removed cache structure and seqlock (~100 lines)
+- Removed cache management functions (~400 lines)
+- Modified write functions to propagate (~40 lines)
+- Simplified read functions to direct access (~20 lines)

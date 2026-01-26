@@ -95,7 +95,7 @@ User: level = 2, nr_descendants = 5
 ```
 ├── include/linux/kserial.h              # UAPI + kernel API
 ├── kernel/kserial.c                     # Core BTF engine
-├── kernel/kserial_procfs.c              # /proc/cgroup_query interface
+├── kernel/kserial_procfs.c              # /proc/kserial interface
 ├── tools/testing/selftests/cgroup/
 │   ├── test_kserial.c                   # Demo client
 │   ├── test_kserial_real.c              # Real client
@@ -125,7 +125,7 @@ User: level = 2, nr_descendants = 5
 ```c
 #include <linux/kserial.h>
 
-int fd = open("/proc/cgroup_query", O_RDWR);
+int fd = open("/proc/kserial", O_RDWR);
 
 struct ks_schema schema = {
     .nr_fields = 2,

@@ -38,7 +38,7 @@ struct ks_result {
 	uint8_t  data[KS_MAX_OUTPUT_SIZE];
 };
 
-#define KS_PROCFS_PATH "/proc/cgroup_query"
+#define KS_PROCFS_PATH "/proc/kserial"
 
 /* Global state */
 static volatile int keep_running = 1;

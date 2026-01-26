@@ -10,7 +10,7 @@ CFLAGS = -Wall -Wextra -O2
 LDFLAGS =
 
 # Targets
-TARGETS = test_kserial test_kserial_real test_kserial_phase2 test_kserial_phase3 test_kserial_security example_monitor
+TARGETS = test_kserial test_kserial_real test_kserial_phase2 test_kserial_phase3 test_kserial_security example_monitor kserial_tool
 
 all: $(TARGETS)
 
@@ -41,12 +41,17 @@ test_kserial_security: test_kserial_security.c
 example_monitor: example_monitor.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
+# k-serial command-line tool
+kserial_tool: kserial_tool.c
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+
 # Make Python client executable
 python-client:
 	chmod +x kserial_client.py
 
 # Install (copy to /usr/local/bin)
 install: all python-client
+	install -m 755 kserial_tool /usr/local/bin/kserial
 	install -m 755 test_kserial_real /usr/local/bin/kserial-query
 	install -m 755 kserial_client.py /usr/local/bin/kserial-query-py
 

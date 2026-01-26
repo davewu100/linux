@@ -46,7 +46,7 @@ Traditional approaches for exposing kernel data to userspace have limitations:
          │ write(schema)
          ▼
 ┌─────────────────────────────────┐
-│      /proc/cgroup_query         │
+│      /proc/kserial         │
 └────────┬────────────────────────┘
          │
          ▼
@@ -210,7 +210,7 @@ insmod kernel/kserial.ko
 insmod kernel/kserial_procfs.ko
 
 # Verify interface exists
-ls -l /proc/cgroup_query
+ls -l /proc/kserial
 ```
 
 ### Userspace Program
@@ -225,7 +225,7 @@ int main() {
     };
     struct ks_result result;
     
-    int fd = open("/proc/cgroup_query", O_RDWR);
+    int fd = open("/proc/kserial", O_RDWR);
     
     // Send query
     write(fd, &schema, sizeof(schema));

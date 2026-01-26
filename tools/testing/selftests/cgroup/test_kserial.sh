@@ -7,7 +7,7 @@
 
 set -e
 
-PROCFS_PATH="/proc/cgroup_query"
+PROCFS_PATH="/proc/kserial"
 TEST_BIN="./test_kserial_real"
 PYTHON_CLIENT="./kserial_client.py"
 

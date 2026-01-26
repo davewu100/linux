@@ -2,7 +2,7 @@
 /*
  * k-serial procfs interface
  * 
- * Provides /proc/self/cgroup_query for querying current task's cgroup fields
+ * Provides /proc/kserial for querying current task's cgroup fields
  * 
  * Usage:
  *   1. Write schema to the file (struct ks_schema)
@@ -153,13 +153,13 @@ static int __init ks_procfs_init(void)
 {
 	struct proc_dir_entry *entry;
 
-	entry = proc_create("cgroup_query", 0600, NULL, &ks_proc_ops);
+	entry = proc_create("kserial", 0600, NULL, &ks_proc_ops);
 	if (!entry) {
-		pr_err("k-serial: failed to create /proc/cgroup_query\n");
+		pr_err("k-serial: failed to create /proc/kserial\n");
 		return -ENOMEM;
 	}
 
-	pr_info("k-serial: initialized /proc/cgroup_query interface\n");
+	pr_info("k-serial: initialized /proc/kserial interface\n");
 	return 0;
 }
 
@@ -168,8 +168,8 @@ static int __init ks_procfs_init(void)
  */
 static void __exit ks_procfs_exit(void)
 {
-	remove_proc_entry("cgroup_query", NULL);
-	pr_info("k-serial: removed /proc/cgroup_query interface\n");
+	remove_proc_entry("kserial", NULL);
+	pr_info("k-serial: removed /proc/kserial interface\n");
 }
 
 module_init(ks_procfs_init);

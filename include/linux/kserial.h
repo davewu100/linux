@@ -48,19 +48,34 @@ struct ks_result {
  * Supports simple fields, nested paths, and arrays (Phase 3)
  */
 static const char *ks_cgroup_whitelist[] = {
-	/* Simple fields */
+	/* Basic hierarchy fields */
 	"level",
 	"max_depth",
 	"nr_descendants",
 	"nr_dying_descendants",
 	"max_descendants",
+	
+	/* Population tracking */
 	"nr_populated_csets",
+	"nr_populated_domain_children",
+	"nr_populated_threaded_children",
+	"nr_threaded_children",
+	
+	/* Control flags */
+	"flags",
+	"subtree_control",
+	"subtree_ss_mask",
+	
+	/* Sequence numbers */
+	"kill_seq",
 	
 	/* Nested paths (Phase 2) */
 	"self.id",                    /* cgrp->self.id */
 	"self.serial_nr",             /* cgrp->self.serial_nr */
+	"self.flags",                 /* cgrp->self.flags */
 	"root.kf",                    /* cgrp->root->kf (ptr) */
 	"dom_cgrp.level",             /* cgrp->dom_cgrp->level */
+	"old_dom_cgrp.level",         /* cgrp->old_dom_cgrp->level */
 	
 	/* Array fields (Phase 3) */
 	"nr_dying_subsys",            /* cgrp->nr_dying_subsys[idx] - int array */

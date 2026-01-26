@@ -17,7 +17,7 @@ A complete MVP (Minimum Viable Product) implementation of k-serial, a BTF-based 
 ```
 include/linux/kserial.h              # UAPI + kernel API definitions
 kernel/kserial.c                     # Core BTF-based query engine
-kernel/kserial_procfs.c              # Procfs interface (/proc/cgroup_query)
+kernel/kserial_procfs.c              # Procfs interface (/proc/kserial)
 ```
 
 **Total kernel code**: ~500 lines
@@ -60,7 +60,7 @@ KSERIAL_IMPLEMENTATION_SUMMARY.md    # This file
 │         └─────────────────┴─────────────────┘                │
 │                           │                                  │
 │                           ▼                                  │
-│                 /proc/cgroup_query                           │
+│                 /proc/kserial                           │
 │                  (read/write file)                           │
 └──────────────────────────┬───────────────────────────────────┘
                            │
@@ -177,7 +177,7 @@ static const char *ks_cgroup_whitelist[] = {
 ```c
 #include <linux/kserial.h>
 
-int fd = open("/proc/cgroup_query", O_RDWR);
+int fd = open("/proc/kserial", O_RDWR);
 
 struct ks_schema schema = {
     .nr_fields = 2,
@@ -370,7 +370,7 @@ schema.operation = KS_OP_SUM;
 ### For Userspace Developers
 
 1. Include `<linux/kserial.h>` (or copy UAPI structs)
-2. Use procfs interface: `/proc/cgroup_query`
+2. Use procfs interface: `/proc/kserial`
 3. Build with examples: `make -f Makefile.kserial`
 
 ### For Distributions

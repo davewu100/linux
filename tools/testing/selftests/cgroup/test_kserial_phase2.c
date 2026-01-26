@@ -37,7 +37,7 @@ struct ks_result {
 	uint8_t  data[KS_MAX_OUTPUT_SIZE];
 };
 
-#define KS_PROCFS_PATH "/proc/cgroup_query"
+#define KS_PROCFS_PATH "/proc/kserial"
 
 /**
  * parse_tlv_result - Parse and display TLV-encoded result

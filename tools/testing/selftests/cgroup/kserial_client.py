@@ -16,7 +16,7 @@ from typing import List, Dict, Any
 KS_MAX_FIELDS = 16
 KS_FIELD_NAME_LEN = 32
 KS_MAX_OUTPUT_SIZE = 4096
-KS_PROCFS_PATH = "/proc/cgroup_query"
+KS_PROCFS_PATH = "/proc/kserial"
 
 # Struct formats
 # struct ks_schema { u32 nr_fields; char field_names[16][32]; }
