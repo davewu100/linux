@@ -4,7 +4,6 @@
 
 #include <linux/types.h>
 #include <linux/atomic.h>
-#include <linux/seqlock.h>
 #include <linux/mm_types.h>
 #include <linux/mmzone.h>
 #include <linux/vm_event_item.h>
@@ -38,19 +37,25 @@ struct memcg_atomic_counter_per_node {
 } ____cacheline_aligned_in_smp;
 
 /*
- * Per-cgroup atomic counter based stats (experimental alternative to rstat)
+ * Per-cgroup atomic counter based stats - HIERARCHICAL VERSION
  *
- * Single atomic counter per cgroup (not per-CPU). Each stat update uses
- * atomic64_add() to update the counter, and reads can directly access the
- * value with atomic64_read(). Hierarchical stats are computed by recursively
- * aggregating all children using RCU-protected tree traversal.
+ * Each counter stores HIERARCHICAL values (self + all descendants).
+ * Writes propagate up the tree to all ancestors, making reads O(1).
+ *
+ * Design:
+ * - Write: Update this cgroup and all ancestors (O(depth) atomic ops)
+ * - Read: Direct atomic64_read(), no tree traversal needed (O(1))
+ * - No cache, no locks, simple and direct
  *
  * Trade-offs:
- * - Pros: Fast reads (no per-CPU aggregation), lock-free recursive queries
- * - Cons: Potential cache line bouncing on writes, higher write overhead
+ * - Pros: Instant reads O(1), no cache overhead, simpler code
+ * - Cons: Slower writes O(depth), root cgroup hot spot, cache line bouncing
+ *
+ * Best for: Read-heavy workloads with shallow hierarchies
+ * Not for: Write-heavy workloads (10000:1 write:read ratio)
  */
 struct memcg_atomic_counter {
-	/* Hierarchical counters (includes all descendants) */
+	/* Hierarchical counters (self + all descendants) */
 	atomic64_t		state[MEMCG_VMSTAT_SIZE];
 	atomic64_t		events[NR_MEMCG_EVENTS];
 
@@ -61,33 +66,12 @@ struct memcg_atomic_counter {
 #endif
 } ____cacheline_aligned_in_smp;
 
-/* Lightweight cache for zero-copy stats reads (threshold-based invalidation) */
-struct memcg_atomic_cache {
-	/* Hot fields: frequently accessed together */
-	bool valid;		/* cache validity flag */
-	seqlock_t stats_seqlock;	/* protects stats updates */
-	seqlock_t events_seqlock;	/* protects events updates */
-
-	/* Large data arrays: separate cache lines for better false sharing avoidance */
-	u64 stats[MEMCG_VMSTAT_SIZE] ____cacheline_aligned_in_smp;
-	unsigned long events[NR_MEMCG_EVENTS];
-};
-
-/* Core read functions */
+/* Core read functions - simple O(1) direct reads */
 u64 css_atomic_page_state(struct mem_cgroup *memcg, int idx, bool force);
 unsigned long css_atomic_events(struct mem_cgroup *memcg,
 				enum vm_event_item idx, bool force);
 unsigned long css_atomic_events_recursive(struct mem_cgroup *memcg,
 					  enum vm_event_item idx);
-
-/* Flush operations (similar to rstat) */
-void css_atomic_flush(struct mem_cgroup *memcg, bool force);
-void css_atomic_flush_ratelimited(struct mem_cgroup *memcg);
-
-/* Tree traversal */
-int css_atomic_walk(struct mem_cgroup *memcg,
-		    int (*visit)(struct mem_cgroup *, void *),
-		    void *arg);
 
 #else /* !CONFIG_MEMCG_ATOMIC_COUNTER */
 
@@ -103,14 +87,6 @@ static inline unsigned long css_atomic_events(struct mem_cgroup *memcg,
 }
 static inline unsigned long css_atomic_events_recursive(struct mem_cgroup *memcg,
 							enum vm_event_item idx)
-{
-	return 0;
-}
-static inline void css_atomic_flush(struct mem_cgroup *memcg, bool force) { }
-static inline void css_atomic_flush_ratelimited(struct mem_cgroup *memcg) { }
-static inline int css_atomic_walk(struct mem_cgroup *memcg,
-				  int (*visit)(struct mem_cgroup *, void *),
-				  void *arg)
 {
 	return 0;
 }

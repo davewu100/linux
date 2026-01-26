@@ -288,10 +288,11 @@ struct mem_cgroup {
 	struct list_head atomic_sibling;	/* linked to parent's atomic_children */
 	spinlock_t atomic_children_lock;	/* for list add/remove; traversal uses RCU */
 
-	/* Lightweight cache for batch-read stats */
-	struct memcg_atomic_cache *atomic_cache;
-
-	/* Atomic counter update tracking (separate for stats and events) */
+	/*
+	 * HIERARCHICAL VERSION: No cache needed!
+	 * counter->state[] already contains hierarchical values.
+	 * Update tracking kept for monitoring/debugging only.
+	 */
 	atomic_t atomic_stats_updates;
 	atomic_t atomic_events_updates;
 #endif /* CONFIG_MEMCG_ATOMIC_COUNTER */

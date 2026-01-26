@@ -16,33 +16,53 @@
 #ifdef CONFIG_MEMCG_ATOMIC_COUNTER
 
 /**
- * css_atomic_mod_state - update atomic counter state
+ * css_atomic_mod_state - update atomic counter state (HIERARCHICAL VERSION)
  * @memcg: the memory cgroup
  * @idx: the stat item index (already converted)
  * @val: delta to add to the counter
+ *
+ * HIERARCHICAL PROPAGATION:
+ * Updates this cgroup AND all ancestor cgroups up to root.
+ * This makes counter->state[idx] store the TOTAL value (self + all descendants).
+ * Trade-off: Slower writes (D atomic ops), but instant reads (no tree traversal).
  */
 void css_atomic_mod_state(struct mem_cgroup *memcg, int idx, int val)
 {
-	struct memcg_atomic_counter *counter = READ_ONCE(memcg->atomic_counter);
-
-	/* Update hierarchical counter */
-	atomic64_add(val, &counter->state[idx]);
-
-#ifdef CONFIG_MEMCG_V1
-	atomic64_add(val, &counter->state_local[idx]);
-#endif
+	struct mem_cgroup *iter;
+	struct memcg_atomic_counter *counter;
 
 	/*
-	 * Track atomic stats updates (similar to rstat's stats_updates).
-	 * This enables threshold-based cache invalidation - cache is only
-	 * invalidated when update count exceeds 64 * num_online_cpus(),
-	 * balancing accuracy with cache hit rate.
+	 * Propagate update up the hierarchy: update this cgroup and all ancestors.
+	 * This ensures each cgroup's counter contains hierarchical value (self + descendants).
+	 *
+	 * Performance impact:
+	 * - Write cost: O(depth) atomic operations (typically 3-5 levels)
+	 * - Read benefit: O(1) direct read, no tree traversal needed
+	 * - Cache line bouncing: Root cgroup becomes hot spot for all updates
 	 */
-	atomic_inc(&memcg->atomic_stats_updates);
+	for (iter = memcg; iter; iter = parent_mem_cgroup(iter)) {
+		counter = READ_ONCE(iter->atomic_counter);
+		if (unlikely(!counter))
+			continue;
+
+		/* Update hierarchical counter */
+		atomic64_add(val, &counter->state[idx]);
+
+		/* Track updates for monitoring (only on the original memcg) */
+		if (iter == memcg)
+			atomic_inc(&iter->atomic_stats_updates);
+	}
+
+#ifdef CONFIG_MEMCG_V1
+	/* Local counter: only update the target memcg (no propagation) */
+	counter = READ_ONCE(memcg->atomic_counter);
+	if (likely(counter))
+		atomic64_add(val, &counter->state_local[idx]);
+#endif
 }
 
 /**
- * css_atomic_mod_lruvec_state - update atomic counter lruvec state
+ * css_atomic_mod_lruvec_state - update atomic counter lruvec state (HIERARCHICAL VERSION)
  * @memcg: the memory cgroup
  * @pn: the per-node structure
  * @idx: the stat item index (already converted)
@@ -52,23 +72,35 @@ void css_atomic_mod_lruvec_state(struct mem_cgroup *memcg,
 				 struct mem_cgroup_per_node *pn,
 				 int idx, int val)
 {
-	struct memcg_atomic_counter *counter = READ_ONCE(memcg->atomic_counter);
-	struct memcg_atomic_counter_per_node *node_counter =
-		READ_ONCE(pn->atomic_counter_per_node);
+	struct mem_cgroup *iter;
+	struct memcg_atomic_counter *counter;
+	struct memcg_atomic_counter_per_node *node_counter;
 
-	/* Update hierarchical counter */
-	atomic64_add(val, &counter->state[idx]);
+	/* Propagate to all ancestors for hierarchical accounting */
+	for (iter = memcg; iter; iter = parent_mem_cgroup(iter)) {
+		counter = READ_ONCE(iter->atomic_counter);
+		if (unlikely(!counter))
+			continue;
+
+		/* Update hierarchical counter */
+		atomic64_add(val, &counter->state[idx]);
+	}
 
 #ifdef CONFIG_MEMCG_V1
-	atomic64_add(val, &counter->state_local[idx]);
+	/* Local counter: only update the target memcg */
+	counter = READ_ONCE(memcg->atomic_counter);
+	if (likely(counter))
+		atomic64_add(val, &counter->state_local[idx]);
 #endif
 
-	/* Update per-node counter */
-	atomic64_add(val, &node_counter->state[idx]);
+	/* Update per-node counter (no propagation needed for per-node stats) */
+	node_counter = READ_ONCE(pn->atomic_counter_per_node);
+	if (likely(node_counter))
+		atomic64_add(val, &node_counter->state[idx]);
 }
 
 /**
- * css_atomic_count_events - update atomic event counter
+ * css_atomic_count_events - update atomic event counter (HIERARCHICAL VERSION)
  * @memcg: the memory cgroup
  * @idx: the event item index (already converted)
  * @count: the number of events that occurred
@@ -76,17 +108,29 @@ void css_atomic_mod_lruvec_state(struct mem_cgroup *memcg,
 void css_atomic_count_events(struct mem_cgroup *memcg, int idx,
 			     unsigned long count)
 {
-	struct memcg_atomic_counter *counter = READ_ONCE(memcg->atomic_counter);
+	struct mem_cgroup *iter;
+	struct memcg_atomic_counter *counter;
 
-	/* Update hierarchical event counter */
-	atomic64_add(count, &counter->events[idx]);
+	/* Propagate to all ancestors for hierarchical accounting */
+	for (iter = memcg; iter; iter = parent_mem_cgroup(iter)) {
+		counter = READ_ONCE(iter->atomic_counter);
+		if (unlikely(!counter))
+			continue;
+
+		/* Update hierarchical event counter */
+		atomic64_add(count, &counter->events[idx]);
+
+		/* Track updates for monitoring (only on original memcg) */
+		if (iter == memcg)
+			atomic_inc(&iter->atomic_events_updates);
+	}
 
 #ifdef CONFIG_MEMCG_V1
-	atomic64_add(count, &counter->events_local[idx]);
+	/* Local counter: only update the target memcg */
+	counter = READ_ONCE(memcg->atomic_counter);
+	if (likely(counter))
+		atomic64_add(count, &counter->events_local[idx]);
 #endif
-
-	/* Track event updates for cache invalidation */
-	atomic_inc(&memcg->atomic_events_updates);
 }
 
 /**
@@ -185,32 +229,27 @@ EXPORT_SYMBOL(css_atomic_lruvec_page_state);
  */
 int css_atomic_init(struct mem_cgroup *memcg)
 {
-	/* Allocate per-cgroup atomic counter stats (experimental) */
+	/* Allocate per-cgroup atomic counter (stores hierarchical values) */
 	memcg->atomic_counter = kzalloc(sizeof(struct memcg_atomic_counter),
 					GFP_KERNEL_ACCOUNT);
 	if (unlikely(!memcg->atomic_counter))
 		return -ENOMEM;
 
-	/* Initialize atomic counter children list for hierarchical aggregation */
+	/* Initialize children list for RCU traversal (compatibility) */
 	INIT_LIST_HEAD(&memcg->atomic_children);
 	INIT_LIST_HEAD(&memcg->atomic_sibling);
 	spin_lock_init(&memcg->atomic_children_lock);
 
-	/* Initialize atomic stats/event update counters (similar to rstat) */
+	/* Initialize update tracking counters (for monitoring only) */
 	atomic_set(&memcg->atomic_stats_updates, 0);
 	atomic_set(&memcg->atomic_events_updates, 0);
 
-	/* Allocate and initialize atomic cache (threshold-based) */
-	memcg->atomic_cache = kzalloc(sizeof(struct memcg_atomic_cache),
-				      GFP_KERNEL_ACCOUNT);
-	if (unlikely(!memcg->atomic_cache)) {
-		kfree(memcg->atomic_counter);
-		memcg->atomic_counter = NULL;
-		return -ENOMEM;
-	}
-	seqlock_init(&memcg->atomic_cache->stats_seqlock);
-	seqlock_init(&memcg->atomic_cache->events_seqlock);
-	memcg->atomic_cache->valid = false; /* Mark as invalid initially */
+	/*
+	 * HIERARCHICAL VERSION: No cache needed!
+	 * counter->state[] already contains hierarchical values,
+	 * maintained by write-time propagation in css_atomic_mod_state().
+	 * Reads can directly access counter->state[] without cache.
+	 */
 
 	return 0;
 }
@@ -222,11 +261,11 @@ int css_atomic_init(struct mem_cgroup *memcg)
 void css_atomic_exit(struct mem_cgroup *memcg)
 {
 	/*
-	 * Safe to free atomic_counter here - RCU grace period has passed,
-	 * all readers using list_for_each_entry_rcu() have completed.
+	 * HIERARCHICAL VERSION: Only free counter, no cache.
+	 * RCU synchronization handled by caller ensures all readers
+	 * using parent_mem_cgroup() traversal have completed.
 	 */
 	kfree(memcg->atomic_counter);
-	kfree(memcg->atomic_cache);
 }
 
 /**
