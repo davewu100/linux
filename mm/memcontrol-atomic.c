@@ -23,10 +23,10 @@
  *
  * RSTAT-LIKE UPDATE:
  * 1. Update local counter (atomic, per-cgroup)
- * 2. Mark self and ancestors as dirty (upward propagation of dirty flag)
+ * 2. Increment stats_updates upward (like rstat's update counter propagation)
  *
- * Key: Only dirty flag propagates, not the value itself!
- * Within 2s window, dirty doesn't trigger flush.
+ * Key: Only update counter propagates, not the value itself!
+ * Flush only happens when updates exceed threshold.
  */
 void css_atomic_mod_state(struct mem_cgroup *memcg, int idx, int val)
 {
@@ -45,14 +45,13 @@ void css_atomic_mod_state(struct mem_cgroup *memcg, int idx, int val)
 #endif
 
 	/*
-	 * Mark dirty upward (rstat-like propagation).
-	 * This is cheaper than propagating values!
-	 * 
-	 * Note: Within 2s window, dirty flag doesn't trigger flush.
+	 * Propagate update counter upward (rstat-like).
+	 * This is used to decide when to flush, similar to rstat's
+	 * stats_updates mechanism.
 	 */
 	for (iter = memcg; iter; iter = parent_mem_cgroup(iter)) {
 		if (iter->atomic_cache)
-			WRITE_ONCE(iter->atomic_cache->dirty, true);
+			atomic_inc(&iter->atomic_cache->stats_updates);
 	}
 }
 
@@ -86,10 +85,10 @@ void css_atomic_mod_lruvec_state(struct mem_cgroup *memcg,
 	/* Update per-node counter */
 	atomic64_add(val, &node_counter->state[idx]);
 
-	/* Mark dirty upward (rstat-like) */
+	/* Propagate update counter upward (rstat-like) */
 	for (iter = memcg; iter; iter = parent_mem_cgroup(iter)) {
 		if (iter->atomic_cache)
-			WRITE_ONCE(iter->atomic_cache->dirty, true);
+			atomic_inc(&iter->atomic_cache->stats_updates);
 	}
 }
 
@@ -116,10 +115,10 @@ void css_atomic_count_events(struct mem_cgroup *memcg, int idx,
 	atomic64_add(count, &counter->events_local[idx]);
 #endif
 
-	/* Mark dirty upward (rstat-like) */
+	/* Propagate update counter upward (rstat-like) */
 	for (iter = memcg; iter; iter = parent_mem_cgroup(iter)) {
 		if (iter->atomic_cache)
-			WRITE_ONCE(iter->atomic_cache->dirty, true);
+			atomic_inc(&iter->atomic_cache->stats_updates);
 	}
 }
 
@@ -239,8 +238,8 @@ int css_atomic_init(struct mem_cgroup *memcg)
 		return -ENOMEM;
 	}
 
-	/* Initialize cache (rstat-like: dirty flag + flush time) */
-	memcg->atomic_cache->dirty = true;  /* Mark as needing initial flush */
+	/* Initialize cache (rstat-like: update counter + flush time) */
+	atomic_set(&memcg->atomic_cache->stats_updates, 0);
 	memcg->atomic_cache->flush_time = 0;
 
 	return 0;

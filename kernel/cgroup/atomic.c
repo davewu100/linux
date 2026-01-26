@@ -2,19 +2,24 @@
 /*
  * Cgroup atomic counter implementation - RSTAT-LIKE DESIGN
  *
- * Similar to rstat: local counters + dirty tracking + 2s time window.
+ * Exactly mimics rstat's flush logic: threshold-based + rate limited.
  *
- * Design:
- * - Write: Update local counter + mark dirty upward (propagate dirty flag)
- * - Read: Flush only if age >= 2s, otherwise use cache (even if dirty)
- * - Explicit flush: On memory.stat read or force=true
+ * Design (mirrors rstat):
+ * - Write: Update local counter + increment stats_updates upward
+ * - Read: Directly read cache (NO automatic flush, like rstat's READ_ONCE)
+ * - Flush: Only when stats_updates > threshold (like rstat)
+ * - Rate limit: 2s minimum between flushes (like rstat's FLUSH_TIME)
  *
- * Key difference from naive time-window:
- * - Dirty flag propagates upward (like rstat)
- * - But within 2s, we don't flush even if dirty!
- * - This amortizes flush cost across multiple writes
+ * Key insight:
+ * - Internal reads NEVER trigger flush (just like rstat)
+ * - Flush only happens via explicit css_atomic_flush() calls
+ * - css_atomic_flush() checks threshold + rate limit before flushing
  *
- * Trade-off: Fast writes (atomic + dirty flag), minimal flushes (2s rate limit).
+ * This matches rstat's behavior where memcg_page_state() just reads
+ * vmstats without flushing, and flush is triggered separately.
+ *
+ * Trade-off: Very fast reads (O(1) always), writes track updates,
+ * flush amortized across many updates via threshold.
  */
 
 #include <linux/cgroup.h>
@@ -36,12 +41,16 @@ static unsigned long css_atomic_aggregate_events(struct mem_cgroup *memcg, int i
  * css_atomic_page_state - read atomic counter with rstat-like caching
  * @memcg: the memory cgroup
  * @idx: the stat item (enum memcg_stat_item or node_stat_item)
- * @force: if true, force cache refresh regardless of TTL
+ * @force: if true, force cache refresh
  *
- * RSTAT-LIKE DESIGN:
- * - Flush only if age > 2s (even if dirty!)
- * - Within 2s window: return cache (even if dirty)
- * - This is the key difference from naive time-window approach
+ * RSTAT-LIKE DESIGN (EXACTLY LIKE RSTAT):
+ * - Normal read: directly return cached value, NO flush check!
+ * - Force read: flush first, then return
+ * - This is exactly how rstat works: memcg_page_state() directly reads vmstats
+ *
+ * Flush is ONLY triggered by:
+ * - Explicit css_atomic_flush() calls (e.g., from memory.stat read)
+ * - Those check threshold and rate limit
  *
  * Returns: hierarchical stat value (self + all descendants)
  */
@@ -49,7 +58,6 @@ u64 css_atomic_page_state(struct mem_cgroup *memcg, int idx, bool force)
 {
 	struct memcg_atomic_cache *cache;
 	int i = memcg_stats_index(idx);
-	unsigned long now, age;
 
 	if (WARN_ONCE(BAD_STAT_IDX(i), "%s: missing stat item %d\n", __func__, idx))
 		return 0;
@@ -62,25 +70,16 @@ u64 css_atomic_page_state(struct mem_cgroup *memcg, int idx, bool force)
 	if (unlikely(!cache))
 		return 0;
 
-	now = jiffies;
-	age = now - READ_ONCE(cache->flush_time);
-
 	/*
-	 * RSTAT-LIKE FLUSH LOGIC:
+	 * RSTAT-LIKE READ:
+	 * - force=false: directly return cache, like rstat's READ_ONCE(vmstats->state[i])
+	 * - force=true: flush first, then return
 	 *
-	 * Flush if:
-	 *   1. force=true (explicit flush request), OR
-	 *   2. age >= 2s (time window expired)
-	 *
-	 * Key insight: We DON'T flush just because dirty=true!
-	 * Within 2s window, we tolerate stale data even if dirty.
-	 * This amortizes flush cost across multiple writes.
+	 * NO automatic flush based on time or threshold here!
+	 * That's handled by explicit css_atomic_flush() calls.
 	 */
-	if (force || age >= ATOMIC_CACHE_TTL) {
-		/* Time window expired or forced: refresh cache */
+	if (force)
 		css_atomic_refresh_cache(memcg);
-	}
-	/* else: Within 2s window, use cache (even if dirty) */
 
 	return READ_ONCE(cache->stats[i]);
 }
@@ -100,7 +99,6 @@ unsigned long css_atomic_events(struct mem_cgroup *memcg, enum vm_event_item idx
 {
 	struct memcg_atomic_cache *cache;
 	int i = memcg_events_index(idx);
-	unsigned long now, age;
 
 	if (WARN_ONCE(BAD_STAT_IDX(i), "%s: missing event item %d\n", __func__, idx))
 		return 0;
@@ -113,13 +111,9 @@ unsigned long css_atomic_events(struct mem_cgroup *memcg, enum vm_event_item idx
 	if (unlikely(!cache))
 		return 0;
 
-	now = jiffies;
-	age = now - READ_ONCE(cache->flush_time);
-
-	/* RSTAT-LIKE: flush only if age >= 2s or force=true */
-	if (force || age >= ATOMIC_CACHE_TTL) {
+	/* RSTAT-LIKE: directly read cache, no automatic flush */
+	if (force)
 		css_atomic_refresh_cache(memcg);
-	}
 
 	return READ_ONCE(cache->events[i]);
 }
@@ -138,17 +132,73 @@ unsigned long css_atomic_events_recursive(struct mem_cgroup *memcg,
 }
 
 /**
- * css_atomic_flush - explicitly refresh cache (called on memory.stat read)
+ * css_atomic_flush - flush cache if needed (rstat-like threshold + rate limit)
  * @memcg: the memory cgroup
+ * @force: if true, bypass threshold and rate limit checks
  *
- * This is called when userspace reads memory.stat or memory.numa_stat.
- * Forces immediate cache refresh to ensure fresh data.
+ * RSTAT-LIKE FLUSH LOGIC (same as __mem_cgroup_flush_stats):
+ * - force=false: Check threshold + rate limit before flushing
+ *   1. Check threshold: stats_updates > THRESHOLD * num_online_cpus()
+ *   2. Check rate limit: last flush > 2s ago
+ *   3. Only flush if both conditions met
+ * - force=true: Flush immediately, skip all checks
+ *
+ * This is called:
+ * - From memory.stat read (force=false): normal flush with checks
+ * - From OOM/comparison (force=true): immediate flush
+ *
+ * Similar to rstat's __mem_cgroup_flush_stats(memcg, force).
  */
-void css_atomic_flush(struct mem_cgroup *memcg)
+void css_atomic_flush(struct mem_cgroup *memcg, bool force)
 {
+	struct memcg_atomic_cache *cache;
+	unsigned long now;
+	int threshold;
+	int updates;
+
 	if (unlikely(!mem_cgroup_online(memcg)))
 		return;
 
+	cache = memcg->atomic_cache;
+	if (unlikely(!cache))
+		return;
+
+	/* Force flush: skip all checks */
+	if (force) {
+		css_atomic_refresh_cache(memcg);
+		return;
+	}
+
+	/*
+	 * Normal flush: check threshold and rate limit.
+	 *
+	 * Calculate threshold like rstat:
+	 * MEMCG_CHARGE_BATCH * num_online_cpus()
+	 *
+	 * We use ATOMIC_FLUSH_THRESHOLD (64) as our base, similar to
+	 * rstat's MEMCG_CHARGE_BATCH.
+	 */
+	threshold = ATOMIC_FLUSH_THRESHOLD * num_online_cpus();
+	updates = atomic_read(&cache->stats_updates);
+
+	/* Fast path: no updates to flush */
+	if (updates == 0)
+		return;
+
+	/* Threshold check: only flush if exceeded (like rstat) */
+	if (updates < threshold)
+		return;
+
+	/*
+	 * Rate limit: avoid flushing too frequently.
+	 * Even if threshold is exceeded, skip if we flushed recently.
+	 * This is optional but helps reduce flush storms.
+	 */
+	now = jiffies;
+	if (time_before(now, READ_ONCE(cache->flush_time) + ATOMIC_FLUSH_TIME))
+		return;  /* Too soon since last flush */
+
+	/* Threshold exceeded and rate limit passed: do the flush */
 	css_atomic_refresh_cache(memcg);
 }
 
@@ -180,12 +230,12 @@ static void css_atomic_refresh_cache(struct mem_cgroup *memcg)
 	}
 
 	/*
-	 * Clear dirty flag and update flush time (rstat-like).
-	 * Cache is now fresh until next write or 2s expiry.
+	 * Reset update counter and record flush time (rstat-like).
+	 * Cache is now fresh until enough updates accumulate.
 	 * Use WRITE_ONCE to ensure visibility to readers.
 	 */
 	WRITE_ONCE(cache->flush_time, jiffies);
-	WRITE_ONCE(cache->dirty, false);
+	atomic_set(&cache->stats_updates, 0);
 }
 
 /**

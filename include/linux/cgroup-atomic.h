@@ -40,18 +40,25 @@ struct memcg_atomic_counter_per_node {
  * Per-cgroup atomic counter based stats - RSTAT-LIKE DESIGN
  *
  * Each counter stores LOCAL values (this cgroup only, not hierarchical).
- * Reads use time-based cache with dirty tracking (like rstat).
+ * Exactly mimics rstat's threshold-based flush logic.
  *
- * Design (similar to rstat):
- * - Write: Update local counter + mark self and ancestors dirty (upward propagation)
- * - Read: Flush if age > 2s, otherwise use cache (even if dirty)
- * - Flush: Traverse tree to aggregate, clear dirty flags
+ * Design (exactly like rstat):
+ * - Write: Update local counter + increment stats_updates upward
+ * - Read: Directly read cache (NO flush, like rstat's READ_ONCE(vmstats))
+ * - Flush: Only when updates > threshold, with 2s rate limit
  *
- * Key insight: Dirty flag propagates upward, but within 2s window we don't flush!
+ * Flush logic (same as rstat's __mem_cgroup_flush_stats):
+ * 1. Check stats_updates > THRESHOLD * num_online_cpus()
+ * 2. Check rate limit: last flush >= 2s ago
+ * 3. Only flush if both conditions met
+ *
+ * Key insight: Internal reads NEVER trigger flush!
+ * - memcg_page_state(): just READ_ONCE(cache)
+ * - memory.stat read: calls css_atomic_flush() which checks threshold
  *
  * Trade-offs:
- * - Pros: Fast writes (atomic + dirty flag), minimal flushes (2s rate limit)
- * - Cons: Up to 2s staleness, dirty propagation overhead (better than value propagation)
+ * - Pros: Very fast reads (O(1) always), writes cheap (atomic + counter inc)
+ * - Cons: Staleness depends on update frequency, threshold-based consistency
  *
  * Best for: Write-heavy workloads (like rstat)
  */
@@ -67,10 +74,10 @@ struct memcg_atomic_counter {
 #endif
 } ____cacheline_aligned_in_smp;
 
-/* Time-based cache for aggregated stats (rstat-like design) */
+/* Cache for aggregated stats (rstat-like design) */
 struct memcg_atomic_cache {
-	/* Cache state (similar to rstat) */
-	bool dirty;			/* Has unflushed updates (propagated upward) */
+	/* Update tracking (like rstat's stats_updates) */
+	atomic_t stats_updates;		/* Number of unflushed updates */
 	unsigned long flush_time;	/* jiffies when cache was last flushed */
 	
 	/* Cached aggregated values (self + all descendants) */
@@ -78,7 +85,11 @@ struct memcg_atomic_cache {
 	unsigned long events[NR_MEMCG_EVENTS];
 };
 
-#define ATOMIC_CACHE_TTL (2UL * HZ)  /* 2 second TTL, same as rstat */
+/* Flush threshold (like rstat's MEMCG_CHARGE_BATCH * num_online_cpus) */
+#define ATOMIC_FLUSH_THRESHOLD (64)  /* Will be multiplied by num_online_cpus */
+
+/* Rate limit interval (like rstat's FLUSH_TIME) */
+#define ATOMIC_FLUSH_TIME (2UL * HZ)  /* 2 seconds, same as rstat */
 
 /* Core read functions - cache-based with 2s TTL */
 u64 css_atomic_page_state(struct mem_cgroup *memcg, int idx, bool force);
@@ -87,8 +98,8 @@ unsigned long css_atomic_events(struct mem_cgroup *memcg,
 unsigned long css_atomic_events_recursive(struct mem_cgroup *memcg,
 					  enum vm_event_item idx);
 
-/* Cache flush - explicitly refresh cache (called on memory.stat read) */
-void css_atomic_flush(struct mem_cgroup *memcg);
+/* Cache flush - rstat-like threshold + rate limit check */
+void css_atomic_flush(struct mem_cgroup *memcg, bool force);
 
 #else /* !CONFIG_MEMCG_ATOMIC_COUNTER */
 
@@ -107,7 +118,7 @@ static inline unsigned long css_atomic_events_recursive(struct mem_cgroup *memcg
 {
 	return 0;
 }
-static inline void css_atomic_flush(struct mem_cgroup *memcg) { }
+static inline void css_atomic_flush(struct mem_cgroup *memcg, bool force) { }
 
 #endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
 
