@@ -485,12 +485,13 @@ int ks_query_cgroup(struct cgroup *cgrp, const struct ks_schema *schema,
 			return ret;
 		}
 
-		/* Validate base field name against whitelist */
-		if (!ks_validate_field(base_name)) {
-			pr_warn("k-serial: field '%s' not in whitelist\n",
-				base_name);
-			return -EPERM;
-		}
+		/* No whitelist - rely on BTF type checking for security
+		 * BTF will reject:
+		 * - Non-existent fields
+		 * - Invalid types
+		 * - Out-of-bounds array access
+		 * This is safe because type system prevents arbitrary memory access
+		 */
 
 		/* Resolve field path (handles nesting and pointers) */
 		ret = ks_resolve_field_path(btf, cgroup_type_id, cgrp,

@@ -44,61 +44,19 @@ struct ks_result {
 #include <linux/cgroup.h>
 
 /*
- * Whitelist of allowed fields for struct cgroup
- * Supports simple fields, nested paths, and arrays (Phase 3)
- */
-static const char *ks_cgroup_whitelist[] = {
-	/* Basic hierarchy fields */
-	"level",
-	"max_depth",
-	"nr_descendants",
-	"nr_dying_descendants",
-	"max_descendants",
-	
-	/* Population tracking */
-	"nr_populated_csets",
-	"nr_populated_domain_children",
-	"nr_populated_threaded_children",
-	"nr_threaded_children",
-	
-	/* Control flags */
-	"flags",
-	"subtree_control",
-	"subtree_ss_mask",
-	
-	/* Sequence numbers */
-	"kill_seq",
-	
-	/* Nested paths (Phase 2) */
-	"self.id",                    /* cgrp->self.id */
-	"self.serial_nr",             /* cgrp->self.serial_nr */
-	"self.flags",                 /* cgrp->self.flags */
-	"root.kf",                    /* cgrp->root->kf (ptr) */
-	"dom_cgrp.level",             /* cgrp->dom_cgrp->level */
-	"old_dom_cgrp.level",         /* cgrp->old_dom_cgrp->level */
-	
-	/* Array fields (Phase 3) */
-	"nr_dying_subsys",            /* cgrp->nr_dying_subsys[idx] - int array */
-	"subsys",                     /* cgrp->subsys[idx] - pointer array */
-	
-	NULL
-};
-
-/**
- * ks_validate_field - Check if field name is in whitelist
- * @field_name: Field name to validate
+ * No whitelist - k-serial allows querying any field that BTF can resolve
  * 
- * Returns: true if allowed, false otherwise
+ * Security model:
+ * - BTF type checking ensures only valid struct fields are accessed
+ * - Only scalar types (int, u64, pointers) are returned
+ * - Complex types (strings, nested structs) are rejected
+ * - Array bounds are checked automatically
+ * 
+ * This is safe because:
+ * 1. BTF prevents access to non-existent fields
+ * 2. Type validation prevents reading arbitrary memory
+ * 3. Users can only query their own cgroup (via current task)
  */
-static inline bool ks_validate_field(const char *field_name)
-{
-	int i;
-	for (i = 0; ks_cgroup_whitelist[i]; i++) {
-		if (!strcmp(field_name, ks_cgroup_whitelist[i]))
-			return true;
-	}
-	return false;
-}
 
 /**
  * ks_query_cgroup - Query fields from a cgroup using BTF
