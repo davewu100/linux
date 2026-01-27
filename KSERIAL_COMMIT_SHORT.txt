@@ -1,0 +1,23 @@
+kserial: Redesign CLI tool to remove hardcoded shortcuts
+
+Remove the inflexible -m parameter and adopt a universal syntax
+that supports querying any kernel struct fields dynamically.
+
+The previous design hardcoded memory.stat field mappings, limiting
+flexibility. The new design uses natural "struct field..." syntax:
+
+  Old: kserial -m anon file kernel
+  New: kserial mem_cgroup vmstats.state[9] vmstats.state[10] vmstats.state[40]
+
+Benefits:
+- Universal: Query any BTF-visible struct, not just mem_cgroup
+- Flexible: User specifies field paths directly
+- Maintainable: ~70% code reduction, no hardcoded mappings
+- Backward compatible: Wrapper script provided for old -m syntax
+
+Examples:
+  kserial cgroup level nr_descendants
+  kserial mem_cgroup vmstats.state[9] vmstats.state[10]
+  kserial task_struct pid comm state
+
+Signed-off-by: Your Name <your.email@example.com>
