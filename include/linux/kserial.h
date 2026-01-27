@@ -26,6 +26,10 @@ struct ks_schema {
 	__u32 flags;
 	char struct_name[KS_FIELD_NAME_LEN];  /* Target struct type (e.g. "cgroup", "mem_cgroup") */
 	
+	/* Target selection */
+	__u32 target_pid;      /* Target process PID (0 = current process) */
+	__u32 reserved[3];     /* Reserved for future use */
+	
 	/* Block read parameters (when KS_FLAG_BLOCK_READ is set) */
 	__u32 block_offset;    /* Raw offset for KS_FLAG_RAW_OFFSET */
 	__u32 block_size;      /* Size in bytes for KS_FLAG_RAW_OFFSET */

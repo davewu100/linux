@@ -53,17 +53,67 @@ static int ks_proc_open(struct inode *inode, struct file *file)
 }
 
 /**
+ * ks_get_target_task - Get target task by PID with permission checking
+ * @pid: Target PID (0 = current process)
+ * 
+ * Returns: task_struct pointer on success, ERR_PTR on error
+ * Note: Caller must call put_task_struct() if task != current
+ */
+static struct task_struct *ks_get_target_task(u32 pid)
+{
+	struct task_struct *task;
+	
+	/* Default: current process */
+	if (pid == 0)
+		return current;
+	
+	rcu_read_lock();
+	
+	/* Find task by PID */
+	task = find_task_by_vpid(pid);
+	if (!task) {
+		rcu_read_unlock();
+		pr_warn("k-serial: PID %u not found\n", pid);
+		return ERR_PTR(-ESRCH);
+	}
+	
+	/* Permission check: same UID or CAP_SYS_ADMIN */
+	if (!uid_eq(current_uid(), task_uid(task)) && 
+	    !capable(CAP_SYS_ADMIN)) {
+		rcu_read_unlock();
+		pr_warn("k-serial: permission denied for PID %u\n", pid);
+		return ERR_PTR(-EPERM);
+	}
+	
+	/* PID namespace check */
+	if (task_active_pid_ns(current) != task_active_pid_ns(task)) {
+		rcu_read_unlock();
+		pr_warn("k-serial: PID namespace mismatch for PID %u\n", pid);
+		return ERR_PTR(-EINVAL);
+	}
+	
+	/* Increase reference count to prevent task from disappearing */
+	get_task_struct(task);
+	rcu_read_unlock();
+	
+	return task;
+}
+
+/**
  * ks_proc_write - Accept schema from userspace
  * 
  * User writes struct ks_schema to specify which fields to query
  * The schema can specify different struct types via struct_name field
+ * and optionally target a specific process via target_pid
  */
 static ssize_t ks_proc_write(struct file *file, const char __user *buf,
 			      size_t count, loff_t *ppos)
 {
 	struct ks_proc_data *data = file->private_data;
+	struct task_struct *target_task = NULL;
 	void *target_struct = NULL;
 	const char *struct_name;
+	bool need_put_task = false;
 	int ret;
 
 	if (count != sizeof(struct ks_schema))
@@ -79,30 +129,48 @@ static ssize_t ks_proc_write(struct file *file, const char __user *buf,
 	}
 	struct_name = data->schema->struct_name;
 
+	/* Get target task (may be current or specified PID) */
+	target_task = ks_get_target_task(data->schema->target_pid);
+	if (IS_ERR(target_task)) {
+		return PTR_ERR(target_task);
+	}
+	
+	/* Remember to release task reference if not current */
+	if (target_task != current)
+		need_put_task = true;
+
 	/* Get target struct based on type */
 	rcu_read_lock();
 	
 	if (!strcmp(struct_name, "cgroup")) {
-		/* Query current task's cgroup */
-		target_struct = task_dfl_cgroup(current);
+		/* Query target task's cgroup */
+		target_struct = task_dfl_cgroup(target_task);
 		if (!target_struct) {
 			rcu_read_unlock();
-			pr_warn("k-serial: failed to get cgroup for current task\n");
+			if (need_put_task)
+				put_task_struct(target_task);
+			pr_warn("k-serial: failed to get cgroup for PID %u\n",
+				data->schema->target_pid);
 			return -ENOENT;
 		}
 	} else if (!strcmp(struct_name, "mem_cgroup")) {
-		/* Query current task's mem_cgroup */
-		target_struct = mem_cgroup_from_task(current);
+		/* Query target task's mem_cgroup */
+		target_struct = mem_cgroup_from_task(target_task);
 		if (!target_struct) {
 			rcu_read_unlock();
-			pr_warn("k-serial: failed to get mem_cgroup for current task\n");
+			if (need_put_task)
+				put_task_struct(target_task);
+			pr_warn("k-serial: failed to get mem_cgroup for PID %u\n",
+				data->schema->target_pid);
 			return -ENOENT;
 		}
 	} else if (!strcmp(struct_name, "task_struct")) {
-		/* Query current task itself */
-		target_struct = current;
+		/* Query target task itself */
+		target_struct = target_task;
 	} else {
 		rcu_read_unlock();
+		if (need_put_task)
+			put_task_struct(target_task);
 		pr_warn("k-serial: unsupported struct type '%s'\n", struct_name);
 		return -EINVAL;
 	}
@@ -110,6 +178,10 @@ static ssize_t ks_proc_write(struct file *file, const char __user *buf,
 	/* Query the struct using k-serial */
 	ret = ks_query_struct(target_struct, struct_name, data->schema, data->result);
 	rcu_read_unlock();
+	
+	/* Release task reference if we acquired one */
+	if (need_put_task)
+		put_task_struct(target_task);
 
 	if (ret) {
 		pr_warn("k-serial: query of struct '%s' failed: %d\n", struct_name, ret);
