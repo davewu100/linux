@@ -24627,6 +24627,7 @@ struct btf *bpf_get_btf_vmlinux(void)
 	}
 	return btf_vmlinux;
 }
+EXPORT_SYMBOL_GPL(bpf_get_btf_vmlinux);
 
 /*
  * The add_fd_from_fd_array() is executed only if fd_array_cnt is non-zero. In

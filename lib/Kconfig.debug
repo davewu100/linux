@@ -3448,4 +3448,26 @@ config RUST_KERNEL_DOCTESTS
 
 endmenu # "Rust"
 
+config KSERIAL
+	tristate "k-serial: BTF-based field query interface"
+	depends on PROC_FS
+	depends on BPF_SYSCALL
+	help
+	  Enable k-serial, a BTF-based interface for querying kernel structure
+	  fields by name at runtime. This provides a /proc/kserial interface
+	  that allows userspace to query fields from kernel structures (like
+	  struct cgroup) without hardcoded offsets.
+
+	  k-serial uses BTF (BPF Type Format) to find fields by name, making
+	  it version-resilient and type-safe. Fields are validated against
+	  a whitelist for security.
+
+	  To compile this driver as a module, choose M here: the module
+	  will be called kserial.
+
+	  Note: BTF support (CONFIG_DEBUG_INFO_BTF) is recommended but not
+	  strictly required if BTF is available at runtime.
+
+	  If unsure, say N.
+
 endmenu # Kernel hacking
