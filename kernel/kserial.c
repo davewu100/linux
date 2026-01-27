@@ -436,7 +436,8 @@ int ks_query_struct(void *struct_addr, const char *struct_name,
 	}
 
 	/* Get BTF for vmlinux */
-	btf = bpf_get_btf_vmlinux();
+	extern struct btf *btf_vmlinux;
+	btf = btf_vmlinux;
 	if (IS_ERR(btf) || !btf)
 		return -ENOENT;
 

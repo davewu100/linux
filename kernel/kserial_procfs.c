@@ -17,6 +17,10 @@
 #include <linux/memcontrol.h>
 #include <linux/sched.h>
 #include <linux/uaccess.h>
+#include <linux/pid.h>
+#include <linux/pid_namespace.h>
+#include <linux/cred.h>
+#include <linux/capability.h>
 
 /* Per-file private data */
 struct ks_proc_data {

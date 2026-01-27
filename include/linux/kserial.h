@@ -84,6 +84,10 @@ struct ks_result {
 int ks_query_struct(void *struct_addr, const char *struct_name,
 		    const struct ks_schema *schema, struct ks_result *result);
 
+/* Block read function */
+int ks_query_block(void *struct_addr, const char *struct_name,
+		   const struct ks_schema *schema, struct ks_result *result);
+
 /* Cache management */
 struct ks_cache_entry;
 struct ks_cache_stats;
