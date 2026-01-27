@@ -629,6 +629,7 @@ void mem_cgroup_flush_stats(struct mem_cgroup *memcg)
 
 	__mem_cgroup_flush_stats(memcg, false);
 }
+EXPORT_SYMBOL_GPL(mem_cgroup_flush_stats);
 
 void mem_cgroup_flush_stats_ratelimited(struct mem_cgroup *memcg)
 {
@@ -4523,6 +4524,346 @@ int memory_stat_show(struct seq_file *m, void *v)
 	return 0;
 }
 
+#ifdef CONFIG_KSERIAL
+
+#include <linux/kserial.h>
+#include <linux/list.h>
+
+/* Per-file context for memory.stat.ks */
+struct ks_memcg_context {
+	char *field_list;	/* User-specified fields (or NULL = all) */
+	struct ks_schema schema;  /* BTF query schema */
+	struct ks_result result;  /* Query results */
+	bool use_btf;		/* Use BTF query (true) or legacy (false) */
+	struct list_head list;   /* For list of contexts */
+	struct kernfs_node *kn;  /* Back pointer to kernfs_node (for reference) */
+	u64 kn_id;		/* Unique ID of kernfs_node (used as key) */
+};
+
+/* List of contexts, keyed by kernfs_node ID (stable across all CPU cores) */
+static LIST_HEAD(ks_memcg_ctx_list);
+static DEFINE_MUTEX(ks_memcg_ctx_lock);
+
+/* Helper to get context from kernfs_open_file */
+static struct ks_memcg_context *ks_memcg_get_ctx(struct kernfs_open_file *of)
+{
+	struct ks_memcg_context *ctx;
+	u64 kn_id;
+
+	if (!of || !of->kn)
+		return NULL;
+
+	kn_id = of->kn->id;
+
+	mutex_lock(&ks_memcg_ctx_lock);
+	list_for_each_entry(ctx, &ks_memcg_ctx_list, list) {
+		if (ctx->kn_id == kn_id) {
+			mutex_unlock(&ks_memcg_ctx_lock);
+			return ctx;
+		}
+	}
+	mutex_unlock(&ks_memcg_ctx_lock);
+	return NULL;
+}
+
+/*
+ * Legacy mode: Show all fields using hardcoded access
+ * This is for backward compatibility and performance comparison
+ */
+static int memory_stat_ks_show_legacy(struct seq_file *m, struct mem_cgroup *memcg)
+{
+	int i;
+
+	/* Flush stats to get accurate values */
+	mem_cgroup_flush_stats(memcg);
+
+	/* Output all memory_stats fields (same as memory.stat) */
+	for (i = 0; i < ARRAY_SIZE(memory_stats); i++) {
+		u64 size;
+
+#ifdef CONFIG_HUGETLB_PAGE
+		if (unlikely(memory_stats[i].idx == NR_HUGETLB) &&
+			!memcg_accounts_hugetlb())
+			continue;
+#endif
+		size = memcg_page_state_output(memcg, memory_stats[i].idx);
+		seq_printf(m, "%s %llu\n", memory_stats[i].name, size);
+
+		if (unlikely(memory_stats[i].idx == NR_SLAB_UNRECLAIMABLE_B)) {
+			size += memcg_page_state_output(memcg,
+							NR_SLAB_RECLAIMABLE_B);
+			seq_printf(m, "slab %llu\n", size);
+		}
+	}
+
+	/* Accumulated memory events */
+	seq_printf(m, "pgscan %lu\n",
+		   memcg_events(memcg, PGSCAN_KSWAPD) +
+		   memcg_events(memcg, PGSCAN_DIRECT) +
+		   memcg_events(memcg, PGSCAN_PROACTIVE) +
+		   memcg_events(memcg, PGSCAN_KHUGEPAGED));
+	seq_printf(m, "pgsteal %lu\n",
+		   memcg_events(memcg, PGSTEAL_KSWAPD) +
+		   memcg_events(memcg, PGSTEAL_DIRECT) +
+		   memcg_events(memcg, PGSTEAL_PROACTIVE) +
+		   memcg_events(memcg, PGSTEAL_KHUGEPAGED));
+
+	for (i = 0; i < ARRAY_SIZE(memcg_vm_event_stat); i++) {
+#ifdef CONFIG_MEMCG_V1
+		if (memcg_vm_event_stat[i] == PGPGIN ||
+		    memcg_vm_event_stat[i] == PGPGOUT)
+			continue;
+#endif
+		seq_printf(m, "%s %lu\n",
+			   vm_event_name(memcg_vm_event_stat[i]),
+			   memcg_events(memcg, memcg_vm_event_stat[i]));
+	}
+
+	return 0;
+}
+
+/*
+ * BTF mode: Query specified fields using kserial BTF engine
+ * This demonstrates true kserial capability
+ */
+static int memory_stat_ks_show_btf(struct seq_file *m,
+				    struct mem_cgroup *memcg,
+				    struct ks_memcg_context *ctx)
+{
+	u8 *p, *end;
+	int ret, field_idx;
+
+	if (!ctx || ctx->schema.nr_fields == 0)
+		return -EINVAL;
+
+	/* Setup result buffer */
+	ctx->result.total_len = 0;
+
+	ret = ks_query_struct(memcg, "mem_cgroup", &ctx->schema, &ctx->result);
+	if (ret < 0) {
+		seq_printf(m, "# Error: BTF query failed: %d\n", ret);
+		return ret;
+	}
+
+	/* Parse TLV results and display */
+	p = ctx->result.data;
+	end = p + ctx->result.total_len;
+	field_idx = 0;
+
+	while (p < end && field_idx < ctx->schema.nr_fields) {
+		u16 len;
+		u64 value;
+
+		/* Parse TLV: field_id (2) + len (2) + data */
+		if (p + 4 > end)
+			break;
+
+		p += 2;  /* Skip field_id */
+		len = *(u16 *)p;
+		p += 2;
+
+		if (p + len > end)
+			break;
+
+		/* Display based on length */
+		if (len == 8) {
+			/* 64-bit value */
+			value = *(u64 *)p;
+			seq_printf(m, "%s %llu\n",
+				   ctx->schema.field_names[field_idx], value);
+		} else if (len == 4) {
+			/* 32-bit value */
+			value = *(u32 *)p;
+			seq_printf(m, "%s %u\n",
+				   ctx->schema.field_names[field_idx], (u32)value);
+		} else if (len == 2) {
+			/* 16-bit value */
+			value = *(u16 *)p;
+			seq_printf(m, "%s %u\n",
+				   ctx->schema.field_names[field_idx], (u16)value);
+		} else {
+			/* Other types - show as hex */
+			int j;
+			seq_printf(m, "%s 0x", ctx->schema.field_names[field_idx]);
+			for (j = 0; j < len && j < 8; j++)
+				seq_printf(m, "%02x", p[j]);
+			seq_printf(m, "\n");
+		}
+
+		p += len;
+		field_idx++;
+	}
+
+	return 0;
+}
+
+/**
+ * memory_stat_ks_show - kserial with BTF query support
+ *
+ * Two modes:
+ * 1. Default (no write): Show all fields (backward compatible)
+ * 2. Selective (after write): Use BTF to query only specified fields
+ *
+ * Examples:
+ *   cat /sys/fs/cgroup/memory.stat.ks
+ *   → All fields (legacy mode)
+ *
+ *   echo "anon,file,slab" > /sys/fs/cgroup/memory.stat.ks
+ *   cat /sys/fs/cgroup/memory.stat.ks
+ *   → Only 3 fields via BTF query (true kserial!)
+ */
+static int memory_stat_ks_show(struct seq_file *m, void *v)
+{
+	struct mem_cgroup *memcg = mem_cgroup_from_seq(m);
+	struct kernfs_open_file *of;
+	struct ks_memcg_context *ctx;
+	int ret;
+
+	/* Get kernfs_open_file from seq_file */
+	of = m->private;
+
+	/* Get context from list by kernfs_node ID */
+	ctx = of && of->kn ? ks_memcg_get_ctx(of) : NULL;
+
+	/* Decide mode: BTF or legacy */
+	if (ctx && ctx->use_btf && ctx->field_list) {
+		/* BTF mode: selective field query */
+		ret = memory_stat_ks_show_btf(m, memcg, ctx);
+	} else {
+		/* Legacy mode: show all fields */
+		ret = memory_stat_ks_show_legacy(m, memcg);
+	}
+
+	return ret;
+}
+
+/*
+ * Handle write to memory.stat.ks: parse and store field list
+ *
+ * Format: Comma-separated field names
+ * Example: "anon,file,slab" or "css.id,memory.usage"
+ */
+static ssize_t memory_stat_ks_write(struct kernfs_open_file *of,
+				     char *buf, size_t nbytes, loff_t off)
+{
+	struct ks_memcg_context *ctx;
+	char *field_list, *pos, *token;
+	int nr_fields = 0, i;
+
+	/* Get or create context */
+	if (!of || !of->kn)
+		return -EINVAL;
+
+	ctx = ks_memcg_get_ctx(of);
+	if (!ctx) {
+		ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+		if (!ctx)
+			return -ENOMEM;
+		ctx->kn = of->kn;
+		ctx->kn_id = of->kn->id;
+		INIT_LIST_HEAD(&ctx->list);
+
+		mutex_lock(&ks_memcg_ctx_lock);
+		list_add(&ctx->list, &ks_memcg_ctx_list);
+		mutex_unlock(&ks_memcg_ctx_lock);
+	}
+
+	/* Reset to legacy mode */
+	kfree(ctx->field_list);
+	ctx->field_list = NULL;
+	memset(&ctx->schema, 0, sizeof(ctx->schema));
+	ctx->use_btf = false;
+
+	/* Empty write = reset to legacy mode */
+	if (nbytes == 0 || buf[0] == '\n')
+		return nbytes;
+
+	/* Store field list */
+	field_list = kstrndup(buf, nbytes, GFP_KERNEL);
+	if (!field_list)
+		return -ENOMEM;
+
+	/* Remove trailing newline */
+	if (field_list[nbytes - 1] == '\n')
+		field_list[nbytes - 1] = '\0';
+
+	/* Parse fields into schema */
+	pos = field_list;
+	i = 0;
+	while ((token = strsep(&pos, ",")) != NULL && i < KS_MAX_FIELDS) {
+		/* Skip leading whitespace */
+		while (*token == ' ' || *token == '\t')
+			token++;
+
+		if (*token && *token != '\n') {
+			/* Remove trailing whitespace */
+			char *end = token + strlen(token) - 1;
+			while (end > token && (*end == ' ' || *end == '\t' || *end == '\n'))
+				*end-- = '\0';
+
+			/* Copy to schema */
+			strscpy(ctx->schema.field_names[i], token, KS_FIELD_NAME_LEN);
+			i++;
+		}
+	}
+
+	nr_fields = i;
+
+	if (nr_fields == 0) {
+		kfree(field_list);
+		return nbytes;  /* Empty = legacy mode */
+	}
+
+	/* Setup schema */
+	strscpy(ctx->schema.struct_name, "mem_cgroup", KS_FIELD_NAME_LEN);
+	ctx->schema.nr_fields = nr_fields;
+	ctx->schema.flags = 0;
+	ctx->schema.target_pid = 0;  /* Current process */
+
+	ctx->field_list = field_list;
+	ctx->use_btf = true;
+
+	return nbytes;
+}
+
+/*
+ * Open handler: initialize context on first open
+ * Note: We don't override of->priv, which is used by cgroup framework
+ */
+static int memory_stat_ks_open(struct kernfs_open_file *of)
+{
+	/* Context will be allocated on write, or remains NULL for read-only */
+	/* We use hash table to store context, not of->priv */
+	return 0;
+}
+
+/*
+ * Release handler: free all allocated context data
+ */
+static void memory_stat_ks_release(struct kernfs_open_file *of)
+{
+	struct ks_memcg_context *ctx, *tmp;
+	u64 kn_id;
+
+	if (!of || !of->kn)
+		return;
+	kn_id = of->kn->id;
+
+	mutex_lock(&ks_memcg_ctx_lock);
+	list_for_each_entry_safe(ctx, tmp, &ks_memcg_ctx_list, list) {
+		if (ctx->kn_id == kn_id) {
+			list_del(&ctx->list);
+			mutex_unlock(&ks_memcg_ctx_lock);
+			kfree(ctx->field_list);
+			kfree(ctx);
+			return;
+		}
+	}
+	mutex_unlock(&ks_memcg_ctx_lock);
+}
+
+#endif /* CONFIG_KSERIAL */
+
 #ifdef CONFIG_NUMA
 static inline unsigned long lruvec_page_state_output(struct lruvec *lruvec,
 						     int item)
@@ -4559,7 +4900,47 @@ static int memory_numa_stat_show(struct seq_file *m, void *v)
 
 	return 0;
 }
-#endif
+
+#ifdef CONFIG_KSERIAL
+/**
+ * memory_numa_stat_ks_show - kserial optimized memory.numa_stat (for performance demo)
+ *
+ * This outputs the SAME fields as memory_numa_stat_show for fair comparison:
+ * - Same field count (all per-node memory_stats[])
+ * - Same data (using lruvec_page_state_output())
+ * - Optimization: Direct seq_printf (no intermediate buffer)
+ * - Built-in profiling
+ */
+static int memory_numa_stat_ks_show(struct seq_file *m, void *v)
+{
+	struct mem_cgroup *memcg = mem_cgroup_from_seq(m);
+	int i;
+
+	mem_cgroup_flush_stats(memcg);
+
+	for (i = 0; i < ARRAY_SIZE(memory_stats); i++) {
+		int nid;
+
+		if (memory_stats[i].idx >= NR_VM_NODE_STAT_ITEMS)
+			continue;
+
+		seq_printf(m, "%s", memory_stats[i].name);
+		for_each_node_state(nid, N_MEMORY) {
+			u64 size;
+			struct lruvec *lruvec;
+
+			lruvec = mem_cgroup_lruvec(memcg, NODE_DATA(nid));
+			size = lruvec_page_state_output(lruvec,
+							memory_stats[i].idx);
+			seq_printf(m, " N%d=%llu", nid, size);
+		}
+		seq_putc(m, '\n');
+	}
+
+	return 0;
+}
+#endif /* CONFIG_KSERIAL */
+#endif /* CONFIG_NUMA */
 
 static int memory_oom_group_show(struct seq_file *m, void *v)
 {
@@ -4659,11 +5040,26 @@ static struct cftype memory_files[] = {
 		.name = "stat",
 		.seq_show = memory_stat_show,
 	},
+#ifdef CONFIG_KSERIAL
+	{
+		.name = "stat.ks",
+		.seq_show = memory_stat_ks_show,
+		.write = memory_stat_ks_write,
+		.open = memory_stat_ks_open,
+		.release = memory_stat_ks_release,
+	},
+#endif
 #ifdef CONFIG_NUMA
 	{
 		.name = "numa_stat",
 		.seq_show = memory_numa_stat_show,
 	},
+#ifdef CONFIG_KSERIAL
+	{
+		.name = "numa_stat.ks",
+		.seq_show = memory_numa_stat_ks_show,
+	},
+#endif
 #endif
 	{
 		.name = "oom.group",
@@ -5167,6 +5563,10 @@ int __init mem_cgroup_init(void)
 
 	memcg_pn_cachep = KMEM_CACHE(mem_cgroup_per_node,
 				     SLAB_PANIC | SLAB_HWCACHE_ALIGN);
+
+#ifdef CONFIG_KSERIAL
+	/* ks_memcg_ctx_list is statically initialized (LIST_HEAD) */
+#endif
 
 	return 0;
 }

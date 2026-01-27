@@ -113,6 +113,7 @@ more memory-management documentation in Documentation/mm/index.rst.
    swiotlb
    mm-api
    cgroup
+   kserial
    genalloc
    pin_user_pages
    boot-time-mm

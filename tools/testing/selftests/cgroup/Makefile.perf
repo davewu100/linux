@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: GPL-2.0
+# Makefile for func_profiler based performance tools
+
+CC = gcc
+CFLAGS = -O2 -Wall -Wextra -std=gnu11
+LDFLAGS = -lrt
+
+TARGETS = perf_compare perf_benchmark compare_memstat_perf
+
+.PHONY: all clean
+
+all: $(TARGETS)
+
+perf_compare: perf_compare.c func_profiler.h
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+
+perf_benchmark: perf_benchmark.c func_profiler.h
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+
+compare_memstat_perf: compare_memstat_perf.c func_profiler.h
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+
+clean:
+	rm -f $(TARGETS)
+
+install: all
+	@echo "Performance tools built successfully"
+	@echo "Available commands:"
+	@echo "  ./perf_compare - Generic command comparison"
+	@echo "  ./perf_benchmark - Function benchmarking framework"
+	@echo "  ./compare_memstat_perf - memory.stat specific comparison"
