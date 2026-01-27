@@ -429,6 +429,11 @@ int ks_query_struct(void *struct_addr, const char *struct_name,
 
 	/* Initialize result buffer */
 	result->total_len = 0;
+	
+	/* Check for block read mode */
+	if (schema->flags & KS_FLAG_BLOCK_READ) {
+		return ks_query_block(struct_addr, struct_name, schema, result);
+	}
 
 	/* Get BTF for vmlinux */
 	btf = bpf_get_btf_vmlinux();
@@ -521,3 +526,8 @@ int ks_query_struct(void *struct_addr, const char *struct_name,
 	return 0;
 }
 EXPORT_SYMBOL_GPL(ks_query_struct);
+
+/* Block read implementation - defined in kserial_block.c */
+extern int ks_query_block(void *struct_addr, const char *struct_name,
+			  const struct ks_schema *schema,
+			  struct ks_result *result);

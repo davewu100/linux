@@ -17,12 +17,21 @@
 
 /* Schema flags */
 #define KS_FLAG_ALLOW_NULL 0x01  /* Return 0 for NULL pointers instead of error */
+#define KS_FLAG_BLOCK_READ 0x02  /* Block read mode for array ranges */
+#define KS_FLAG_RAW_OFFSET 0x04  /* Raw memory offset mode */
 
 /* User space schema: list of field names/paths to query */
 struct ks_schema {
 	__u32 nr_fields;
 	__u32 flags;
 	char struct_name[KS_FIELD_NAME_LEN];  /* Target struct type (e.g. "cgroup", "mem_cgroup") */
+	
+	/* Block read parameters (when KS_FLAG_BLOCK_READ is set) */
+	__u32 block_offset;    /* Raw offset for KS_FLAG_RAW_OFFSET */
+	__u32 block_size;      /* Size in bytes for KS_FLAG_RAW_OFFSET */
+	__u32 array_start;     /* Array start index for range reads */
+	__u32 array_count;     /* Number of array elements to read */
+	
 	char field_names[KS_MAX_FIELDS][KS_FIELD_NAME_LEN];
 };
 
