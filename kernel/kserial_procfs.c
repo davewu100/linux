@@ -21,6 +21,7 @@
 #include <linux/pid_namespace.h>
 #include <linux/cred.h>
 #include <linux/capability.h>
+#include <linux/cpumask.h>
 
 /* Per-file private data */
 struct ks_proc_data {
@@ -168,8 +169,24 @@ static ssize_t ks_proc_write(struct file *file, const char __user *buf,
 				data->schema->target_pid);
 			return -ENOENT;
 		}
-		/* Flush stats before reading to ensure we get up-to-date values */
-		mem_cgroup_flush_stats((struct mem_cgroup *)target_struct);
+		/* Force flush stats before reading to ensure we get up-to-date values */
+		/* First call mem_cgroup_flush_stats to trigger update tracking, then force flush */
+		{
+			struct mem_cgroup *memcg = (struct mem_cgroup *)target_struct;
+			struct cgroup_subsys_state *css = &memcg->css;
+			int cpu;
+			
+			/* Call mem_cgroup_flush_stats first to ensure stats are marked for update */
+			mem_cgroup_flush_stats(memcg);
+			
+			/* Then directly flush all CPUs to ensure complete aggregation */
+			/* This ensures we get all per-CPU stats, including those not yet marked */
+			if (css->ss && css->ss->css_rstat_flush) {
+				for_each_possible_cpu(cpu) {
+					css->ss->css_rstat_flush(css, cpu);
+				}
+			}
+		}
 	} else if (!strcmp(struct_name, "task_struct")) {
 		/* Query target task itself */
 		target_struct = target_task;

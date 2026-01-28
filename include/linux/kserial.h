@@ -19,6 +19,8 @@
 #define KS_FLAG_ALLOW_NULL 0x01  /* Return 0 for NULL pointers instead of error */
 #define KS_FLAG_BLOCK_READ 0x02  /* Block read mode for array ranges */
 #define KS_FLAG_RAW_OFFSET 0x04  /* Raw memory offset mode */
+#define KS_FLAG_RAW_OUTPUT 0x08  /* Raw output mode (no TLV encoding) */
+#define KS_FLAG_ALLOW_STRING 0x10  /* Allow string field access */
 
 /* User space schema: list of field names/paths to query */
 struct ks_schema {
@@ -87,6 +89,11 @@ int ks_query_struct(void *struct_addr, const char *struct_name,
 /* Block read function */
 int ks_query_block(void *struct_addr, const char *struct_name,
 		   const struct ks_schema *schema, struct ks_result *result);
+
+/* String field support */
+bool ks_is_string_field(const struct btf *btf, u32 field_type_id);
+int ks_query_string_field(const struct btf *btf, void *field_addr,
+			   u32 field_type_id, char *out_buf, u32 buf_size);
 
 /* Cache management */
 struct ks_cache_entry;

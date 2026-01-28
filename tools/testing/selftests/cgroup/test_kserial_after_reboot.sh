@@ -1,22 +1,22 @@
 #!/bin/bash
-# 重启后的 kserial 测试脚本
-# 请手动运行此脚本（需要 sudo 权限）
+# kserial test script after reboot
+# Please run this script manually (requires sudo privileges)
 
 set -e
 
 KERNEL_DIR="/home/jianyuew/develop/kernel/cgroup/linux"
 cd "$KERNEL_DIR/tools/testing/selftests/cgroup"
 
-echo "=== kserial 重启后测试 ==="
+echo "=== kserial Post-Reboot Test ==="
 echo ""
 
-# 1. 检查内核版本
-echo "1. 检查内核版本..."
-echo "   当前内核: $(uname -r)"
+# 1. Check kernel version
+echo "1. Checking kernel version..."
+echo "   Current kernel: $(uname -r)"
 echo ""
 
-# 2. 检查符号是否存在
-echo "2. 检查必要的符号是否存在..."
+# 2. Check if symbols exist
+echo "2. Checking if required symbols exist..."
 SYMBOLS=(
     "btf_find_by_name_kind"
     "bpf_get_btf_vmlinux"
@@ -29,45 +29,45 @@ for sym in "${SYMBOLS[@]}"; do
     if sudo cat /proc/kallsyms 2>/dev/null | grep -q "^[0-9a-f]* [tT] $sym$"; then
         echo "   ✓ $sym"
     else
-        echo "   ✗ $sym - 不存在！"
+        echo "   ✗ $sym - not found!"
         MISSING=1
     fi
 done
 
 if [ $MISSING -eq 1 ]; then
     echo ""
-    echo "⚠️  警告：部分符号不存在，可能需要重新编译内核"
+    echo "⚠️  Warning: Some symbols not found, kernel may need to be recompiled"
     echo ""
 fi
 
-# 3. 检查模块文件
+# 3. Check module files
 echo ""
-echo "3. 检查模块文件..."
+echo "3. Checking module files..."
 if [ -f "$KERNEL_DIR/kernel/kserial.ko" ]; then
-    echo "   ✓ kserial.ko 存在"
+    echo "   ✓ kserial.ko exists"
     ls -lh "$KERNEL_DIR/kernel/kserial.ko"
 else
-    echo "   ✗ kserial.ko 不存在"
-    echo "   需要重新编译模块"
+    echo "   ✗ kserial.ko not found"
+    echo "   Need to recompile modules"
 fi
 
-# 4. 尝试加载模块
+# 4. Try to load modules
 echo ""
-echo "4. 加载模块..."
+echo "4. Loading modules..."
 if lsmod | grep -q kserial; then
-    echo "   ✓ 模块已加载"
+    echo "   ✓ Modules already loaded"
     lsmod | grep kserial
 else
-    echo "   正在加载模块..."
+    echo "   Loading modules..."
     
-    # 按依赖顺序加载：kserial_block -> kserial -> kserial_procfs
+    # Load in dependency order: kserial_block -> kserial -> kserial_procfs
     if [ -f "$KERNEL_DIR/kernel/kserial_block.ko" ]; then
         if lsmod | grep -q kserial_block; then
-            echo "   ✓ kserial_block 已加载"
+            echo "   ✓ kserial_block already loaded"
         else
-            echo "   加载 kserial_block.ko..."
+            echo "   Loading kserial_block.ko..."
             sudo insmod "$KERNEL_DIR/kernel/kserial_block.ko" 2>&1 || {
-                echo "   ⚠ kserial_block.ko 加载失败"
+                echo "   ⚠ kserial_block.ko load failed"
                 sudo dmesg | tail -5
             }
         fi
@@ -75,12 +75,12 @@ else
     
     if [ -f "$KERNEL_DIR/kernel/kserial.ko" ]; then
         if lsmod | grep -q "^kserial "; then
-            echo "   ✓ kserial 已加载"
+            echo "   ✓ kserial already loaded"
         else
-            echo "   加载 kserial.ko..."
+            echo "   Loading kserial.ko..."
             sudo insmod "$KERNEL_DIR/kernel/kserial.ko" 2>&1 || {
-                echo "   ⚠ kserial.ko 加载失败"
-                echo "   错误信息:"
+                echo "   ⚠ kserial.ko load failed"
+                echo "   Error messages:"
                 sudo dmesg | tail -10 | grep -i kserial
                 exit 1
             }
@@ -89,59 +89,59 @@ else
     
     if [ -f "$KERNEL_DIR/kernel/kserial_procfs.ko" ]; then
         if lsmod | grep -q kserial_procfs; then
-            echo "   ✓ kserial_procfs 已加载"
+            echo "   ✓ kserial_procfs already loaded"
         else
-            echo "   加载 kserial_procfs.ko..."
+            echo "   Loading kserial_procfs.ko..."
             sudo insmod "$KERNEL_DIR/kernel/kserial_procfs.ko" 2>&1 || {
-                echo "   ⚠ kserial_procfs.ko 加载失败"
-                echo "   错误信息:"
+                echo "   ⚠ kserial_procfs.ko load failed"
+                echo "   Error messages:"
                 sudo dmesg | tail -10 | grep -i kserial
                 exit 1
             }
         fi
     fi
     
-    echo "   ✓ 模块加载成功"
+    echo "   ✓ Modules loaded successfully"
 fi
 
-# 5. 验证 /proc/kserial
+# 5. Verify /proc/kserial
 echo ""
-echo "5. 验证 /proc/kserial..."
+echo "5. Verifying /proc/kserial..."
 if [ -e /proc/kserial ]; then
-    echo "   ✓ /proc/kserial 存在"
+    echo "   ✓ /proc/kserial exists"
     ls -l /proc/kserial
 else
-    echo "   ✗ /proc/kserial 不存在"
-    echo "   检查 dmesg:"
-    dmesg | tail -10 | grep -i kserial || echo "   无相关日志"
+    echo "   ✗ /proc/kserial does not exist"
+    echo "   Check dmesg:"
+    dmesg | tail -10 | grep -i kserial || echo "   No related logs"
     exit 1
 fi
 
-# 6. 编译测试程序
+# 6. Compile test program
 echo ""
-echo "6. 编译测试程序..."
+echo "6. Compiling test program..."
 if [ ! -x "./test_kserial_real" ]; then
     gcc -Wall -Wextra -o test_kserial_real test_kserial_real.c || {
-        echo "   ✗ 编译失败"
+        echo "   ✗ Compilation failed"
         exit 1
     }
 fi
-echo "   ✓ 测试程序已就绪"
+echo "   ✓ Test program ready"
 
-# 7. 运行测试
+# 7. Run tests
 echo ""
-echo "7. 运行测试..."
+echo "7. Running tests..."
 echo ""
-echo "--- 测试 1: 查询 cgroup 字段 ---"
+echo "--- Test 1: Query cgroup fields ---"
 sudo ./test_kserial_real level nr_descendants max_depth
 echo ""
 
-echo "--- 测试 2: 查询 mem_cgroup 内存统计 ---"
+echo "--- Test 2: Query mem_cgroup memory statistics ---"
 sudo ./test_kserial_real --struct mem_cgroup vmstats.state[14] vmstats.state[16] vmstats.state[34]
 echo ""
 
-echo "--- 测试 3: 查询指定进程 (PID 1) ---"
+echo "--- Test 3: Query specified process (PID 1) ---"
 sudo ./test_kserial_real --struct mem_cgroup --pid 1 vmstats.state[14] vmstats.state[16]
 echo ""
 
-echo "=== 所有测试完成 ==="
+echo "=== All tests completed ==="
