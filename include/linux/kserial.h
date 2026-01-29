@@ -28,6 +28,10 @@
 #define KS_IOCTL_UNSUBSCRIBE _IO(KS_IOCTL_MAGIC, 2)
 #define KS_IOCTL_REFRESH _IO(KS_IOCTL_MAGIC, 3)  /* Refresh shared buffer for mmap */
 
+/* io_uring commands for ultimate performance */
+#define KS_URING_CMD_READ    1  /* Async read data */
+#define KS_URING_CMD_REFRESH 2  /* Async refresh mmap buffer */
+
 /* Subscribe structure for stateful queries */
 struct ks_subscribe {
 	char struct_name[64];           /* e.g., "mem_cgroup", "task_struct" */

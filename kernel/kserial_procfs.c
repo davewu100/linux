@@ -666,12 +666,12 @@ static int ks_proc_release(struct inode *inode, struct file *file)
 }
 
 static const struct proc_ops ks_proc_ops = {
-	.proc_open    = ks_proc_open,
-	.proc_read    = ks_proc_read,
-	.proc_write   = ks_proc_write,
-	.proc_ioctl   = ks_proc_ioctl,
-	.proc_mmap    = ks_proc_mmap,
-	.proc_release = ks_proc_release,
+	.proc_open      = ks_proc_open,
+	.proc_read      = ks_proc_read,
+	.proc_write     = ks_proc_write,
+	.proc_ioctl     = ks_proc_ioctl,
+	.proc_mmap      = ks_proc_mmap,
+	.proc_release   = ks_proc_release,
 };
 
 /**

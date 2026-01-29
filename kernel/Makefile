@@ -121,6 +121,7 @@ obj-$(CONFIG_CPU_PM) += cpu_pm.o
 obj-$(CONFIG_BPF) += bpf/
 obj-$(CONFIG_KSERIAL) += kserial.o
 obj-$(CONFIG_KSERIAL) += kserial_procfs.o
+obj-$(CONFIG_KSERIAL) += kserial_chrdev.o
 obj-$(CONFIG_KSERIAL) += kserial_block.o
 obj-$(CONFIG_KSERIAL) += kserial_cache.o
 obj-$(CONFIG_KSERIAL) += kserial_string.o
