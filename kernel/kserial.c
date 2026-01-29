@@ -3,13 +3,13 @@
  * k-serial: Dynamic field subscription for kernel structs
  * Phase 2: Supports nested struct fields
  * Phase 3: Supports array indexing
- * 
+ *
  * This implementation allows userspace to query fields using paths like:
  * - Simple: "level"
  * - Nested: "self.id"
  * - Deep: "css_set.dfl_cgrp.level"
  * - Array: "subsys[0]", "nr_dying_subsys[2]"
- * 
+ *
  * Fields are validated against a whitelist and returned in TLV format.
  */
 
@@ -28,7 +28,7 @@
  * @type_id: BTF type ID of the struct
  * @field_name: Name of the field to find
  * @member: Output pointer to btf_member
- * 
+ *
  * Returns: 0 on success, -ENOENT if not found
  */
 static int ks_find_field_by_name(const struct btf *btf, s32 type_id,
@@ -46,7 +46,7 @@ static int ks_find_field_by_name(const struct btf *btf, s32 type_id,
 	for (i = 0; i < btf_vlen(t); i++) {
 		m = btf_members(t) + i;
 		const char *name = btf_name_by_offset(btf, m->name_off);
-		
+
 		if (name && !strcmp(name, field_name)) {
 			*member = m;
 			return 0;
@@ -60,7 +60,7 @@ static int ks_find_field_by_name(const struct btf *btf, s32 type_id,
  * ks_get_field_size - Get size of a BTF type
  * @btf: BTF object
  * @type_id: BTF type ID
- * 
+ *
  * Returns: Size in bytes, or -EINVAL for unsupported types
  */
 static int ks_get_field_size(const struct btf *btf, u32 type_id)
@@ -98,7 +98,7 @@ static int ks_get_field_size(const struct btf *btf, u32 type_id)
  * @field: Field name (e.g., "subsys[0]" or "level")
  * @base_name: Output buffer for base field name
  * @index: Output pointer for array index (-1 if not an array)
- * 
+ *
  * Returns: 0 on success, negative error code on failure
  */
 static int ks_parse_array_syntax(const char *field, char *base_name, int *index)
@@ -106,31 +106,31 @@ static int ks_parse_array_syntax(const char *field, char *base_name, int *index)
 	const char *bracket = strchr(field, '[');
 	int len;
 	int digit_count = 0;
-	
+
 	if (!bracket) {
 		/* No array syntax */
 		strcpy(base_name, field);
 		*index = -1;
 		return 0;
 	}
-	
+
 	/* Extract base name */
 	len = bracket - field;
 	if (len >= 32 || len == 0)
 		return -EINVAL;
-	
+
 	strncpy(base_name, field, len);
 	base_name[len] = '\0';
-	
+
 	/* Parse index */
 	bracket++; /* Skip '[' */
 	if (*bracket == '\0' || *bracket == ']')
 		return -EINVAL;
-	
+
 	*index = 0;
 	while (*bracket >= '0' && *bracket <= '9') {
 		int digit = *bracket - '0';
-		
+
 		/* Prevent integer overflow: check before multiplication
 		 * Max safe value: INT_MAX / 10 = 214748364
 		 * If index > INT_MAX/10, next multiplication will overflow
@@ -141,11 +141,11 @@ static int ks_parse_array_syntax(const char *field, char *base_name, int *index)
 			pr_warn("k-serial: array index too large in '%s'\n", field);
 			return -ERANGE;
 		}
-		
+
 		*index = (*index) * 10 + digit;
 		bracket++;
 		digit_count++;
-		
+
 		/* Sanity check: reject unreasonably long numbers (>10 digits)
 		 * This prevents DoS by parsing extremely long number strings
 		 */
@@ -154,16 +154,16 @@ static int ks_parse_array_syntax(const char *field, char *base_name, int *index)
 			return -EINVAL;
 		}
 	}
-	
+
 	if (*bracket != ']')
 		return -EINVAL;
-	
+
 	/* Additional sanity check: reject negative results from overflow */
 	if (*index < 0) {
 		pr_warn("k-serial: array index invalid in '%s'\n", field);
 		return -ERANGE;
 	}
-	
+
 	return 0;
 }
 
@@ -172,7 +172,7 @@ static int ks_parse_array_syntax(const char *field, char *base_name, int *index)
  * @path: Field path (e.g., "css_set.dfl_cgrp.level")
  * @components: Output array of path components
  * @max_depth: Maximum number of components
- * 
+ *
  * Returns: Number of components, or negative error code
  */
 static int ks_parse_field_path(const char *path, char components[][32], int max_depth)
@@ -183,7 +183,7 @@ static int ks_parse_field_path(const char *path, char components[][32], int max_
 
 	while (*p && depth < max_depth) {
 		const char *dot = strchr(p, '.');
-		
+
 		if (dot) {
 			len = dot - p;
 			if (len >= 32)
@@ -216,7 +216,7 @@ static int ks_parse_field_path(const char *path, char components[][32], int max_
  * @flags: Schema flags
  * @final_addr: Output pointer to final field address
  * @final_type_id: Output pointer to final field type ID
- * 
+ *
  * Returns: 0 on success, negative error code on failure
  */
 static int ks_resolve_field_path(const struct btf *btf, s32 start_type_id,
@@ -257,7 +257,7 @@ static int ks_resolve_field_path(const struct btf *btf, s32 start_type_id,
 		t = btf_type_by_id(btf, current_type_id);
 		if (!t)
 			return -EINVAL;
-		
+
 		/* Calculate byte offset using proper BTF API */
 		offset = __btf_member_bit_offset(t, m) / 8;
 		pr_debug("k-serial: field '%s' offset=%u bytes (bit_offset=%u)\n",
@@ -275,7 +275,7 @@ static int ks_resolve_field_path(const struct btf *btf, s32 start_type_id,
 			if (btf_type_is_ptr(t)) {
 				/* Dereference pointer */
 				void *ptr = *(void **)current_addr;
-				
+
 				if (!ptr) {
 					if (flags & KS_FLAG_ALLOW_NULL) {
 						*final_addr = NULL;
@@ -288,7 +288,7 @@ static int ks_resolve_field_path(const struct btf *btf, s32 start_type_id,
 				}
 
 				current_addr = ptr;
-				
+
 				/* Get the pointed-to type and skip modifiers */
 				current_type_id = t->type;
 				t = btf_type_skip_modifiers(btf, current_type_id, &current_type_id);
@@ -322,7 +322,7 @@ static int ks_resolve_field_path(const struct btf *btf, s32 start_type_id,
  * @index: Array index
  * @elem_addr: Output pointer to element address
  * @elem_type_id: Output pointer to element type ID
- * 
+ *
  * Returns: 0 on success, negative error code on failure
  */
 static int ks_resolve_array_element(const struct btf *btf, u32 array_type_id,
@@ -333,33 +333,33 @@ static int ks_resolve_array_element(const struct btf *btf, u32 array_type_id,
 	const struct btf_array *arr;
 	u32 elem_size;
 	int ret;
-	
+
 	/* Skip modifiers */
 	t = btf_type_skip_modifiers(btf, array_type_id, &array_type_id);
 	if (!t)
 		return -EINVAL;
-	
+
 	/* Must be an array type */
 	if (!btf_type_is_array(t)) {
 		pr_warn("k-serial: field is not an array\n");
 		return -EINVAL;
 	}
-	
+
 	arr = btf_array(t);
-	
+
 	/* Bounds check */
 	if (index < 0 || (u32)index >= arr->nelems) {
 		pr_warn("k-serial: array index %d out of bounds (0-%u)\n",
 			index, arr->nelems - 1);
 		return -ERANGE;
 	}
-	
+
 	/* Get element size */
 	ret = ks_get_field_size(btf, arr->type);
 	if (ret < 0)
 		return ret;
 	elem_size = ret;
-	
+
 	/* Prevent address calculation overflow
 	 * Check if (index * elem_size) would overflow before calculating
 	 */
@@ -367,11 +367,11 @@ static int ks_resolve_array_element(const struct btf *btf, u32 array_type_id,
 		pr_warn("k-serial: array offset calculation would overflow\n");
 		return -ERANGE;
 	}
-	
+
 	/* Calculate element address (now safe from overflow) */
 	*elem_addr = (char *)array_addr + (index * elem_size);
 	*elem_type_id = arr->type;
-	
+
 	return 0;
 }
 
@@ -381,7 +381,7 @@ static int ks_resolve_array_element(const struct btf *btf, u32 array_type_id,
  * @field_id: Field index in schema
  * @data: Field value
  * @len: Length of value
- * 
+ *
  * Returns: 0 on success, -ENOSPC if buffer full
  */
 static int ks_write_tlv(struct ks_result *result, u16 field_id,
@@ -408,17 +408,17 @@ static int ks_write_tlv(struct ks_result *result, u16 field_id,
  * @struct_name: Name of struct type (e.g., "cgroup", "mem_cgroup", "task_struct")
  * @schema: User-provided field list (may contain nested paths)
  * @result: Output buffer for TLV-encoded data
- * 
+ *
  * This function supports querying any BTF-visible kernel struct:
  * - Simple fields: "level", "nr_descendants"
  * - Nested fields: "self.id", "dom_cgrp.level"
  * - Array elements: "subsys[0]", "nr_dying_subsys[1]"
- * 
+ *
  * Security:
  * - BTF type checking ensures field exists
  * - Only scalar types (int, u64, pointer) are returned
  * - Array bounds checked automatically
- * 
+ *
  * Returns: 0 on success, negative error code on failure
  */
 int ks_query_struct(void *struct_addr, const char *struct_name,
@@ -437,7 +437,7 @@ int ks_query_struct(void *struct_addr, const char *struct_name,
 
 	/* Initialize result buffer */
 	result->total_len = 0;
-	
+
 	/* Check for block read mode */
 	if (schema->flags & KS_FLAG_BLOCK_READ) {
 		return ks_query_block(struct_addr, struct_name, schema, result);
@@ -493,7 +493,7 @@ int ks_query_struct(void *struct_addr, const char *struct_name,
 			/* Continue with next field instead of failing */
 			continue;
 		}
-		
+
 		/* Debug: print field address and offset */
 		pr_debug("k-serial: field '%s' resolved to addr=%p (offset=%ld from base=%p)\n",
 			 field_path, field_addr, (long)(field_addr - struct_addr), struct_addr);
@@ -537,7 +537,7 @@ int ks_query_struct(void *struct_addr, const char *struct_name,
 			continue;
 		}
 		memcpy(&value, field_addr, field_size);
-		
+
 		/* Sign-extend if the field is a signed integer type */
 		{
 			const struct btf_type *t = btf_type_by_id(btf, field_type_id);

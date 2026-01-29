@@ -22,22 +22,39 @@
 #define KS_FLAG_RAW_OUTPUT 0x08  /* Raw output mode (no TLV encoding) */
 #define KS_FLAG_ALLOW_STRING 0x10  /* Allow string field access */
 
+/* ioctl commands */
+#define KS_IOCTL_MAGIC 'k'
+#define KS_IOCTL_SUBSCRIBE _IOW(KS_IOCTL_MAGIC, 1, struct ks_subscribe)
+#define KS_IOCTL_UNSUBSCRIBE _IO(KS_IOCTL_MAGIC, 2)
+#define KS_IOCTL_REFRESH _IO(KS_IOCTL_MAGIC, 3)  /* Refresh shared buffer for mmap */
+
+/* Subscribe structure for stateful queries */
+struct ks_subscribe {
+	char struct_name[64];           /* e.g., "mem_cgroup", "task_struct" */
+	char fields[32][128];           /* Field paths to query */
+	__u32 nr_fields;                /* Number of fields */
+	__u32 pid;                      /* Target PID (0 = current) */
+	__u32 flags;                    /* Query flags */
+	__u8 include_descriptor;        /* Include descriptor in first read */
+	__u8 reserved[3];
+};
+
 /* User space schema: list of field names/paths to query */
 struct ks_schema {
 	__u32 nr_fields;
 	__u32 flags;
 	char struct_name[KS_FIELD_NAME_LEN];  /* Target struct type (e.g. "cgroup", "mem_cgroup") */
-	
+
 	/* Target selection */
 	__u32 target_pid;      /* Target process PID (0 = current process) */
 	__u32 reserved[3];     /* Reserved for future use */
-	
+
 	/* Block read parameters (when KS_FLAG_BLOCK_READ is set) */
 	__u32 block_offset;    /* Raw offset for KS_FLAG_RAW_OFFSET */
 	__u32 block_size;      /* Size in bytes for KS_FLAG_RAW_OFFSET */
 	__u32 array_start;     /* Array start index for range reads */
 	__u32 array_count;     /* Number of array elements to read */
-	
+
 	char field_names[KS_MAX_FIELDS][KS_FIELD_NAME_LEN];
 };
 
@@ -61,13 +78,13 @@ struct ks_result {
 
 /*
  * No whitelist - k-serial allows querying any field that BTF can resolve
- * 
+ *
  * Security model:
  * - BTF type checking ensures only valid struct fields are accessed
  * - Only scalar types (int, u64, pointers) are returned
  * - Complex types (strings, nested structs) are rejected
  * - Array bounds are checked automatically
- * 
+ *
  * This is safe because:
  * 1. BTF prevents access to non-existent fields
  * 2. Type validation prevents reading arbitrary memory
@@ -80,7 +97,7 @@ struct ks_result {
  * @struct_name: Name of struct type (e.g., "cgroup", "mem_cgroup")
  * @schema: User-provided field list
  * @result: Output buffer for TLV-encoded data
- * 
+ *
  * Returns: 0 on success, negative error code on failure
  */
 int ks_query_struct(void *struct_addr, const char *struct_name,
@@ -114,7 +131,7 @@ void ks_cache_print_stats(struct seq_file *m);
  * @cgrp: Target cgroup
  * @schema: User-provided field list
  * @result: Output buffer for TLV-encoded data
- * 
+ *
  * Returns: 0 on success, negative error code on failure
  */
 static inline int ks_query_cgroup(struct cgroup *cgrp, const struct ks_schema *schema,
