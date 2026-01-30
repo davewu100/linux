@@ -31,13 +31,13 @@ echo "✅ CONFIG_KSERIAL is enabled"
 echo "✅ /sys/fs/cgroup/memory.stat.ks exists"
 echo
 
-# Compile comparison tool
-echo "Compiling performance comparison tool..."
-gcc -O2 -Wall -o compare_memstat_perf compare_memstat_perf.c || {
-    echo "❌ Compilation failed"
+# Build performance tools using Makefile.perf
+echo "Building performance tools..."
+make -f Makefile.perf all || {
+    echo "❌ Build failed"
     exit 1
 }
-echo "✅ Compilation successful"
+echo "✅ Build complete"
 echo
 echo "=============================================="
 echo
@@ -98,4 +98,4 @@ echo
 echo "✅ Test completed!"
 
 # Cleanup
-rm -f compare_memstat_perf
+make -f Makefile.perf clean
