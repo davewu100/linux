@@ -4527,7 +4527,7 @@ int memory_stat_show(struct seq_file *m, void *v)
 #ifdef CONFIG_KSERIAL
 /**
  * memory_stat_ks_show - kserial optimized memory.stat (for performance demo)
- * 
+ *
  * This outputs the SAME fields as memory_stat_show for fair comparison:
  * - Same field count (all fields from memory_stats[])
  * - Same data (using memcg_page_state_output())
@@ -4539,13 +4539,13 @@ static int memory_stat_ks_show(struct seq_file *m, void *v)
 	struct mem_cgroup *memcg = mem_cgroup_from_seq(m);
 	u64 start_ns, end_ns;
 	int i;
-	
+
 	/* Start timing */
 	start_ns = ktime_get_ns();
-	
+
 	/* Flush stats to get accurate values */
 	mem_cgroup_flush_stats(memcg);
-	
+
 	/* Output all memory_stats fields (same as memory.stat) */
 	for (i = 0; i < ARRAY_SIZE(memory_stats); i++) {
 		u64 size;
@@ -4587,15 +4587,15 @@ static int memory_stat_ks_show(struct seq_file *m, void *v)
 			   vm_event_name(memcg_vm_event_stat[i]),
 			   memcg_events(memcg, memcg_vm_event_stat[i]));
 	}
-	
+
 	/* End timing */
 	end_ns = ktime_get_ns();
-	
+
 	/* Add profiling info as comment */
 	seq_printf(m, "\n# kserial_time_ns %llu\n", end_ns - start_ns);
 	seq_printf(m, "# Optimized: Direct seq_printf (no seq_buf overhead)\n");
 	seq_printf(m, "# Traditional: seq_buf + kmalloc + seq_puts\n");
-	
+
 	return 0;
 }
 #endif /* CONFIG_KSERIAL */
@@ -4636,7 +4636,60 @@ static int memory_numa_stat_show(struct seq_file *m, void *v)
 
 	return 0;
 }
-#endif
+
+#ifdef CONFIG_KSERIAL
+/**
+ * memory_numa_stat_ks_show - kserial optimized memory.numa_stat (for performance demo)
+ *
+ * This outputs the SAME fields as memory_numa_stat_show for fair comparison:
+ * - Same field count (all per-node memory_stats[])
+ * - Same data (using lruvec_page_state_output())
+ * - Optimization: Direct seq_printf (no intermediate buffer)
+ * - Built-in profiling
+ */
+static int memory_numa_stat_ks_show(struct seq_file *m, void *v)
+{
+	struct mem_cgroup *memcg = mem_cgroup_from_seq(m);
+	u64 start_ns, end_ns;
+	int i;
+
+	/* Start timing */
+	start_ns = ktime_get_ns();
+
+	/* Flush stats to get accurate values */
+	mem_cgroup_flush_stats(memcg);
+
+	/* Output all NUMA memory_stats fields (same as memory.numa_stat) */
+	for (i = 0; i < ARRAY_SIZE(memory_stats); i++) {
+		int nid;
+
+		if (memory_stats[i].idx >= NR_VM_NODE_STAT_ITEMS)
+			continue;
+
+		seq_printf(m, "%s", memory_stats[i].name);
+		for_each_node_state(nid, N_MEMORY) {
+			u64 size;
+			struct lruvec *lruvec;
+
+			lruvec = mem_cgroup_lruvec(memcg, NODE_DATA(nid));
+			size = lruvec_page_state_output(lruvec,
+							memory_stats[i].idx);
+			seq_printf(m, " N%d=%llu", nid, size);
+		}
+		seq_putc(m, '\n');
+	}
+
+	/* End timing */
+	end_ns = ktime_get_ns();
+
+	/* Add profiling info as comment */
+	seq_printf(m, "\n# kserial_time_ns %llu\n", end_ns - start_ns);
+	seq_printf(m, "# Optimized: Direct seq_printf (no seq_buf overhead)\n");
+
+	return 0;
+}
+#endif /* CONFIG_KSERIAL */
+#endif /* CONFIG_NUMA */
 
 static int memory_oom_group_show(struct seq_file *m, void *v)
 {
@@ -4747,6 +4800,12 @@ static struct cftype memory_files[] = {
 		.name = "numa_stat",
 		.seq_show = memory_numa_stat_show,
 	},
+#ifdef CONFIG_KSERIAL
+	{
+		.name = "numa_stat.ks",
+		.seq_show = memory_numa_stat_ks_show,
+	},
+#endif
 #endif
 	{
 		.name = "oom.group",
