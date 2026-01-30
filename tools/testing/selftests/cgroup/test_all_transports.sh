@@ -83,14 +83,14 @@ else
     if [ -f kserial_uring_example ]; then
         rm -f kserial_uring_example
     fi
-    
+
     gcc -O2 -Wall -o kserial_uring_example kserial_uring_example.c \
         $(pkg-config --cflags --libs liburing) \
         -I../../../include || {
         echo "❌ Failed to compile io_uring example"
         exit 1
     }
-    
+
     sudo ./kserial_uring_example
     echo
 fi

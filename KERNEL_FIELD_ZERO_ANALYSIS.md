@@ -114,14 +114,14 @@ static int ks_get_memcg_stat_index(const char *stat_name)
         const char *name;
         unsigned int idx;
     } memory_stats[];
-    
+
     // 查找字段
     for (i = 0; memory_stats[i].name; i++) {
         if (!strcmp(memory_stats[i].name, stat_name)) {
             return memcg_stats_index(memory_stats[i].idx);
         }
     }
-    
+
     return -ENOENT;
 }
 ```
@@ -144,7 +144,7 @@ static u64 ks_read_memcg_stat(struct mem_cgroup *memcg, const char *field_name)
     } else if (!strcmp(field_name, "@pagetables")) {
         return memcg_page_state(memcg, NR_PAGETABLE);
     }
-    
+
     return 0;
 }
 ```
@@ -197,7 +197,7 @@ static int ks_query_memcg_stat_field(struct mem_cgroup *memcg,
         *out_value = memcg_page_state(memcg, NR_PAGETABLE) * PAGE_SIZE;
         return 0;
     }
-    
+
     return -ENOENT;
 }
 

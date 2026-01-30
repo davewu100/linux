@@ -79,40 +79,40 @@ static int ks_proc_uring_cmd(struct io_uring_cmd *ioucmd, unsigned int issue_fla
     void __user *user_buf;
     u32 cmd_op;
     ssize_t ret;
-    
+
     if (!ctx)
         return -EINVAL;
-    
+
     /* Get command from SQE */
     cmd_op = ioucmd->cmd_len[0];
-    
+
     switch (cmd_op) {
     case KS_URING_CMD_READ:
         /* Standard read: generate + copy */
         user_buf = u64_to_user_ptr(READ_ONCE(ioucmd->sqe->addr));
-        
+
         ret = ks_generate_data(ctx, ctx->shared_buffer, ctx->buffer_size);
         if (ret < 0)
             goto out;
-        
+
         if (copy_to_user(user_buf, ctx->shared_buffer, ret)) {
             ret = -EFAULT;
             goto out;
         }
         break;
-        
+
     case KS_URING_CMD_REFRESH:
         /* For mmap users: refresh without copy */
         ret = ks_generate_data(ctx, ctx->shared_buffer, ctx->buffer_size);
         if (ret < 0)
             goto out;
         break;
-        
+
     default:
         ret = -EINVAL;
         goto out;
     }
-    
+
 out:
     /* Complete async */
     io_uring_cmd_done(ioucmd, ret, 0, issue_flags);
@@ -160,10 +160,10 @@ int main() {
     struct io_uring_cqe *cqe;
     char buffers[1000][4096];
     int fd;
-    
+
     // 1. 初始化 io_uring
     io_uring_queue_init(1000, &ring, 0);
-    
+
     // 2. 订阅字段（一次性设置）
     fd = open("/proc/kserial", O_RDWR);
     struct ks_subscribe sub = {
@@ -175,7 +175,7 @@ int main() {
     strcpy(sub.fields[1], "vmstats.state[15]");  // file
     strcpy(sub.fields[2], "vmstats.state[37]");  // kernel
     ioctl(fd, KS_IOCTL_SUBSCRIBE, &sub);
-    
+
     // 3. 批量提交 1000 个查询（1 次 syscall）
     for (int i = 0; i < 1000; i++) {
         sqe = io_uring_get_sqe(&ring);
@@ -185,7 +185,7 @@ int main() {
         sqe->user_data = i;
     }
     io_uring_submit(&ring);  // ← 只有这 1 次 syscall！
-    
+
     // 4. 批量等待完成（1 次 syscall）
     for (int i = 0; i < 1000; i++) {
         io_uring_wait_cqe(&ring, &cqe);
@@ -195,7 +195,7 @@ int main() {
                cqe->user_data, values[0], values[1], values[2]);
         io_uring_cqe_seen(&ring, cqe);
     }
-    
+
     // 清理
     io_uring_queue_exit(&ring);
     close(fd);

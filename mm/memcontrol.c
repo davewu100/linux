@@ -4524,6 +4524,82 @@ int memory_stat_show(struct seq_file *m, void *v)
 	return 0;
 }
 
+#ifdef CONFIG_KSERIAL
+/**
+ * memory_stat_ks_show - kserial optimized memory.stat (for performance demo)
+ * 
+ * This outputs the SAME fields as memory_stat_show for fair comparison:
+ * - Same field count (all fields from memory_stats[])
+ * - Same data (using memcg_page_state_output())
+ * - Optimization: Direct seq_printf (no seq_buf intermediate buffer)
+ * - Built-in profiling
+ */
+static int memory_stat_ks_show(struct seq_file *m, void *v)
+{
+	struct mem_cgroup *memcg = mem_cgroup_from_seq(m);
+	u64 start_ns, end_ns;
+	int i;
+	
+	/* Start timing */
+	start_ns = ktime_get_ns();
+	
+	/* Flush stats to get accurate values */
+	mem_cgroup_flush_stats(memcg);
+	
+	/* Output all memory_stats fields (same as memory.stat) */
+	for (i = 0; i < ARRAY_SIZE(memory_stats); i++) {
+		u64 size;
+
+#ifdef CONFIG_HUGETLB_PAGE
+		if (unlikely(memory_stats[i].idx == NR_HUGETLB) &&
+			!memcg_accounts_hugetlb())
+			continue;
+#endif
+		size = memcg_page_state_output(memcg, memory_stats[i].idx);
+		seq_printf(m, "%s %llu\n", memory_stats[i].name, size);
+
+		if (unlikely(memory_stats[i].idx == NR_SLAB_UNRECLAIMABLE_B)) {
+			size += memcg_page_state_output(memcg,
+							NR_SLAB_RECLAIMABLE_B);
+			seq_printf(m, "slab %llu\n", size);
+		}
+	}
+
+	/* Accumulated memory events (same as memory.stat) */
+	seq_printf(m, "pgscan %lu\n",
+		   memcg_events(memcg, PGSCAN_KSWAPD) +
+		   memcg_events(memcg, PGSCAN_DIRECT) +
+		   memcg_events(memcg, PGSCAN_PROACTIVE) +
+		   memcg_events(memcg, PGSCAN_KHUGEPAGED));
+	seq_printf(m, "pgsteal %lu\n",
+		   memcg_events(memcg, PGSTEAL_KSWAPD) +
+		   memcg_events(memcg, PGSTEAL_DIRECT) +
+		   memcg_events(memcg, PGSTEAL_PROACTIVE) +
+		   memcg_events(memcg, PGSTEAL_KHUGEPAGED));
+
+	for (i = 0; i < ARRAY_SIZE(memcg_vm_event_stat); i++) {
+#ifdef CONFIG_MEMCG_V1
+		if (memcg_vm_event_stat[i] == PGPGIN ||
+		    memcg_vm_event_stat[i] == PGPGOUT)
+			continue;
+#endif
+		seq_printf(m, "%s %lu\n",
+			   vm_event_name(memcg_vm_event_stat[i]),
+			   memcg_events(memcg, memcg_vm_event_stat[i]));
+	}
+	
+	/* End timing */
+	end_ns = ktime_get_ns();
+	
+	/* Add profiling info as comment */
+	seq_printf(m, "\n# kserial_time_ns %llu\n", end_ns - start_ns);
+	seq_printf(m, "# Optimized: Direct seq_printf (no seq_buf overhead)\n");
+	seq_printf(m, "# Traditional: seq_buf + kmalloc + seq_puts\n");
+	
+	return 0;
+}
+#endif /* CONFIG_KSERIAL */
+
 #ifdef CONFIG_NUMA
 static inline unsigned long lruvec_page_state_output(struct lruvec *lruvec,
 						     int item)
@@ -4660,6 +4736,12 @@ static struct cftype memory_files[] = {
 		.name = "stat",
 		.seq_show = memory_stat_show,
 	},
+#ifdef CONFIG_KSERIAL
+	{
+		.name = "stat.ks",
+		.seq_show = memory_stat_ks_show,
+	},
+#endif
 #ifdef CONFIG_NUMA
 	{
 		.name = "numa_stat",
