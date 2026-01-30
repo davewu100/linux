@@ -51,7 +51,7 @@ void example_mmap_zero_copy(void)
 	printf("=== Example 1: mmap Zero-Copy Access ===\n\n");
 	
 	/* Open */
-	fd = open("/proc/kserial", O_RDWR);
+	fd = open("/dev/kserial", O_RDWR);
 	if (fd < 0) {
 		perror("open");
 		return;
@@ -176,7 +176,7 @@ void example_realtime_monitoring(void)
 	
 	printf("\n=== Example 3: Real-time Monitoring (10 iterations) ===\n\n");
 	
-	fd = open("/proc/kserial", O_RDWR);
+	fd = open("/dev/kserial", O_RDWR);
 	if (fd < 0) {
 		perror("open");
 		return;

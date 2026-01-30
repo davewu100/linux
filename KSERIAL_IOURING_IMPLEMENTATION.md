@@ -64,7 +64,7 @@ io_uring 传输层是 kserial 的第三种高性能传输方式，专为**批量
 ### 1. 添加 io_uring 头文件
 
 ```c
-// kernel/kserial_procfs.c
+// kernel/kserial_chrdev.c
 #include <linux/io_uring.h>
 ```
 
@@ -165,7 +165,7 @@ int main() {
     io_uring_queue_init(1000, &ring, 0);
 
     // 2. 订阅字段（一次性设置）
-    fd = open("/proc/kserial", O_RDWR);
+    fd = open("/dev/kserial", O_RDWR);
     struct ks_subscribe sub = {
         .struct_name = "mem_cgroup",
         .nr_fields = 3,
@@ -302,7 +302,7 @@ sudo apt install liburing-dev
 
 # 加载 kserial 模块
 sudo insmod kernel/kserial.ko
-sudo insmod kernel/kserial_procfs.ko
+sudo insmod kernel/kserial_chrdev.ko
 ```
 
 ### 编译示例
@@ -335,7 +335,7 @@ sudo ./test_all_transports.sh
 ```
 === kserial io_uring Example ===
 
-[1] Opening /proc/kserial...
+[1] Opening /dev/kserial...
 [2] Subscribing to mem_cgroup fields...
     ✓ Subscribed (cached BTF lookups)
 
@@ -378,7 +378,7 @@ Throughput gain:      10.5M queries/sec (io_uring) vs 111K (read)
 ### 内核侧
 
 **文件修改**：
-1. `kernel/kserial_procfs.c`
+1. `kernel/kserial_chrdev.c`
    - 添加 `#include <linux/io_uring.h>`
    - 实现 `ks_proc_uring_cmd()`
    - 注册 `.proc_uring_cmd` 回调

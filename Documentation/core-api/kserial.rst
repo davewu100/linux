@@ -22,7 +22,7 @@ k-serial consists of three main components:
 1. **UAPI Layer** (``include/linux/kserial.h``): Shared structures between
    kernel and userspace
 2. **Core Engine** (``kernel/kserial.c``): BTF-based field resolution
-3. **Interface** (``kernel/kserial_procfs.c``): procfs interface
+3. **Interface** (``kernel/kserial_chrdev.c``): procfs interface
 
 Data Flow
 ---------
@@ -32,7 +32,7 @@ Data Flow
     Userspace                 Kernel
     =========                 ======
     
-    ks_schema                 /proc/kserial
+    ks_schema                 /dev/kserial
         |                            |
         | write()                    v
         |                     ks_proc_write()
@@ -584,4 +584,4 @@ See Also
 - :ref:`kserial <kserial>`: k-serial admin guide
 - ``include/linux/kserial.h``: UAPI header
 - ``kernel/kserial.c``: Implementation
-- ``kernel/kserial_procfs.c``: procfs interface
+- ``kernel/kserial_chrdev.c``: procfs interface

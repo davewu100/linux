@@ -34,7 +34,7 @@ Current Implementation
 
 The current implementation (Phase 2) supports:
 
-- struct cgroup queries via ``/proc/kserial``
+- struct cgroup queries via ``/dev/kserial``
 - Simple fields: ``level``, ``nr_descendants``, etc.
 - Nested fields: ``self.id``, ``dom_cgrp.level``, etc.
 - Pointer dereferencing with NULL safety
@@ -47,7 +47,7 @@ Basic Usage
 Interface
 ---------
 
-k-serial provides a procfs interface at ``/proc/kserial`` that accepts
+k-serial provides a procfs interface at ``/dev/kserial`` that accepts
 queries for the current process's cgroup.
 
 Query Process
@@ -55,7 +55,7 @@ Query Process
 
 1. **Open** the interface file::
 
-    int fd = open("/proc/kserial", O_RDWR);
+    int fd = open("/dev/kserial", O_RDWR);
 
 2. **Write** a schema specifying which fields to query::
 
@@ -134,7 +134,7 @@ Query simple fields from current cgroup::
     };
     
     int main() {
-        int fd = open("/proc/kserial", O_RDWR);
+        int fd = open("/dev/kserial", O_RDWR);
         if (fd < 0) {
             perror("open");
             return 1;
@@ -312,10 +312,10 @@ Common Issues
 Interface not available
 ~~~~~~~~~~~~~~~~~~~~~~~
 
-If ``/proc/kserial`` doesn't exist::
+If ``/dev/kserial`` doesn't exist::
 
-    $ ls /proc/kserial
-    ls: cannot access '/proc/kserial': No such file or directory
+    $ ls /dev/kserial
+    ls: cannot access '/dev/kserial': No such file or directory
 
 **Solution**: Ensure k-serial kernel module is loaded. Check kernel
 configuration for ``CONFIG_KSERIAL=y``.
@@ -325,8 +325,8 @@ Permission denied
 
 ::
 
-    $ cat /proc/kserial
-    cat: /proc/kserial: Permission denied
+    $ cat /dev/kserial
+    cat: /dev/kserial: Permission denied
 
 **Solution**: The interface requires read/write permissions. Ensure
 appropriate permissions or run with sufficient privileges.

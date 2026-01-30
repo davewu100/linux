@@ -50,7 +50,7 @@ static int test_should_fail(const char *test_name, const char *field_name)
 	printf("Test: %-50s ", test_name);
 	fflush(stdout);
 
-	fd = open("/proc/kserial", O_RDWR);
+	fd = open("/dev/kserial", O_RDWR);
 	if (fd < 0) {
 		printf("✗ (can't open procfs)\n");
 		return 0;
@@ -89,8 +89,8 @@ int main(void)
 
 	printf("=== k-serial Security Test Suite ===\n\n");
 
-	if (access("/proc/kserial", F_OK) != 0) {
-		fprintf(stderr, "Error: /proc/kserial not found\n");
+	if (access("/dev/kserial", F_OK) != 0) {
+		fprintf(stderr, "Error: /dev/kserial not found\n");
 		return 1;
 	}
 

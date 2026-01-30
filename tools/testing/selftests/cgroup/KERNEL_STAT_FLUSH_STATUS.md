@@ -15,9 +15,9 @@ The `kernel` memory statistic (MEMCG_KMEM) from k-serial consistently returns 0,
    - This callback calls `mem_cgroup_stat_aggregate()` to merge per-CPU counters into `vmstats->state[]`.
 
 3. **Current Implementation**:
-   - Modified `kserial_procfs.c` to call `mem_cgroup_flush_stats()` before querying.
+   - Modified `kserial_chrdev.c` to call `mem_cgroup_flush_stats()` before querying.
    - Additionally, directly invokes `css_rstat_flush` callback for all CPUs to bypass threshold checks.
-   - Code location: `kernel/kserial_procfs.c:172-183`
+   - Code location: `kernel/kserial_chrdev.c:172-183`
 
 4. **Test Results**:
    - `anon`, `file`, and `kernel_stack` statistics match correctly.
@@ -26,7 +26,7 @@ The `kernel` memory statistic (MEMCG_KMEM) from k-serial consistently returns 0,
 
 ### Code Changes
 
-**File**: `kernel/kserial_procfs.c`
+**File**: `kernel/kserial_chrdev.c`
 
 ```c
 /* Force flush stats before reading to ensure we get up-to-date values */
@@ -74,7 +74,7 @@ The `kernel` memory statistic (MEMCG_KMEM) from k-serial consistently returns 0,
   - `mod_memcg_state()`: Update memcg stats (line 689)
   - `flush_nmi_stats()`: NMI-safe stat flush (line 4044)
 
-- `kernel/kserial_procfs.c`: k-serial procfs interface
+- `kernel/kserial_chrdev.c`: k-serial procfs interface
   - `ks_proc_write()`: Query handler with stat flush (line 172-183)
 
 - `tools/testing/selftests/cgroup/verify_memcg_stats.sh`: Test script

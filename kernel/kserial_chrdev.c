@@ -61,8 +61,63 @@ struct ks_context {
 	spinlock_t buffer_lock;   /* Protect concurrent access */
 };
 
+/* Per-file private data - supports both modes */
+struct ks_chrdev_data {
+	struct ks_schema *schema;       /* Legacy mode */
+	struct ks_result *result;       /* Legacy mode */
+	bool result_ready;              /* Legacy mode */
+
+	struct ks_context *ctx;         /* Subscribe-publish mode */
+};
+
 extern int ks_query_struct(void *struct_addr, const char *struct_name,
 			   const struct ks_schema *schema, struct ks_result *result);
+
+/**
+ * ks_get_target_task - Get target task by PID with permission checks
+ * @pid: Target PID (0 = current task)
+ *
+ * Returns: Task pointer on success, ERR_PTR on error
+ */
+static struct task_struct *ks_get_target_task(u32 pid)
+{
+	struct task_struct *task;
+
+	/* Default: current process */
+	if (pid == 0)
+		return current;
+
+	rcu_read_lock();
+
+	/* Find task by PID */
+	task = find_task_by_vpid(pid);
+	if (!task) {
+		rcu_read_unlock();
+		pr_warn("k-serial: PID %u not found\n", pid);
+		return ERR_PTR(-ESRCH);
+	}
+
+	/* Permission check: same UID or CAP_SYS_ADMIN */
+	if (!uid_eq(current_uid(), task_uid(task)) &&
+	    !capable(CAP_SYS_ADMIN)) {
+		rcu_read_unlock();
+		pr_warn("k-serial: permission denied for PID %u\n", pid);
+		return ERR_PTR(-EPERM);
+	}
+
+	/* PID namespace check */
+	if (task_active_pid_ns(current) != task_active_pid_ns(task)) {
+		rcu_read_unlock();
+		pr_warn("k-serial: PID namespace mismatch for PID %u\n", pid);
+		return ERR_PTR(-EINVAL);
+	}
+
+	/* Increase reference count to prevent task from disappearing */
+	get_task_struct(task);
+	rcu_read_unlock();
+
+	return task;
+}
 
 /**
  * ks_generate_data - Generate query data (transport-agnostic)
@@ -134,18 +189,139 @@ static ssize_t ks_generate_data(struct ks_context *ctx, void *buf, size_t buf_si
 }
 
 /**
+ * ks_chrdev_write - Accept schema from userspace (Legacy mode)
+ *
+ * User writes struct ks_schema to specify which fields to query
+ */
+static ssize_t ks_chrdev_write(struct file *file, const char __user *buf,
+			       size_t count, loff_t *ppos)
+{
+	struct ks_chrdev_data *data = file->private_data;
+	struct task_struct *target_task = NULL;
+	void *target_struct = NULL;
+	const char *struct_name;
+	bool need_put_task = false;
+	int ret;
+
+	if (count != sizeof(struct ks_schema))
+		return -EINVAL;
+
+	/* Copy schema from userspace */
+	if (copy_from_user(data->schema, buf, sizeof(*data->schema)))
+		return -EFAULT;
+
+	/* Determine target struct type (default to "cgroup" if not specified) */
+	if (data->schema->struct_name[0] == '\0') {
+		strncpy(data->schema->struct_name, "cgroup", KS_FIELD_NAME_LEN - 1);
+	}
+	struct_name = data->schema->struct_name;
+
+	/* Get target task (may be current or specified PID) */
+	target_task = ks_get_target_task(data->schema->target_pid);
+	if (IS_ERR(target_task)) {
+		return PTR_ERR(target_task);
+	}
+
+	/* Remember to release task reference if not current */
+	if (target_task != current)
+		need_put_task = true;
+
+	/* Get target struct based on type */
+	rcu_read_lock();
+
+	if (!strcmp(struct_name, "cgroup")) {
+		/* Query target task's cgroup */
+		target_struct = task_dfl_cgroup(target_task);
+		if (!target_struct) {
+			rcu_read_unlock();
+			if (need_put_task)
+				put_task_struct(target_task);
+			pr_warn("k-serial: failed to get cgroup for PID %u\n",
+				data->schema->target_pid);
+			return -ENOENT;
+		}
+	} else if (!strcmp(struct_name, "mem_cgroup")) {
+		/* Query target task's mem_cgroup */
+		target_struct = mem_cgroup_from_task(target_task);
+		if (!target_struct) {
+			rcu_read_unlock();
+			if (need_put_task)
+				put_task_struct(target_task);
+			pr_warn("k-serial: failed to get mem_cgroup for PID %u\n",
+				data->schema->target_pid);
+			return -ENOENT;
+		}
+		/* Force flush stats before reading */
+		{
+			struct mem_cgroup *memcg = (struct mem_cgroup *)target_struct;
+			struct cgroup_subsys_state *css = &memcg->css;
+			int cpu;
+
+			mem_cgroup_flush_stats(memcg);
+			if (css->ss && css->ss->css_rstat_flush) {
+				for_each_possible_cpu(cpu) {
+					css->ss->css_rstat_flush(css, cpu);
+				}
+			}
+		}
+	} else if (!strcmp(struct_name, "task_struct")) {
+		/* Query target task itself */
+		target_struct = target_task;
+	} else {
+		rcu_read_unlock();
+		if (need_put_task)
+			put_task_struct(target_task);
+		pr_warn("k-serial: unsupported struct type '%s'\n", struct_name);
+		return -EINVAL;
+	}
+
+	/* Query the struct using k-serial */
+	ret = ks_query_struct(target_struct, struct_name, data->schema, data->result);
+	rcu_read_unlock();
+
+	/* Release task reference if we acquired one */
+	if (need_put_task)
+		put_task_struct(target_task);
+
+	if (ret) {
+		pr_warn("k-serial: query of struct '%s' failed: %d\n", struct_name, ret);
+		return ret;
+	}
+
+	data->result_ready = true;
+	*ppos = 0; /* Reset read position */
+
+	return count;
+}
+
+/**
  * ks_chrdev_open - Allocate per-file context
  */
 static int ks_chrdev_open(struct inode *inode, struct file *file)
 {
-	struct ks_context *ctx;
+	struct ks_chrdev_data *data;
 	
-	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
-	if (!ctx)
+	data = kzalloc(sizeof(*data), GFP_KERNEL);
+	if (!data)
 		return -ENOMEM;
 	
-	spin_lock_init(&ctx->buffer_lock);
-	file->private_data = ctx;
+	/* Allocate legacy mode buffers */
+	data->schema = kzalloc(sizeof(*data->schema), GFP_KERNEL);
+	data->result = kzalloc(sizeof(*data->result), GFP_KERNEL);
+	
+	/* Allocate subscribe context */
+	data->ctx = kzalloc(sizeof(*data->ctx), GFP_KERNEL);
+	
+	if (!data->schema || !data->result || !data->ctx) {
+		kfree(data->schema);
+		kfree(data->result);
+		kfree(data->ctx);
+		kfree(data);
+		return -ENOMEM;
+	}
+	
+	spin_lock_init(&data->ctx->buffer_lock);
+	file->private_data = data;
 	
 	return 0;
 }
@@ -155,7 +331,8 @@ static int ks_chrdev_open(struct inode *inode, struct file *file)
  */
 static long ks_chrdev_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
-	struct ks_context *ctx = file->private_data;
+	struct ks_chrdev_data *data = file->private_data;
+	struct ks_context *ctx = data->ctx;
 	struct ks_subscribe *sub;
 	ssize_t ret;
 	
@@ -359,6 +536,7 @@ static const struct file_operations ks_chrdev_fops = {
 	.owner          = THIS_MODULE,
 	.open           = ks_chrdev_open,
 	.read           = ks_chrdev_read,
+	.write          = ks_chrdev_write,  /* Legacy mode support */
 	.unlocked_ioctl = ks_chrdev_ioctl,
 	.mmap           = ks_chrdev_mmap,
 	.uring_cmd      = ks_chrdev_uring_cmd,

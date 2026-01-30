@@ -104,14 +104,14 @@ else
     echo "   ✓ Modules loaded successfully"
 fi
 
-# 5. Verify /proc/kserial
+# 5. Verify /dev/kserial
 echo ""
-echo "5. Verifying /proc/kserial..."
-if [ -e /proc/kserial ]; then
-    echo "   ✓ /proc/kserial exists"
-    ls -l /proc/kserial
+echo "5. Verifying /dev/kserial..."
+if [ -e /dev/kserial ]; then
+    echo "   ✓ /dev/kserial exists"
+    ls -l /dev/kserial
 else
-    echo "   ✗ /proc/kserial does not exist"
+    echo "   ✗ /dev/kserial does not exist"
     echo "   Check dmesg:"
     dmesg | tail -10 | grep -i kserial || echo "   No related logs"
     exit 1

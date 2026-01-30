@@ -19,7 +19,7 @@ fi
 # Unload old modules (if exist)
 echo ""
 echo "1. Unloading old modules (if exist)..."
-sudo rmmod kserial_procfs 2>/dev/null || true
+sudo rmmod kserial_chrdev 2>/dev/null || true
 sudo rmmod kserial_block 2>/dev/null || true
 sudo rmmod kserial 2>/dev/null || true
 echo "✓ Done"
@@ -53,7 +53,7 @@ make -j$(nproc) M=kernel modules 2>&1 | tee /tmp/kserial_build.log | \
 # Find compiled modules
 KSERIAL_KO=$(find kernel -name "kserial.ko" -type f 2>/dev/null | head -1)
 KSERIAL_BLOCK_KO=$(find kernel -name "kserial_block.ko" -type f 2>/dev/null | head -1)
-KSERIAL_PROCFS_KO=$(find kernel -name "kserial_procfs.ko" -type f 2>/dev/null | head -1)
+KSERIAL_PROCFS_KO=$(find kernel -name "kserial_chrdev.ko" -type f 2>/dev/null | head -1)
 
 if [ -z "$KSERIAL_PROCFS_KO" ]; then
     echo ""
@@ -81,7 +81,7 @@ if [ -n "$KSERIAL_BLOCK_KO" ]; then
     sudo insmod "$KSERIAL_BLOCK_KO" 2>&1 | grep -v "File exists" || true
 fi
 
-echo "  Loading kserial_procfs.ko..."
+echo "  Loading kserial_chrdev.ko..."
 sudo insmod "$KSERIAL_PROCFS_KO" 2>&1 || {
     echo "  ⚠ Load failed, check errors:"
     dmesg | tail -10
@@ -93,13 +93,13 @@ echo "✓ Modules loaded successfully"
 # Verify
 echo ""
 echo "5. Verifying..."
-if [ -e /proc/kserial ]; then
-    echo "✓ /proc/kserial exists"
+if [ -e /dev/kserial ]; then
+    echo "✓ /dev/kserial exists"
     echo ""
     echo "Loaded modules:"
     lsmod | grep kserial || echo "  (not shown, but loaded)"
 else
-    echo "⚠ /proc/kserial does not exist"
+    echo "⚠ /dev/kserial does not exist"
     echo "Recent dmesg output:"
     dmesg | tail -10 | grep -i kserial || dmesg | tail -5
 fi

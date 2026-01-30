@@ -59,10 +59,10 @@ int main(int argc, char *argv[])
 		strncpy(schema.field_names[i], argv[i + 1], KS_FIELD_NAME_LEN - 1);
 	}
 	
-	// Open /proc/kserial
-	fd = open("/proc/kserial", O_RDWR);
+	// Open /dev/kserial
+	fd = open("/dev/kserial", O_RDWR);
 	if (fd < 0) {
-		perror("open /proc/kserial");
+		perror("open /dev/kserial");
 		return 1;
 	}
 	

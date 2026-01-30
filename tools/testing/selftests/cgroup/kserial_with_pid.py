@@ -92,9 +92,9 @@ def parse_array_range(field: str) -> Tuple[str, Optional[int], Optional[int], bo
     return (field, None, None, False)
 
 def query_kserial(schema: KSerialSchema) -> bytes:
-    """Query /proc/kserial with schema"""
+    """Query /dev/kserial with schema"""
     try:
-        with open('/proc/kserial', 'r+b') as f:
+        with open('/dev/kserial', 'r+b') as f:
             # Write schema
             f.write(schema.pack())
             f.flush()
@@ -103,7 +103,7 @@ def query_kserial(schema: KSerialSchema) -> bytes:
             result = f.read(KS_MAX_OUTPUT_SIZE)
             return result
     except FileNotFoundError:
-        print("Error: /proc/kserial not found", file=sys.stderr)
+        print("Error: /dev/kserial not found", file=sys.stderr)
         print("Is the k-serial module loaded?", file=sys.stderr)
         sys.exit(1)
     except PermissionError:

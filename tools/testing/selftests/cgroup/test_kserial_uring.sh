@@ -32,7 +32,7 @@ if ! lsmod | grep -q kserial; then
     sudo insmod ../../../../kernel/kserial_cache.ko || true
     sudo insmod ../../../../kernel/kserial_string.ko || true
     sudo insmod ../../../../kernel/kserial_block.ko || true
-    sudo insmod ../../../../kernel/kserial_procfs.ko || true
+    sudo insmod ../../../../kernel/kserial_chrdev.ko || true
 fi
 
 if ! lsmod | grep -q kserial; then

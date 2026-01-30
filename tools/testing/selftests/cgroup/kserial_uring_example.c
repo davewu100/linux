@@ -60,7 +60,7 @@ int main(void)
 	fd = open("/dev/kserial", O_RDWR);
 	if (fd < 0) {
 		perror("open /dev/kserial");
-		printf("    Note: Use /dev/kserial for io_uring (not /proc/kserial)\n");
+		printf("    Note: Use /dev/kserial for io_uring (not /dev/kserial)\n");
 		return 1;
 	}
 	

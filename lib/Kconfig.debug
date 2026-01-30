@@ -3450,13 +3450,14 @@ endmenu # "Rust"
 
 config KSERIAL
 	tristate "k-serial: BTF-based field query interface"
-	depends on PROC_FS
 	depends on BPF_SYSCALL
 	help
 	  Enable k-serial, a BTF-based interface for querying kernel structure
 	  fields by name at runtime. This provides:
-	    - /proc/kserial: Dynamic field query interface
-	    - /dev/kserial: Character device with io_uring support
+	    - /dev/kserial: Unified character device interface
+	      * Legacy mode: write() schema + read() result (TLV format)
+	      * Subscribe mode: ioctl() once + read() multiple times
+	      * Supports read(), write(), mmap, and io_uring transports
 	    - /sys/fs/cgroup/*/memory.stat.ks: Optimized cgroup stats demo
 
 	  k-serial uses BTF (BPF Type Format) to find fields by name, making
@@ -3467,7 +3468,7 @@ config KSERIAL
 	  will be built-in regardless of module choice (it's independent).
 
 	  Performance: 2.48x faster than traditional memory.stat for cgroup
-	  monitoring. Supports read(), mmap, and io_uring transports.
+	  monitoring. io_uring provides 90x performance boost for batch queries.
 
 	  If unsure, say Y.
 

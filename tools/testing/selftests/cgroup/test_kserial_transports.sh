@@ -11,8 +11,8 @@ echo "========================================"
 echo
 
 # Check if kserial is available
-if [ ! -e /proc/kserial ]; then
-    echo "ERROR: /proc/kserial not found"
+if [ ! -e /dev/kserial ]; then
+    echo "ERROR: /dev/kserial not found"
     echo "Please load kserial kernel modules first"
     exit 1
 fi

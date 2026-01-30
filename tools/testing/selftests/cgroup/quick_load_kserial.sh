@@ -12,7 +12,7 @@ echo ""
 # Check module files
 KSERIAL_BLOCK_KO="/lib/modules/$(uname -r)/kernel/kernel/kserial_block.ko"
 KSERIAL_KO="/lib/modules/$(uname -r)/kernel/kernel/kserial.ko"
-KSERIAL_PROCFS_KO="/lib/modules/$(uname -r)/kernel/kernel/kserial_procfs.ko"
+KSERIAL_PROCFS_KO="/lib/modules/$(uname -r)/kernel/kernel/kserial_chrdev.ko"
 
 # Load in dependency order
 echo "1. Loading kserial_block.ko..."
@@ -33,21 +33,21 @@ else
 fi
 
 echo ""
-echo "3. Loading kserial_procfs.ko..."
-if lsmod | grep -q kserial_procfs; then
+echo "3. Loading kserial_chrdev.ko..."
+if lsmod | grep -q kserial_chrdev; then
     echo "   ✓ Already loaded"
 else
-    sudo modprobe kserial_procfs || sudo insmod "$KSERIAL_PROCFS_KO"
+    sudo modprobe kserial_chrdev || sudo insmod "$KSERIAL_PROCFS_KO"
     echo "   ✓ Loaded successfully"
 fi
 
 echo ""
 echo "4. Verifying..."
-if [ -e /proc/kserial ]; then
-    echo "   ✓ /proc/kserial exists"
+if [ -e /dev/kserial ]; then
+    echo "   ✓ /dev/kserial exists"
     lsmod | grep kserial
 else
-    echo "   ✗ /proc/kserial does not exist"
+    echo "   ✗ /dev/kserial does not exist"
     echo "   Error messages:"
     sudo dmesg | tail -10 | grep -i kserial
     exit 1

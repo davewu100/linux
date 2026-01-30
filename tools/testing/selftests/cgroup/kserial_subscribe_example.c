@@ -49,7 +49,7 @@ void example_subscribe_with_descriptor(void)
 	printf("=== Example 1: Subscribe with Descriptor ===\n\n");
 
 	/* Open kserial device */
-	fd = open("/proc/kserial", O_RDWR);
+	fd = open("/dev/kserial", O_RDWR);
 	if (fd < 0) {
 		perror("open");
 		return;
@@ -159,7 +159,7 @@ void example_high_frequency_monitoring(void)
 
 	printf("=== Example 2: High-Frequency Monitoring ===\n\n");
 
-	fd = open("/proc/kserial", O_RDWR);
+	fd = open("/dev/kserial", O_RDWR);
 	if (fd < 0) {
 		perror("open");
 		return;

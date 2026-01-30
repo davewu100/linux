@@ -10,9 +10,9 @@ cd "$SCRIPT_DIR"
 echo "=== kserial Security Test ==="
 echo ""
 
-# 1. Check if /proc/kserial exists
-if [ ! -e /proc/kserial ]; then
-    echo "Error: /proc/kserial not found"
+# 1. Check if /dev/kserial exists
+if [ ! -e /dev/kserial ]; then
+    echo "Error: /dev/kserial not found"
     echo ""
     echo "Please load kserial modules first. Use one of the following methods:"
     echo ""
@@ -32,7 +32,7 @@ if [ ! -e /proc/kserial ]; then
     echo ""
     echo "Verify modules are loaded:"
     echo "  lsmod | grep kserial"
-    echo "  ls -la /proc/kserial"
+    echo "  ls -la /dev/kserial"
     exit 1
 fi
 

@@ -37,15 +37,15 @@ struct ks_result {
 	uint8_t  data[KS_MAX_OUTPUT_SIZE];
 };
 
-/* Query mem_cgroup via /proc/kserial */
+/* Query mem_cgroup via /dev/kserial */
 static int query_memcg(const struct ks_schema *schema, struct ks_result *result)
 {
 	int fd;
 	ssize_t n;
 
-	fd = open("/proc/kserial", O_RDWR);
+	fd = open("/dev/kserial", O_RDWR);
 	if (fd < 0) {
-		perror("open /proc/kserial");
+		perror("open /dev/kserial");
 		return -1;
 	}
 
@@ -123,8 +123,8 @@ int main(void)
 	printf("k-serial mem_cgroup Query Test\n");
 	printf("=================================\n\n");
 
-	if (access("/proc/kserial", F_OK) != 0) {
-		fprintf(stderr, "Error: /proc/kserial not found\n");
+	if (access("/dev/kserial", F_OK) != 0) {
+		fprintf(stderr, "Error: /dev/kserial not found\n");
 		fprintf(stderr, "Make sure k-serial module is loaded\n");
 		return 1;
 	}

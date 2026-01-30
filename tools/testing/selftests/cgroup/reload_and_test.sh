@@ -39,11 +39,11 @@ echo ""
 
 # Verify
 echo "3. Verifying modules..."
-if [ -e /proc/kserial ]; then
-    echo "   ✓ /proc/kserial exists"
+if [ -e /dev/kserial ]; then
+    echo "   ✓ /dev/kserial exists"
     lsmod | grep kserial
 else
-    echo "   ✗ /proc/kserial does not exist"
+    echo "   ✗ /dev/kserial does not exist"
     echo "   Recent dmesg output:"
     dmesg | tail -10 | grep -i kserial || dmesg | tail -5
     exit 1

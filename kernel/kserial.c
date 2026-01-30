@@ -564,7 +564,7 @@ int ks_query_struct(void *struct_addr, const char *struct_name,
 	return 0;
 }
 
-/* Export for use by kserial_procfs module */
+/* Export for use by kserial_chrdev module */
 EXPORT_SYMBOL_GPL(ks_query_struct);
 
 /* Module metadata - only when built as module */

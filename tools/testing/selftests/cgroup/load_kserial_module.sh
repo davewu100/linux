@@ -12,17 +12,17 @@ echo ""
 # Check if module files exist
 KSERIAL_KO="kernel/kserial.ko"
 KSERIAL_BLOCK_KO="kernel/kserial_block.ko"
-KSERIAL_PROCFS_KO="kernel/kserial_procfs.ko"
+KSERIAL_CHRDEV_KO="kernel/kserial_chrdev.ko"
 
-if [ ! -f "$KSERIAL_KO" ] || [ ! -f "$KSERIAL_PROCFS_KO" ]; then
+if [ ! -f "$KSERIAL_KO" ] || [ ! -f "$KSERIAL_CHRDEV_KO" ]; then
     echo "⚠ Module files not found, please compile first:"
-    echo "   make -j\$(nproc) kernel/kserial.ko kernel/kserial_procfs.ko kernel/kserial_block.ko"
+    echo "   make -j\$(nproc) kernel/kserial.ko kernel/kserial_chrdev.ko kernel/kserial_block.ko"
     exit 1
 fi
 
 # Unload old modules (if exist)
 echo "1. Unloading old modules (if exist)..."
-sudo rmmod kserial_procfs 2>/dev/null || true
+sudo rmmod kserial_chrdev 2>/dev/null || true
 sudo rmmod kserial_block 2>/dev/null || true
 sudo rmmod kserial 2>/dev/null || true
 echo "   ✓ Done"
@@ -61,18 +61,18 @@ if [ -f "$KSERIAL_KO" ]; then
     fi
 fi
 
-# Finally load kserial_procfs.ko (depends on kserial)
-if [ -f "$KSERIAL_PROCFS_KO" ]; then
-    if lsmod | grep -q kserial_procfs; then
-        echo "   ✓ kserial_procfs already loaded"
+# Finally load kserial_chrdev.ko (depends on kserial)
+if [ -f "$KSERIAL_CHRDEV_KO" ]; then
+    if lsmod | grep -q kserial_chrdev; then
+        echo "   ✓ kserial_chrdev already loaded"
     else
-        echo "   Loading kserial_procfs.ko..."
-        sudo insmod "$KSERIAL_PROCFS_KO" 2>&1 || {
+        echo "   Loading kserial_chrdev.ko..."
+        sudo insmod "$KSERIAL_CHRDEV_KO" 2>&1 || {
             echo "   ⚠ Load failed, check errors:"
             sudo dmesg | tail -10 | grep -i kserial
             exit 1
         }
-        echo "   ✓ kserial_procfs loaded successfully"
+        echo "   ✓ kserial_chrdev loaded successfully"
     fi
 fi
 
@@ -81,13 +81,13 @@ echo "   ✓ Modules loaded successfully"
 # Verify
 echo ""
 echo "3. Verifying..."
-if [ -e /proc/kserial ]; then
-    echo "   ✓ /proc/kserial exists"
+if [ -e /dev/kserial ]; then
+    echo "   ✓ /dev/kserial exists"
     echo ""
     echo "Loaded modules:"
     lsmod | grep kserial || echo "   (not shown, but loaded)"
 else
-    echo "   ⚠ /proc/kserial does not exist"
+    echo "   ⚠ /dev/kserial does not exist"
     echo "   Recent dmesg output:"
     dmesg | tail -10 | grep -i kserial || dmesg | tail -5
 fi
