@@ -79,6 +79,7 @@ struct ks_result {
 
 #include <linux/btf.h>
 #include <linux/cgroup.h>
+#include <linux/rhashtable.h>
 
 /*
  * No whitelist - k-serial allows querying any field that BTF can resolve
@@ -117,8 +118,27 @@ int ks_query_string_field(const struct btf *btf, void *field_addr,
 			   u32 field_type_id, char *out_buf, u32 buf_size);
 
 /* Cache management */
-struct ks_cache_entry;
-struct ks_cache_stats;
+struct ks_cache_entry {
+	struct rhash_head node;
+	char struct_name[KS_FIELD_NAME_LEN];
+	char field_path[KS_FIELD_NAME_LEN];
+	u32 offset;
+	u32 size;
+	u32 type_id;
+	u8 flags;
+	u64 created_ns;
+	u64 hits;
+	u64 last_access_ns;
+};
+
+struct ks_cache_stats {
+	u64 lookups;
+	u64 hits;
+	u64 misses;
+	u64 inserts;
+	u64 evictions;
+	u64 invalidations;
+};
 
 int ks_cache_init(void);
 void ks_cache_cleanup(void);
@@ -129,6 +149,10 @@ int ks_cache_insert(const char *struct_name, const char *field_path,
 void ks_cache_invalidate(void);
 void ks_cache_get_stats(struct ks_cache_stats *stats);
 void ks_cache_print_stats(struct seq_file *m);
+
+/* Debugfs interface */
+int ks_debug_init(void);
+void ks_debug_cleanup(void);
 
 /**
  * ks_query_cgroup - Query fields from a cgroup using BTF (legacy wrapper)

@@ -464,8 +464,10 @@ int ks_query_struct(void *struct_addr, const char *struct_name,
 		int array_index;
 		void *field_addr;
 		u32 field_type_id;
+		u32 field_offset = 0;
 		u64 value;
 		int field_size;
+		struct ks_cache_entry *cache_entry = NULL;
 
 		/* Parse array syntax (e.g., "subsys[0]") */
 		ret = ks_parse_array_syntax(field_path, base_name, &array_index);
@@ -474,6 +476,26 @@ int ks_query_struct(void *struct_addr, const char *struct_name,
 				field_path);
 			return ret;
 		}
+
+		/* Try cache lookup first (only for non-array paths) */
+		if (array_index < 0) {
+			cache_entry = ks_cache_lookup(struct_name, base_name);
+			if (cache_entry) {
+				/* Cache hit! Use cached offset and type */
+				field_offset = cache_entry->offset;
+				field_type_id = cache_entry->type_id;
+				field_size = cache_entry->size;
+				field_addr = struct_addr + field_offset;
+
+				pr_debug("k-serial: cache HIT for %s.%s (offset=%u)\n",
+					 struct_name, base_name, field_offset);
+				goto read_value;
+			}
+			pr_debug("k-serial: cache MISS for %s.%s\n",
+				 struct_name, base_name);
+		}
+
+		/* Cache miss or array access - resolve via BTF */
 
 		/* No whitelist - rely on BTF type checking for security
 		 * BTF will reject:
@@ -493,6 +515,9 @@ int ks_query_struct(void *struct_addr, const char *struct_name,
 			/* Continue with next field instead of failing */
 			continue;
 		}
+
+		/* Calculate offset for caching */
+		field_offset = (u32)(field_addr - struct_addr);
 
 		/* Debug: print field address and offset */
 		pr_debug("k-serial: field '%s' resolved to addr=%p (offset=%ld from base=%p)\n",
@@ -529,6 +554,13 @@ int ks_query_struct(void *struct_addr, const char *struct_name,
 			continue;
 		}
 
+		/* Cache the resolved field info (only for non-array, non-pointer paths) */
+		if (array_index < 0 && !cache_entry) {
+			ks_cache_insert(struct_name, base_name, field_offset,
+					field_size, field_type_id, 0);
+		}
+
+read_value:
 		/* Read value (zero-extend for smaller types, sign-extend for signed types) */
 		value = 0;
 		if (field_size > sizeof(value)) {

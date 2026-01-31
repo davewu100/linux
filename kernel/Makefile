@@ -124,6 +124,7 @@ obj-$(CONFIG_KSERIAL) += kserial_chrdev.o
 obj-$(CONFIG_KSERIAL) += kserial_block.o
 obj-$(CONFIG_KSERIAL) += kserial_cache.o
 obj-$(CONFIG_KSERIAL) += kserial_string.o
+obj-$(CONFIG_KSERIAL) += kserial_debug.o
 obj-$(CONFIG_KCSAN) += kcsan/
 obj-$(CONFIG_SHADOW_CALL_STACK) += scs.o
 obj-$(CONFIG_HAVE_STATIC_CALL) += static_call.o
