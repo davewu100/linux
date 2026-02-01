@@ -12,6 +12,7 @@
 #include <linux/slab.h>
 #include <linux/cgroup.h>
 #include <linux/memcontrol.h>
+#include <linux/memcontrol_kserial.h>
 #include <linux/sched.h>
 #include <linux/uaccess.h>
 #include <linux/pid.h>
@@ -63,15 +64,28 @@ struct ks_context {
 
 /* Per-file private data - supports both modes */
 struct ks_chrdev_data {
-	struct ks_schema *schema;       /* Legacy mode */
-	struct ks_result *result;       /* Legacy mode */
-	bool result_ready;              /* Legacy mode */
+	struct ks_schema *schema;       /* write mode */
+	struct ks_result *result;       /* write mode */
+	bool result_ready;              /* write mode */
 
 	struct ks_context *ctx;         /* Subscribe-publish mode */
 };
 
 extern int ks_query_struct(void *struct_addr, const char *struct_name,
 			   const struct ks_schema *schema, struct ks_result *result);
+
+#if defined(CONFIG_KSERIAL)
+/* Register with memcontrol so memory.stat.ks works when kserial is a module */
+static int memcg_kserial_query(struct mem_cgroup *memcg, struct ks_schema *schema,
+			       struct ks_result *result)
+{
+	return ks_query_struct(memcg, "mem_cgroup", schema, result);
+}
+
+static const struct memcg_kserial_ops memcg_kserial_ops_instance = {
+	.query = memcg_kserial_query,
+};
+#endif
 
 /**
  * ks_get_target_task - Get target task by PID with permission checks
@@ -189,7 +203,7 @@ static ssize_t ks_generate_data(struct ks_context *ctx, void *buf, size_t buf_si
 }
 
 /**
- * ks_chrdev_write - Accept schema from userspace (Legacy mode)
+ * ks_chrdev_write - Accept schema from userspace (write mode)
  *
  * User writes struct ks_schema to specify which fields to query
  */
@@ -305,7 +319,7 @@ static int ks_chrdev_open(struct inode *inode, struct file *file)
 	if (!data)
 		return -ENOMEM;
 
-	/* Allocate legacy mode buffers */
+	/* Allocate write-mode buffers (schema/result) */
 	data->schema = kzalloc(sizeof(*data->schema), GFP_KERNEL);
 	data->result = kzalloc(sizeof(*data->result), GFP_KERNEL);
 
@@ -327,18 +341,101 @@ static int ks_chrdev_open(struct inode *inode, struct file *file)
 }
 
 /**
+ * ks_chrdev_run_subscribe_query - Run BTF query from ctx (Subscribe mode)
+ * Build schema from ctx->fields, get target struct, ks_query_struct, set result_ready.
+ */
+static int ks_chrdev_run_subscribe_query(struct ks_chrdev_data *data)
+{
+	struct ks_context *ctx = data->ctx;
+	struct ks_schema *schema = data->schema;
+	struct task_struct *target_task = NULL;
+	void *target_struct = NULL;
+	const char *struct_name;
+	bool need_put_task = false;
+	int i, ret;
+
+	memset(schema, 0, sizeof(*schema));
+	schema->nr_fields = ctx->nr_fields;
+	schema->target_pid = ctx->pid;
+	strncpy(schema->struct_name, ctx->struct_name, KS_FIELD_NAME_LEN - 1);
+	if (schema->struct_name[0] == '\0')
+		strncpy(schema->struct_name, "cgroup", KS_FIELD_NAME_LEN - 1);
+	struct_name = schema->struct_name;
+
+	for (i = 0; i < ctx->nr_fields && i < KS_MAX_FIELDS; i++)
+		strncpy(schema->field_names[i], ctx->fields[i], KS_FIELD_NAME_LEN - 1);
+
+	target_task = ks_get_target_task(ctx->pid);
+	if (IS_ERR(target_task))
+		return PTR_ERR(target_task);
+	if (target_task != current)
+		need_put_task = true;
+
+	rcu_read_lock();
+	if (!strcmp(struct_name, "cgroup")) {
+		target_struct = task_dfl_cgroup(target_task);
+		if (!target_struct) {
+			rcu_read_unlock();
+			if (need_put_task)
+				put_task_struct(target_task);
+			return -ENOENT;
+		}
+	} else if (!strcmp(struct_name, "mem_cgroup")) {
+		target_struct = mem_cgroup_from_task(target_task);
+		if (!target_struct) {
+			rcu_read_unlock();
+			if (need_put_task)
+				put_task_struct(target_task);
+			return -ENOENT;
+		}
+		{
+			struct mem_cgroup *memcg = (struct mem_cgroup *)target_struct;
+			struct cgroup_subsys_state *css = &memcg->css;
+			int cpu;
+
+			mem_cgroup_flush_stats(memcg);
+			if (css->ss && css->ss->css_rstat_flush) {
+				for_each_possible_cpu(cpu) {
+					css->ss->css_rstat_flush(css, cpu);
+				}
+			}
+		}
+	} else if (!strcmp(struct_name, "task_struct")) {
+		target_struct = target_task;
+	} else {
+		rcu_read_unlock();
+		if (need_put_task)
+			put_task_struct(target_task);
+		return -EINVAL;
+	}
+
+	ret = ks_query_struct(target_struct, struct_name, schema, data->result);
+	rcu_read_unlock();
+	if (need_put_task)
+		put_task_struct(target_task);
+
+	if (ret)
+		return ret;
+
+	data->result_ready = true;
+	return 0;
+}
+
+/**
  * ks_chrdev_ioctl - Handle subscribe/unsubscribe/refresh
+ *
+ * Subscribe mode: ioctl(SUBSCRIBE) sets field list and runs one BTF query,
+ * result is cached; read() returns it. ioctl(REFRESH) re-runs query for fresh data.
  */
 static long ks_chrdev_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	struct ks_chrdev_data *data = file->private_data;
 	struct ks_context *ctx = data->ctx;
 	struct ks_subscribe *sub;
-	ssize_t ret;
+	int ret;
 
 	switch (cmd) {
 	case KS_IOCTL_SUBSCRIBE:
-		/* Allocate temporary buffer */
 		sub = kzalloc(sizeof(*sub), GFP_KERNEL);
 		if (!sub)
 			return -ENOMEM;
@@ -348,7 +445,6 @@ static long ks_chrdev_ioctl(struct file *file, unsigned int cmd, unsigned long a
 			return -EFAULT;
 		}
 
-		/* Copy subscription parameters */
 		memcpy(ctx->struct_name, sub->struct_name, sizeof(ctx->struct_name));
 		ctx->nr_fields = sub->nr_fields;
 		ctx->pid = sub->pid;
@@ -358,19 +454,13 @@ static long ks_chrdev_ioctl(struct file *file, unsigned int cmd, unsigned long a
 		for (int i = 0; i < sub->nr_fields && i < 32; i++)
 			memcpy(ctx->fields[i], sub->fields[i], sizeof(ctx->fields[i]));
 
-		/* TODO: Resolve BTF offsets and cache them */
-		/* This would call ks_query_struct() once to populate field_cache[] */
-
-		/* Allocate shared buffer */
-		ctx->buffer_size = PAGE_SIZE;
-		ctx->shared_buffer = (void *)__get_free_pages(GFP_KERNEL, 0);
-		if (!ctx->shared_buffer) {
-			kfree(sub);
-			return -ENOMEM;
-		}
+		/* Run one BTF query and cache result; read() will return it */
+		ret = ks_chrdev_run_subscribe_query(data);
+		kfree(sub);
+		if (ret)
+			return ret;
 
 		ctx->subscribed = true;
-		kfree(sub);
 		return 0;
 
 	case KS_IOCTL_UNSUBSCRIBE:
@@ -381,10 +471,7 @@ static long ks_chrdev_ioctl(struct file *file, unsigned int cmd, unsigned long a
 		if (!ctx->subscribed)
 			return -EINVAL;
 
-		ret = ks_generate_data(ctx, ctx->shared_buffer, ctx->buffer_size);
-		if (ret > 0)
-			ctx->data_len = ret;
-
+		ret = ks_chrdev_run_subscribe_query(data);
 		return ret;
 
 	default:
@@ -394,29 +481,58 @@ static long ks_chrdev_ioctl(struct file *file, unsigned int cmd, unsigned long a
 
 /**
  * ks_chrdev_read - Standard read() transport
+ *
+ * Write mode: After write(schema), returns data->result (TLV-encoded).
+ * Subscribe mode: ioctl(SUBSCRIBE) then read() returns filtered data.
  */
 static ssize_t ks_chrdev_read(struct file *file, char __user *buf,
 			      size_t count, loff_t *ppos)
 {
-	struct ks_context *ctx = file->private_data;
+	struct ks_chrdev_data *data = file->private_data;
+	struct ks_context *ctx = data->ctx;
 	ssize_t ret;
 
+	/* Write mode: write(schema) was done, return result */
+	if (data->result_ready) {
+		size_t result_size = sizeof(data->result->total_len) + data->result->total_len;
+
+		if (result_size > count)
+			result_size = count;
+		if (result_size == 0)
+			return 0;
+
+		if (copy_to_user(buf, data->result, result_size))
+			return -EFAULT;
+
+		data->result_ready = false;
+		return result_size;
+	}
+
+	/* Subscribe mode: each read() re-runs BTF query and returns result */
 	if (!ctx->subscribed)
 		return -EINVAL;
 
-	/* Generate data */
-	ret = ks_generate_data(ctx, ctx->shared_buffer, ctx->buffer_size);
-	if (ret < 0)
+	ret = ks_chrdev_run_subscribe_query(data);
+	if (ret)
 		return ret;
 
-	if (count > ret)
-		count = ret;
+	/* Return cached result (same as write-mode path) */
+	if (!data->result_ready)
+		return 0;
+	{
+		size_t result_size = sizeof(data->result->total_len) + data->result->total_len;
 
-	/* Copy to userspace */
-	if (copy_to_user(buf, ctx->shared_buffer, count))
-		return -EFAULT;
+		if (result_size > count)
+			result_size = count;
+		if (result_size == 0)
+			return 0;
 
-	return count;
+		if (copy_to_user(buf, data->result, result_size))
+			return -EFAULT;
+
+		data->result_ready = false;
+		return result_size;
+	}
 }
 
 /**
@@ -536,7 +652,7 @@ static const struct file_operations ks_chrdev_fops = {
 	.owner          = THIS_MODULE,
 	.open           = ks_chrdev_open,
 	.read           = ks_chrdev_read,
-	.write          = ks_chrdev_write,  /* Legacy mode support */
+	.write          = ks_chrdev_write,  /* write mode: write(schema) then read() */
 	.unlocked_ioctl = ks_chrdev_ioctl,
 	.mmap           = ks_chrdev_mmap,
 	.uring_cmd      = ks_chrdev_uring_cmd,
@@ -571,6 +687,12 @@ static int __init ks_chrdev_init(void)
 		return ret;
 	}
 
+#if defined(CONFIG_KSERIAL)
+	ret = memcg_register_kserial(&memcg_kserial_ops_instance);
+	if (ret)
+		pr_warn("kserial: memcg stat.ks registration failed (non-fatal): %d\n", ret);
+#endif
+
 	/* Initialize debugfs interface */
 	ret = ks_debug_init();
 	if (ret) {
@@ -584,6 +706,9 @@ static int __init ks_chrdev_init(void)
 
 static void __exit ks_chrdev_exit(void)
 {
+#if defined(CONFIG_KSERIAL)
+	memcg_unregister_kserial();
+#endif
 	ks_debug_cleanup();
 	misc_deregister(&ks_miscdev);
 	ks_cache_cleanup();

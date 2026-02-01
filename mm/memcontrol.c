@@ -4526,9 +4526,11 @@ int memory_stat_show(struct seq_file *m, void *v)
 
 #ifdef CONFIG_KSERIAL
 
-/* Include kserial headers for BTF query */
-#include <linux/kserial.h>
+/* Registration API so stat.ks works when KSERIAL=y (built-in) or KSERIAL=m (module) */
+#include <linux/memcontrol_kserial.h>
 #include <linux/list.h>
+
+static const struct memcg_kserial_ops *memcg_kserial_ops;
 
 /* Per-file context for memory.stat.ks */
 struct ks_memcg_context {
@@ -4640,8 +4642,12 @@ static int memory_stat_ks_show_btf(struct seq_file *m,
 	/* Setup result buffer */
 	ctx->result.total_len = 0;
 
-	/* Query via BTF */
-	ret = ks_query_struct(memcg, "mem_cgroup", &ctx->schema, &ctx->result);
+	/* Query via BTF (ops set by kserial when built-in or when module loads) */
+	if (!memcg_kserial_ops || !memcg_kserial_ops->query) {
+		seq_puts(m, "# kserial not available (load kserial module if CONFIG_KSERIAL=m)\n");
+		return -ENODEV;
+	}
+	ret = memcg_kserial_ops->query(memcg, &ctx->schema, &ctx->result);
 	if (ret < 0) {
 		seq_printf(m, "# Error: BTF query failed: %d\n", ret);
 		return ret;
@@ -4863,6 +4869,22 @@ static void memory_stat_ks_release(struct kernfs_open_file *of)
 	}
 	mutex_unlock(&ks_memcg_ctx_lock);
 }
+
+int memcg_register_kserial(const struct memcg_kserial_ops *ops)
+{
+	if (!ops || !ops->query)
+		return -EINVAL;
+	memcg_kserial_ops = ops;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(memcg_register_kserial);
+
+void memcg_unregister_kserial(void)
+{
+	memcg_kserial_ops = NULL;
+}
+EXPORT_SYMBOL_GPL(memcg_unregister_kserial);
+
 #endif /* CONFIG_KSERIAL */
 
 #ifdef CONFIG_NUMA

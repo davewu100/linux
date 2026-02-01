@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  * k-serial real userspace test using procfs interface
- * 
+ *
  * This program actually communicates with the kernel via /dev/kserial
  */
 
@@ -48,34 +48,64 @@ struct ks_result {
 
 /**
  * parse_tlv_result - Parse and display TLV-encoded result
+ * Bounds-checks all reads to avoid segfault on malformed or kernel quirks.
  */
 static void parse_tlv_result(const struct ks_result *result,
 			      const struct ks_schema *schema)
 {
 	uint32_t offset = 0;
+	const uint32_t tlv_hdr = sizeof(struct ks_tlv);
 
 	printf("\n=== Query Results ===\n");
 	printf("Total data: %u bytes\n\n", result->total_len);
 
-	while (offset < result->total_len) {
+	if (schema->nr_fields == 0)
+		return;
+
+	{
+		uint32_t total = result->total_len;
+		if (total > KS_MAX_OUTPUT_SIZE)
+			total = KS_MAX_OUTPUT_SIZE;
+
+	while (offset < total) {
 		const struct ks_tlv *tlv;
 		uint64_t value = 0;
+		uint16_t len;
 
-		tlv = (const struct ks_tlv *)(result->data + offset);
-
-		if (tlv->field_id >= schema->nr_fields) {
-			fprintf(stderr, "ERROR: Invalid field_id %u\n",
-				tlv->field_id);
+		/* Must have at least TLV header in buffer */
+		if (offset + tlv_hdr > total) {
+			fprintf(stderr, "ERROR: TLV header past end at offset %u\n",
+				offset);
 			break;
 		}
 
-		/* Extract value */
-		memcpy(&value, tlv->data, tlv->len);
+		tlv = (const struct ks_tlv *)(result->data + offset);
+		len = tlv->len;
+
+		/* Sanity: field_id must be in schema; len capped to avoid overflow */
+		if (tlv->field_id >= schema->nr_fields) {
+			fprintf(stderr, "ERROR: Invalid field_id %u (nr_fields=%u)\n",
+				tlv->field_id, schema->nr_fields);
+			break;
+		}
+		if (len > 8) {
+			fprintf(stderr, "ERROR: TLV len %u > 8 at offset %u\n",
+				len, offset);
+			break;
+		}
+		if (offset + tlv_hdr + len > total) {
+			fprintf(stderr, "ERROR: TLV data past end (offset %u + %u + %u > %u)\n",
+				offset, (unsigned)tlv_hdr, len, total);
+			break;
+		}
+
+		/* Extract value (len already <= 8) */
+		memcpy(&value, tlv->data, len);
 
 		/* Display result */
 		printf("  %-25s = ", schema->field_names[tlv->field_id]);
-		
-		switch (tlv->len) {
+
+		switch (len) {
 		case 1:
 			printf("%u\n", (uint8_t)value);
 			break;
@@ -86,13 +116,14 @@ static void parse_tlv_result(const struct ks_result *result,
 			printf("%u\n", (uint32_t)value);
 			break;
 		case 8:
-			printf("%lu\n", value);
+			printf("%lu\n", (unsigned long)value);
 			break;
 		default:
-			printf("(%u bytes of data)\n", tlv->len);
+			printf("(%u bytes of data)\n", len);
 		}
 
-		offset += sizeof(struct ks_tlv) + tlv->len;
+		offset += tlv_hdr + len;
+	}
 	}
 	printf("\n");
 }
@@ -188,14 +219,14 @@ static void print_usage(const char *prog)
 	printf("Options:\n");
 	printf("  --pid PID              Target process PID (0 = current process, default: 0)\n");
 	printf("  --struct TYPE          Struct type: cgroup, mem_cgroup, task_struct (default: cgroup)\n");
-	
+
 	printf("\nCgroup fields:\n");
 	printf("  level                  - Cgroup depth in hierarchy\n");
 	printf("  max_depth              - Maximum depth allowed\n");
 	printf("  nr_descendants         - Number of descendant cgroups\n");
 	printf("  nr_dying_descendants   - Number of dying descendants\n");
 	printf("  max_descendants        - Maximum descendants allowed\n");
-	
+
 	printf("\nMem_cgroup fields (use --struct mem_cgroup):\n");
 	printf("  vmstats.state[14]      - anon (NR_ANON_MAPPED)\n");
 	printf("  vmstats.state[16]      - file (NR_FILE_PAGES)\n");
@@ -203,13 +234,13 @@ static void print_usage(const char *prog)
 	printf("  vmstats.state[23]      - kernel_stack (NR_KERNEL_STACK_KB)\n");
 	printf("  vmstats.state[19]      - shmem (NR_SHMEM)\n");
 	printf("  vmstats.state[24]      - pagetables (NR_PAGETABLE)\n");
-	
+
 	printf("\nExamples:\n");
 	printf("  %s level\n", prog);
 	printf("  %s --pid 1234 level nr_descendants\n", prog);
 	printf("  %s --struct mem_cgroup vmstats.state[14] vmstats.state[16]\n", prog);
 	printf("  %s --struct mem_cgroup --pid 1234 vmstats.state[34]\n", prog);
-	
+
 	printf("\nNotes:\n");
 	printf("  - Default: queries current process's cgroup\n");
 	printf("  - Requires k-serial kernel module loaded\n");

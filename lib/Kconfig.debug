@@ -3464,8 +3464,8 @@ config KSERIAL
 	  it version-resilient and type-safe.
 
 	  To compile this driver as a module, choose M here: the module
-	  will be called kserial. Note that /sys/fs/cgroup/*/memory.stat.ks
-	  will be built-in regardless of module choice (it's independent).
+	  will be called kserial. When loaded, /sys/fs/cgroup/*/memory.stat.ks
+	  and memory.numa_stat.ks become available without rebooting.
 
 	  Performance: 2.48x faster than traditional memory.stat for cgroup
 	  monitoring. io_uring provides 90x performance boost for batch queries.

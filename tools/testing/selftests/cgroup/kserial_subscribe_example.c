@@ -55,10 +55,10 @@ void example_subscribe_with_descriptor(void)
 		return;
 	}
 
-	/* Setup subscription */
+	/* Setup subscription (same fields as test_kserial_real) */
 	strncpy(sub.struct_name, "mem_cgroup", sizeof(sub.struct_name) - 1);
-	strncpy(sub.fields[0], "vmstats", sizeof(sub.fields[0]) - 1);
-	strncpy(sub.fields[1], "vmstats", sizeof(sub.fields[1]) - 1);
+	strncpy(sub.fields[0], "level", sizeof(sub.fields[0]) - 1);
+	strncpy(sub.fields[1], "nr_descendants", sizeof(sub.fields[1]) - 1);
 	sub.nr_fields = 2;
 	sub.pid = 0;  /* Current process */
 	sub.include_descriptor = 1;  /* Include descriptor in first read */
@@ -167,8 +167,8 @@ void example_high_frequency_monitoring(void)
 
 	/* Subscribe to 2 fields */
 	strncpy(sub.struct_name, "mem_cgroup", sizeof(sub.struct_name) - 1);
-	strncpy(sub.fields[0], "vmstats", sizeof(sub.fields[0]) - 1);
-	strncpy(sub.fields[1], "vmstats", sizeof(sub.fields[1]) - 1);
+	strncpy(sub.fields[0], "level", sizeof(sub.fields[0]) - 1);
+	strncpy(sub.fields[1], "nr_descendants", sizeof(sub.fields[1]) - 1);
 	sub.nr_fields = 2;
 	sub.pid = 0;
 	sub.include_descriptor = 0;  /* Skip descriptor */
