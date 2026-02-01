@@ -17,7 +17,7 @@ import argparse
 from typing import List, Tuple, Optional
 
 # k-serial UAPI constants
-KS_MAX_FIELDS = 16
+KS_MAX_FIELDS = 32
 KS_FIELD_NAME_LEN = 64
 KS_MAX_OUTPUT_SIZE = 4096
 

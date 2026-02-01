@@ -9,7 +9,7 @@
  * Supports nested paths (e.g. "vmstats.state[14]") and caches lookups.
  */
 
-#define KS_MAX_FIELDS 16
+#define KS_MAX_FIELDS 32
 #define KS_FIELD_NAME_LEN 64
 #define KS_MAX_OUTPUT_SIZE 4096
 #define KS_MAX_PATH_DEPTH 4

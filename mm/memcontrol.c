@@ -4613,8 +4613,8 @@ static int memory_stat_ks_show_btf(struct seq_file *m,
 	if (!cfg || cfg->schema.nr_fields == 0)
 		return -EINVAL;
 
-	if (cfg->schema.flags & KS_FLAG_FLUSH)
-		mem_cgroup_flush_stats(memcg);
+	/* Flush to match memory.stat freshness */
+	mem_cgroup_flush_stats(memcg);
 
 	nr = cfg->schema.nr_fields;
 
@@ -4884,9 +4884,14 @@ static int memory_numa_stat_ks_show(struct seq_file *m, void *v)
 		/* Filtered: only requested vmstats.state[N] rows */
 		for (i = 0; i < cfg->schema.nr_fields; i++) {
 			const char *fname = cfg->schema.field_names[i];
+			const char *p;
 
-			if (strncmp(fname, "vmstats.state[", 14) != 0 ||
-			    kstrtouint(fname + 14, 10, &state_idx) != 0)
+			if (strncmp(fname, "vmstats.state[", 14) != 0)
+				continue;
+			state_idx = 0;
+			for (p = fname + 14; *p >= '0' && *p <= '9'; p++)
+				state_idx = state_idx * 10 + (*p - '0');
+			if (p == fname + 14)
 				continue;
 			stat_item = memcg_ks_state_index_to_stat_item(state_idx);
 			if (stat_item < 0 || stat_item >= NR_VM_NODE_STAT_ITEMS)
