@@ -4627,7 +4627,7 @@ static int memory_stat_ks_show_legacy(struct seq_file *m, struct mem_cgroup *mem
  * BTF mode: Query specified fields using kserial BTF engine
  * This demonstrates true kserial capability
  */
-static int memory_stat_ks_show_btf(struct seq_file *m, 
+static int memory_stat_ks_show_btf(struct seq_file *m,
 				    struct mem_cgroup *memcg,
 				    struct ks_memcg_context *ctx)
 {
@@ -4671,7 +4671,7 @@ static int memory_stat_ks_show_btf(struct seq_file *m,
 		if (len == 8) {
 			/* 64-bit value */
 			value = *(u64 *)p;
-			seq_printf(m, "%s %llu\n", 
+			seq_printf(m, "%s %llu\n",
 				   ctx->schema.field_names[field_idx], value);
 		} else if (len == 4) {
 			/* 32-bit value */
@@ -4719,17 +4719,13 @@ static int memory_stat_ks_show(struct seq_file *m, void *v)
 	struct mem_cgroup *memcg = mem_cgroup_from_seq(m);
 	struct kernfs_open_file *of;
 	struct ks_memcg_context *ctx;
-	u64 start_ns, end_ns;
 	int ret;
 
 	/* Get kernfs_open_file from seq_file */
-	/* According to kernfs implementation, seq_file->private points to kernfs_open_file */
 	of = m->private;
 
 	/* Get context from list by kernfs_node ID */
 	ctx = of && of->kn ? ks_memcg_get_ctx(of) : NULL;
-
-	start_ns = ktime_get_ns();
 
 	/* Decide mode: BTF or legacy */
 	if (ctx && ctx->use_btf && ctx->field_list) {
@@ -4739,15 +4735,6 @@ static int memory_stat_ks_show(struct seq_file *m, void *v)
 		/* Legacy mode: show all fields */
 		ret = memory_stat_ks_show_legacy(m, memcg);
 	}
-
-	end_ns = ktime_get_ns();
-
-	/* Add profiling info */
-	seq_printf(m, "\n# kserial_time_ns %llu\n", end_ns - start_ns);
-	if (ctx && ctx->use_btf && ctx->field_list)
-		seq_printf(m, "# Mode: BTF query (%u fields)\n", ctx->schema.nr_fields);
-	else
-		seq_printf(m, "# Mode: Legacy (all fields)\n");
 
 	return ret;
 }
@@ -4928,16 +4915,10 @@ static int memory_numa_stat_show(struct seq_file *m, void *v)
 static int memory_numa_stat_ks_show(struct seq_file *m, void *v)
 {
 	struct mem_cgroup *memcg = mem_cgroup_from_seq(m);
-	u64 start_ns, end_ns;
 	int i;
 
-	/* Start timing */
-	start_ns = ktime_get_ns();
-
-	/* Flush stats to get accurate values */
 	mem_cgroup_flush_stats(memcg);
 
-	/* Output all NUMA memory_stats fields (same as memory.numa_stat) */
 	for (i = 0; i < ARRAY_SIZE(memory_stats); i++) {
 		int nid;
 
@@ -4956,13 +4937,6 @@ static int memory_numa_stat_ks_show(struct seq_file *m, void *v)
 		}
 		seq_putc(m, '\n');
 	}
-
-	/* End timing */
-	end_ns = ktime_get_ns();
-
-	/* Add profiling info as comment */
-	seq_printf(m, "\n# kserial_time_ns %llu\n", end_ns - start_ns);
-	seq_printf(m, "# Optimized: Direct seq_printf (no seq_buf overhead)\n");
 
 	return 0;
 }
