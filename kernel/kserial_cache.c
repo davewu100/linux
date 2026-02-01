@@ -105,6 +105,9 @@ struct ks_cache_entry *ks_cache_lookup(const char *struct_name,
 	struct ks_cache_entry key, *entry;
 	u64 now;
 
+	if (!struct_name || !field_path)
+		return NULL;
+
 	ks_stats.lookups++;
 
 	/* Prepare key */
@@ -122,7 +125,7 @@ struct ks_cache_entry *ks_cache_lookup(const char *struct_name,
 		return NULL;
 	}
 
-	/* Check TTL */
+	/* Check TTL (entry is valid under rcu_read_lock) */
 	now = ktime_get_ns();
 	if (now - entry->created_ns > KS_CACHE_TTL_NS) {
 		rcu_read_unlock();
@@ -164,8 +167,8 @@ int ks_cache_insert(const char *struct_name, const char *field_path,
 		return -ENOSPC;
 	}
 
-	/* Allocate new entry */
-	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
+	/* Allocate new entry; under memory pressure avoid triggering OOM */
+	entry = kzalloc(sizeof(*entry), GFP_KERNEL | __GFP_NORETRY);
 	if (!entry)
 		return -ENOMEM;
 
