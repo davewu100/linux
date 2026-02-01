@@ -4528,6 +4528,7 @@ int memory_stat_show(struct seq_file *m, void *v)
 
 /* Include kserial headers for BTF query */
 #include <linux/kserial.h>
+#include <linux/rhashtable.h>
 
 /* Per-file context for memory.stat.ks */
 struct ks_memcg_context {
@@ -4535,7 +4536,47 @@ struct ks_memcg_context {
 	struct ks_schema schema;  /* BTF query schema */
 	struct ks_result result;  /* Query results */
 	bool use_btf;		/* Use BTF query (true) or legacy (false) */
+	struct rhash_head node;  /* For hash table */
+	struct kernfs_node *kn;  /* Back pointer to kernfs_node (for reference) */
+	u64 kn_id;		/* Unique ID of kernfs_node (used as key) */
 };
+
+/* Hash table to store context by kernfs_node ID */
+static struct rhashtable ks_memcg_ctx_table;
+static DEFINE_MUTEX(ks_memcg_ctx_lock);
+
+/* Hash table parameters */
+static const struct rhashtable_params ks_memcg_ctx_params = {
+	.head_offset = offsetof(struct ks_memcg_context, node),
+	.key_offset = offsetof(struct ks_memcg_context, kn_id),
+	.key_len = sizeof(u64),
+	.automatic_shrinking = true,
+};
+
+/* Helper to get context from kernfs_open_file */
+static struct ks_memcg_context *ks_memcg_get_ctx(struct kernfs_open_file *of)
+{
+	struct ks_memcg_context *ctx;
+	u64 kn_id;
+
+	if (!of || !of->kn)
+		return NULL;
+
+	/* Use kernfs_node ID as key (unique and stable across all CPU cores) */
+	kn_id = of->kn->id;
+
+	/* Use RCU read lock for lookup (rhashtable requires RCU protection) */
+	rcu_read_lock();
+	ctx = rhashtable_lookup_fast(&ks_memcg_ctx_table, &kn_id,
+				     ks_memcg_ctx_params);
+	if (ctx)
+		pr_warn("memory.stat.ks: lookup success kn_id=%llu, ctx=%p\n", kn_id, ctx);
+	else
+		pr_warn("memory.stat.ks: lookup failed kn_id=%llu\n", kn_id);
+	rcu_read_unlock();
+
+	return ctx;
+}
 
 /*
  * Legacy mode: Show all fields using hardcoded access
@@ -4687,9 +4728,29 @@ static int memory_stat_ks_show_btf(struct seq_file *m,
 static int memory_stat_ks_show(struct seq_file *m, void *v)
 {
 	struct mem_cgroup *memcg = mem_cgroup_from_seq(m);
-	struct ks_memcg_context *ctx = m->private;
+	struct kernfs_open_file *of;
+	struct ks_memcg_context *ctx;
 	u64 start_ns, end_ns;
 	int ret;
+
+	/* Get kernfs_open_file from seq_file */
+	/* According to kernfs implementation, seq_file->private points to kernfs_open_file */
+	of = m->private;
+
+	/* Get context from hash table using kernfs_node */
+	if (!of) {
+		pr_warn("memory.stat.ks: of is NULL in show\n");
+		ctx = NULL;
+	} else if (!of->kn) {
+		pr_warn("memory.stat.ks: of->kn is NULL in show\n");
+		ctx = NULL;
+	} else {
+		ctx = ks_memcg_get_ctx(of);
+		if (!ctx) {
+			pr_warn("memory.stat.ks: ctx not found in show, kn=%p, kn_id=%llu\n",
+				of->kn, of->kn->id);
+		}
+	}
 
 	start_ns = ktime_get_ns();
 
@@ -4706,10 +4767,17 @@ static int memory_stat_ks_show(struct seq_file *m, void *v)
 
 	/* Add profiling info */
 	seq_printf(m, "\n# kserial_time_ns %llu\n", end_ns - start_ns);
-	if (ctx && ctx->use_btf)
+	if (ctx && ctx->use_btf && ctx->field_list) {
 		seq_printf(m, "# Mode: BTF query (%u fields)\n", ctx->schema.nr_fields);
-	else
+		seq_printf(m, "# Debug: ctx=%p, use_btf=%d, field_list=%p, kn=%p\n",
+			   ctx, ctx->use_btf, ctx->field_list, ctx->kn);
+	} else {
 		seq_printf(m, "# Mode: Legacy (all fields)\n");
+		if (of && of->kn)
+			seq_printf(m, "# Debug: of=%p, kn=%p, ctx=%p\n", of, of->kn, ctx);
+		else
+			seq_printf(m, "# Debug: of=%p, ctx=%p\n", of, ctx);
+	}
 
 	return ret;
 }
@@ -4726,14 +4794,51 @@ static ssize_t memory_stat_ks_write(struct kernfs_open_file *of,
 	struct ks_memcg_context *ctx;
 	char *field_list, *pos, *token;
 	int nr_fields = 0, i;
+	int ret;
 
 	/* Get or create context */
-	ctx = of->priv;
+	if (!of || !of->kn)
+		return -EINVAL;
+
+	ctx = ks_memcg_get_ctx(of);
 	if (!ctx) {
 		ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
 		if (!ctx)
 			return -ENOMEM;
-		of->priv = ctx;
+		ctx->kn = of->kn;
+		ctx->kn_id = of->kn->id;  /* Store unique ID as key */
+
+		pr_warn("memory.stat.ks: inserting ctx kn_id=%llu, kn=%p\n",
+			ctx->kn_id, ctx->kn);
+
+		/* Add to hash table */
+		mutex_lock(&ks_memcg_ctx_lock);
+		/* Insert using ctx->kn_id as key */
+		ret = rhashtable_insert_fast(&ks_memcg_ctx_table, &ctx->node,
+					     ks_memcg_ctx_params);
+		mutex_unlock(&ks_memcg_ctx_lock);
+
+		if (ret == 0) {
+			/* Verify insertion by immediate lookup (with RCU) */
+			struct ks_memcg_context *verify_ctx;
+			u64 verify_id = ctx->kn_id;
+			rcu_read_lock();
+			verify_ctx = rhashtable_lookup_fast(&ks_memcg_ctx_table, &verify_id,
+							     ks_memcg_ctx_params);
+			if (verify_ctx == ctx) {
+				pr_warn("memory.stat.ks: insertion verified, kn_id=%llu\n", verify_id);
+			} else {
+				pr_warn("memory.stat.ks: insertion verification failed! kn_id=%llu, verify_ctx=%p, ctx=%p\n",
+					verify_id, verify_ctx, ctx);
+			}
+			rcu_read_unlock();
+		}
+
+		if (ret) {
+			pr_warn("memory.stat.ks: insert failed kn_id=%llu, ret=%d\n", ctx->kn_id, ret);
+			kfree(ctx);
+			return ret;
+		}
 	}
 
 	/* Reset to legacy mode */
@@ -4791,16 +4896,21 @@ static ssize_t memory_stat_ks_write(struct kernfs_open_file *of,
 	ctx->field_list = field_list;
 	ctx->use_btf = true;
 
+	/* Debug: verify context was stored */
+	pr_warn("memory.stat.ks: stored context kn=%p, nr_fields=%d, use_btf=%d\n",
+		ctx->kn, ctx->schema.nr_fields, ctx->use_btf);
+
 	return nbytes;
 }
 
 /*
  * Open handler: initialize context on first open
+ * Note: We don't override of->priv, which is used by cgroup framework
  */
 static int memory_stat_ks_open(struct kernfs_open_file *of)
 {
 	/* Context will be allocated on write, or remains NULL for read-only */
-	of->priv = NULL;
+	/* We use hash table to store context, not of->priv */
 	return 0;
 }
 
@@ -4809,14 +4919,22 @@ static int memory_stat_ks_open(struct kernfs_open_file *of)
  */
 static void memory_stat_ks_release(struct kernfs_open_file *of)
 {
-	struct ks_memcg_context *ctx = of->priv;
+	struct ks_memcg_context *ctx;
 
+	/* Get context from hash table */
+	ctx = ks_memcg_get_ctx(of);
 	if (!ctx)
 		return;
 
+	/* Remove from hash table */
+	mutex_lock(&ks_memcg_ctx_lock);
+	rhashtable_remove_fast(&ks_memcg_ctx_table, &ctx->node,
+			       ks_memcg_ctx_params);
+	mutex_unlock(&ks_memcg_ctx_lock);
+
+	/* Free context */
 	kfree(ctx->field_list);
 	kfree(ctx);
-	of->priv = NULL;
 }
 #endif /* CONFIG_KSERIAL */
 
@@ -5532,6 +5650,14 @@ int __init mem_cgroup_init(void)
 
 	memcg_pn_cachep = KMEM_CACHE(mem_cgroup_per_node,
 				     SLAB_PANIC | SLAB_HWCACHE_ALIGN);
+
+#ifdef CONFIG_KSERIAL
+	/* Initialize hash table for memory.stat.ks context */
+	if (rhashtable_init(&ks_memcg_ctx_table, &ks_memcg_ctx_params) < 0) {
+		pr_err("mem_cgroup: failed to initialize ks_memcg_ctx_table\n");
+		return -ENOMEM;
+	}
+#endif
 
 	return 0;
 }
