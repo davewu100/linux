@@ -4609,6 +4609,9 @@ static int memory_stat_ks_show_btf(struct seq_file *m,
 	if (!cfg || cfg->schema.nr_fields == 0)
 		return -EINVAL;
 
+	if (cfg->schema.flags & KS_FLAG_FLUSH)
+		mem_cgroup_flush_stats(memcg);
+
 	cfg->result.total_len = 0;
 
 	ret = ks_query_struct(memcg, "mem_cgroup", &cfg->schema, &cfg->result);
@@ -4747,9 +4750,14 @@ static ssize_t memory_stat_ks_write(struct kernfs_open_file *of,
 				end--;
 			if (end > pos) {
 				size_t len = min_t(size_t, end - pos, KS_FIELD_NAME_LEN - 1);
-				memcpy(cfg->schema.field_names[i], pos, len);
-				cfg->schema.field_names[i][len] = '\0';
-				i++;
+				/* Optional "flush" token: flush stats before read */
+				if (len == 5 && memcmp(pos, "flush", 5) == 0)
+					cfg->schema.flags |= KS_FLAG_FLUSH;
+				else {
+					memcpy(cfg->schema.field_names[i], pos, len);
+					cfg->schema.field_names[i][len] = '\0';
+					i++;
+				}
 			}
 		}
 		if (token < buf + nbytes)
@@ -4769,7 +4777,6 @@ static ssize_t memory_stat_ks_write(struct kernfs_open_file *of,
 
 	strscpy(cfg->schema.struct_name, "mem_cgroup", KS_FIELD_NAME_LEN);
 	cfg->schema.nr_fields = i;
-	cfg->schema.flags = 0;
 	cfg->schema.target_pid = 0;
 
 	return nbytes;

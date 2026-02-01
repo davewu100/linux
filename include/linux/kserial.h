@@ -15,6 +15,7 @@
 #define KS_MAX_PATH_DEPTH 4
 
 #define KS_FLAG_ALLOW_NULL 0x01
+#define KS_FLAG_FLUSH      0x02  /* memcg: flush stats before read (fresh data) */
 
 struct ks_schema {
 	__u32 nr_fields;
