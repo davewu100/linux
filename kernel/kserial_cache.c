@@ -14,6 +14,11 @@
 #include <linux/spinlock.h>
 #include <linux/module.h>
 
+/* Forward declarations (used internally or via initcall) */
+int __init ks_cache_init(void);
+void ks_cache_cleanup(void);
+void ks_cache_invalidate(void);
+
 /* Cache configuration */
 #define KS_CACHE_MAX_ENTRIES  512
 #define KS_CACHE_TTL_NS       (60ULL * NSEC_PER_SEC)  /* 60 seconds */
@@ -28,8 +33,9 @@ static struct rhashtable ks_cache_ht;
 static DEFINE_SPINLOCK(ks_cache_lock);
 static atomic_t ks_cache_entries = ATOMIC_INIT(0);
 
-/* Cache statistics */
-static struct ks_cache_stats ks_stats;
+static struct {
+	u64 lookups, hits, misses, inserts, evictions, invalidations;
+} ks_stats;
 
 /* Hash table parameters */
 static const struct rhashtable_params ks_cache_params = {
@@ -57,7 +63,6 @@ int __init ks_cache_init(void)
 
 	return 0;
 }
-EXPORT_SYMBOL_GPL(ks_cache_init);
 
 /**
  * ks_cache_cleanup - Clean up the cache
@@ -94,7 +99,6 @@ void ks_cache_cleanup(void)
 			ks_stats.lookups, ks_stats.hits, ks_stats.misses);
 	}
 }
-EXPORT_SYMBOL_GPL(ks_cache_cleanup);
 
 /**
  * ks_cache_lookup - Look up a field in the cache
@@ -149,7 +153,6 @@ struct ks_cache_entry *ks_cache_lookup(const char *struct_name,
 	rcu_read_unlock();
 	return entry;
 }
-EXPORT_SYMBOL_GPL(ks_cache_lookup);
 
 /**
  * ks_cache_insert - Insert a new entry into the cache
@@ -202,7 +205,6 @@ int ks_cache_insert(const char *struct_name, const char *field_path,
 
 	return 0;
 }
-EXPORT_SYMBOL_GPL(ks_cache_insert);
 
 /**
  * ks_cache_invalidate - Invalidate all cache entries
@@ -235,40 +237,6 @@ void ks_cache_invalidate(void)
 
 	spin_unlock(&ks_cache_lock);
 }
-EXPORT_SYMBOL_GPL(ks_cache_invalidate);
 
-/**
- * ks_cache_get_stats - Get cache statistics
- */
-void ks_cache_get_stats(struct ks_cache_stats *stats)
-{
-	memcpy(stats, &ks_stats, sizeof(*stats));
-}
-EXPORT_SYMBOL_GPL(ks_cache_get_stats);
-
-/**
- * ks_cache_print_stats - Print cache statistics
- */
-void ks_cache_print_stats(struct seq_file *m)
-{
-	u64 hit_rate = 0;
-
-	if (ks_stats.lookups > 0)
-		hit_rate = (ks_stats.hits * 100) / ks_stats.lookups;
-
-	seq_printf(m, "Cache Statistics:\n");
-	seq_printf(m, "  Entries:       %d / %d\n",
-		   atomic_read(&ks_cache_entries), KS_CACHE_MAX_ENTRIES);
-	seq_printf(m, "  Lookups:       %llu\n", ks_stats.lookups);
-	seq_printf(m, "  Hits:          %llu\n", ks_stats.hits);
-	seq_printf(m, "  Misses:        %llu\n", ks_stats.misses);
-	seq_printf(m, "  Hit Rate:      %llu%%\n", hit_rate);
-	seq_printf(m, "  Inserts:       %llu\n", ks_stats.inserts);
-	seq_printf(m, "  Evictions:     %llu\n", ks_stats.evictions);
-	seq_printf(m, "  Invalidations: %llu\n", ks_stats.invalidations);
-}
-EXPORT_SYMBOL_GPL(ks_cache_print_stats);
-
-MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Jianyue Wu <wujianyue000@gmail.com>");
-MODULE_DESCRIPTION("k-serial: BTF field lookup cache for performance optimization");
+/* Initialize cache at boot when CONFIG_KSERIAL=y */
+subsys_initcall(ks_cache_init);

@@ -1,16 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * k-serial: Dynamic field subscription for kernel structs
- * Phase 2: Supports nested struct fields
- * Phase 3: Supports array indexing
+ * kserial: BTF-based field query for kernel structs
  *
- * This implementation allows userspace to query fields using paths like:
- * - Simple: "level"
- * - Nested: "self.id"
- * - Deep: "css_set.dfl_cgrp.level"
- * - Array: "subsys[0]", "nr_dying_subsys[2]"
- *
- * Fields are validated against a whitelist and returned in TLV format.
+ * Used by memory.stat.ks and memory.numa_stat.ks to query mem_cgroup
+ * fields by name via BTF, allowing selective reads with better performance.
  */
 
 #include <linux/kserial.h>
@@ -438,11 +431,6 @@ int ks_query_struct(void *struct_addr, const char *struct_name,
 	/* Initialize result buffer */
 	result->total_len = 0;
 
-	/* Check for block read mode */
-	if (schema->flags & KS_FLAG_BLOCK_READ) {
-		return ks_query_block(struct_addr, struct_name, schema, result);
-	}
-
 	/* Get BTF for vmlinux */
 	/* Use bpf_get_btf_vmlinux() instead of direct access to btf_vmlinux */
 	extern struct btf *bpf_get_btf_vmlinux(void);
@@ -469,59 +457,36 @@ int ks_query_struct(void *struct_addr, const char *struct_name,
 		int field_size;
 		struct ks_cache_entry *cache_entry = NULL;
 
-		/* Parse array syntax (e.g., "subsys[0]") */
+		/* Parse array syntax (e.g., "vmstats.state[14]") */
 		ret = ks_parse_array_syntax(field_path, base_name, &array_index);
 		if (ret) {
-			pr_warn("k-serial: invalid array syntax in '%s'\n",
+			pr_warn("kserial: invalid array syntax in '%s'\n",
 				field_path);
 			return ret;
 		}
 
-		/* Try cache lookup first (only for non-array paths) */
+		/* Try cache first (non-array paths only) for performance */
 		if (array_index < 0) {
 			cache_entry = ks_cache_lookup(struct_name, base_name);
 			if (cache_entry) {
-				/* Cache hit! Use cached offset and type */
 				field_offset = cache_entry->offset;
 				field_type_id = cache_entry->type_id;
 				field_size = cache_entry->size;
-				field_addr = struct_addr + field_offset;
-
-				pr_debug("k-serial: cache HIT for %s.%s (offset=%u)\n",
-					 struct_name, base_name, field_offset);
+				field_addr = (char *)struct_addr + field_offset;
 				goto read_value;
 			}
-			pr_debug("k-serial: cache MISS for %s.%s\n",
-				 struct_name, base_name);
 		}
 
-		/* Cache miss or array access - resolve via BTF */
-
-		/* No whitelist - rely on BTF type checking for security
-		 * BTF will reject:
-		 * - Non-existent fields
-		 * - Invalid types
-		 * - Out-of-bounds array access
-		 * This is safe because type system prevents arbitrary memory access
-		 */
-
-		/* Resolve field path (handles nesting and pointers) */
+		/* Cache miss or array: resolve field path via BTF */
 		ret = ks_resolve_field_path(btf, struct_type_id, struct_addr,
 					     base_name, schema->flags,
 					     &field_addr, &field_type_id);
 		if (ret) {
-			pr_warn("k-serial: failed to resolve path '%s': %d\n",
+			pr_warn("kserial: failed to resolve path '%s': %d\n",
 				base_name, ret);
-			/* Continue with next field instead of failing */
 			continue;
 		}
-
-		/* Calculate offset for caching */
-		field_offset = (u32)(field_addr - struct_addr);
-
-		/* Debug: print field address and offset */
-		pr_debug("k-serial: field '%s' resolved to addr=%p (offset=%ld from base=%p)\n",
-			 field_path, field_addr, (long)(field_addr - struct_addr), struct_addr);
+		field_offset = (u32)((char *)field_addr - (char *)struct_addr);
 
 		/* If array access, resolve the element */
 		if (array_index >= 0) {
@@ -529,7 +494,7 @@ int ks_query_struct(void *struct_addr, const char *struct_name,
 						        field_addr, array_index,
 						        &field_addr, &field_type_id);
 			if (ret) {
-				pr_warn("k-serial: failed to access array element '%s'\n",
+				pr_warn("kserial: failed to access array element '%s'\n",
 					field_path);
 				return ret;
 			}
@@ -548,23 +513,21 @@ int ks_query_struct(void *struct_addr, const char *struct_name,
 		/* Get field size and validate type */
 		field_size = ks_get_field_size(btf, field_type_id);
 		if (field_size < 0) {
-			pr_warn("k-serial: field '%s' has unsupported type: %d\n",
-				field_path, field_size);
-			/* Continue with next field instead of failing */
+			pr_warn("kserial: field '%s' has unsupported type\n",
+				field_path);
 			continue;
 		}
 
-		/* Cache the resolved field info (only for non-array, non-pointer paths) */
-		if (array_index < 0 && !cache_entry) {
+		/* Cache resolved field for next time (non-array only) */
+		if (array_index < 0 && !cache_entry)
 			ks_cache_insert(struct_name, base_name, field_offset,
 					field_size, field_type_id, 0);
-		}
 
 read_value:
 		/* Read value (zero-extend for smaller types, sign-extend for signed types) */
 		value = 0;
 		if (field_size > sizeof(value)) {
-			pr_warn("k-serial: field '%s' size %d too large\n",
+			pr_warn("kserial: field '%s' size %d too large\n",
 				field_path, field_size);
 			continue;
 		}
@@ -595,18 +558,3 @@ read_value:
 
 	return 0;
 }
-
-/* Export for use by kserial_chrdev module */
-EXPORT_SYMBOL_GPL(ks_query_struct);
-
-/* Module metadata - only when built as module */
-#ifdef MODULE
-MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Jianyue Wu <wujianyue000@gmail.com>");
-MODULE_DESCRIPTION("k-serial: BTF-based field query interface");
-#endif
-
-/* Block read implementation - defined in kserial_block.c */
-extern int ks_query_block(void *struct_addr, const char *struct_name,
-			  const struct ks_schema *schema,
-			  struct ks_result *result);

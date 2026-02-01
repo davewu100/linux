@@ -3449,32 +3449,12 @@ config RUST_KERNEL_DOCTESTS
 endmenu # "Rust"
 
 config KSERIAL
-	tristate "k-serial: BTF-based field query interface"
+	bool "kserial: BTF-based memory.stat.ks and memory.numa_stat.ks"
 	depends on BPF_SYSCALL
 	help
-	  Enable k-serial, a BTF-based interface for querying kernel structure
-	  fields by name at runtime. This provides:
-	    - /dev/kserial: Unified character device interface
-	      * Legacy mode: write() schema + read() result (TLV format)
-	      * Subscribe mode: ioctl() once + read() multiple times
-	      * Supports read(), write(), mmap, and io_uring transports
-	    - /sys/fs/cgroup/*/memory.stat.ks: Optimized cgroup stats demo
-
-	  k-serial uses BTF (BPF Type Format) to find fields by name, making
-	  it version-resilient and type-safe.
-
-	  To compile this driver as a module, choose M here: the module
-	  will be called kserial. When loaded, /sys/fs/cgroup/*/memory.stat.ks
-	  and memory.numa_stat.ks become available without rebooting.
-
-	  Performance: 2.48x faster than traditional memory.stat for cgroup
-	  monitoring. io_uring provides 90x performance boost for batch queries.
-
-	  If unsure, say Y.
-
-	  Note: BTF support (CONFIG_DEBUG_INFO_BTF) is recommended but not
-	  strictly required if BTF is available at runtime.
-
-	  If unsure, say N.
+	  Add memory.stat.ks and memory.numa_stat.ks to the memory cgroup.
+	  These files use BTF to query mem_cgroup fields by name, allowing
+	  selective reads (e.g. echo "anon,file" > memory.stat.ks then cat)
+	  with cached lookups for better performance than full memory.stat.
 
 endmenu # Kernel hacking

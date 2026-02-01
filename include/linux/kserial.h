@@ -5,73 +5,38 @@
 #include <linux/types.h>
 
 /*
- * k-serial: Dynamic field subscription for kernel structs
- * Phase 2: Supports nested struct fields (e.g., "css_set.dfl_cgrp.level")
- * Phase 3: Supports array indexing (e.g., "subsys[0]", "nr_dying_subsys[2]")
+ * kserial: BTF-based field query for memory.stat.ks and memory.numa_stat.ks.
+ * Supports nested paths (e.g. "vmstats.state[14]") and caches lookups.
  */
 
 #define KS_MAX_FIELDS 16
-#define KS_FIELD_NAME_LEN 64  /* Increased for nested paths */
+#define KS_FIELD_NAME_LEN 64
 #define KS_MAX_OUTPUT_SIZE 4096
-#define KS_MAX_PATH_DEPTH 4   /* Maximum nesting depth */
+#define KS_MAX_PATH_DEPTH 4
 
-/* Schema flags */
-#define KS_FLAG_ALLOW_NULL 0x01  /* Return 0 for NULL pointers instead of error */
-#define KS_FLAG_BLOCK_READ 0x02  /* Block read mode for array ranges */
-#define KS_FLAG_RAW_OFFSET 0x04  /* Raw memory offset mode */
-#define KS_FLAG_RAW_OUTPUT 0x08  /* Raw output mode (no TLV encoding) */
-#define KS_FLAG_ALLOW_STRING 0x10  /* Allow string field access */
+#define KS_FLAG_ALLOW_NULL 0x01
 
-/* ioctl commands */
-#define KS_IOCTL_MAGIC 'k'
-#define KS_IOCTL_SUBSCRIBE _IOW(KS_IOCTL_MAGIC, 1, struct ks_subscribe)
-#define KS_IOCTL_UNSUBSCRIBE _IO(KS_IOCTL_MAGIC, 2)
-#define KS_IOCTL_REFRESH _IO(KS_IOCTL_MAGIC, 3)  /* Refresh shared buffer for mmap */
-
-/* io_uring commands for ultimate performance */
-#define KS_URING_CMD_READ    1  /* Async read data */
-#define KS_URING_CMD_REFRESH 2  /* Async refresh mmap buffer */
-
-/* Subscribe structure for stateful queries */
-struct ks_subscribe {
-	char struct_name[64];           /* e.g., "mem_cgroup", "task_struct" */
-	char fields[32][128];           /* Field paths to query */
-	__u32 nr_fields;                /* Number of fields */
-	__u32 pid;                      /* Target PID (0 = current) */
-	__u32 flags;                    /* Query flags */
-	__u8 include_descriptor;        /* Include descriptor in first read */
-	__u8 reserved[3];
-};
-
-/* User space schema: list of field names/paths to query */
 struct ks_schema {
 	__u32 nr_fields;
 	__u32 flags;
-	char struct_name[KS_FIELD_NAME_LEN];  /* Target struct type (e.g. "cgroup", "mem_cgroup") */
-
-	/* Target selection */
-	__u32 target_pid;      /* Target process PID (0 = current process) */
-	__u32 reserved[3];     /* Reserved for future use */
-
-	/* Block read parameters (when KS_FLAG_BLOCK_READ is set) */
-	__u32 block_offset;    /* Raw offset for KS_FLAG_RAW_OFFSET */
-	__u32 block_size;      /* Size in bytes for KS_FLAG_RAW_OFFSET */
-	__u32 array_start;     /* Array start index for range reads */
-	__u32 array_count;     /* Number of array elements to read */
-
+	char struct_name[KS_FIELD_NAME_LEN];
+	__u32 target_pid;
+	__u32 reserved[3];
+	__u32 block_offset;
+	__u32 block_size;
+	__u32 array_start;
+	__u32 array_count;
 	char field_names[KS_MAX_FIELDS][KS_FIELD_NAME_LEN];
 };
 
-/* Output format: TLV (Type-Length-Value) */
 struct ks_tlv {
-	__u16 field_id;   /* Index in schema */
-	__u16 len;        /* Length of data */
-	__u8  data[];     /* Field value */
+	__u16 field_id;
+	__u16 len;
+	__u8  data[];
 } __attribute__((packed));
 
-/* Result buffer */
 struct ks_result {
-	__u32 total_len;  /* Total bytes written */
+	__u32 total_len;
 	__u8  data[KS_MAX_OUTPUT_SIZE];
 };
 
@@ -81,43 +46,9 @@ struct ks_result {
 #include <linux/cgroup.h>
 #include <linux/rhashtable.h>
 
-/*
- * No whitelist - k-serial allows querying any field that BTF can resolve
- *
- * Security model:
- * - BTF type checking ensures only valid struct fields are accessed
- * - Only scalar types (int, u64, pointers) are returned
- * - Complex types (strings, nested structs) are rejected
- * - Array bounds are checked automatically
- *
- * This is safe because:
- * 1. BTF prevents access to non-existent fields
- * 2. Type validation prevents reading arbitrary memory
- * 3. Users can only query their own cgroup (via current task)
- */
-
-/**
- * ks_query_struct - Query fields from any kernel struct using BTF
- * @struct_addr: Address of target struct
- * @struct_name: Name of struct type (e.g., "cgroup", "mem_cgroup")
- * @schema: User-provided field list
- * @result: Output buffer for TLV-encoded data
- *
- * Returns: 0 on success, negative error code on failure
- */
 int ks_query_struct(void *struct_addr, const char *struct_name,
 		    const struct ks_schema *schema, struct ks_result *result);
 
-/* Block read function */
-int ks_query_block(void *struct_addr, const char *struct_name,
-		   const struct ks_schema *schema, struct ks_result *result);
-
-/* String field support */
-bool ks_is_string_field(const struct btf *btf, u32 field_type_id);
-int ks_query_string_field(const struct btf *btf, void *field_addr,
-			   u32 field_type_id, char *out_buf, u32 buf_size);
-
-/* Cache management */
 struct ks_cache_entry {
 	struct rhash_head node;
 	char struct_name[KS_FIELD_NAME_LEN];
@@ -131,42 +62,10 @@ struct ks_cache_entry {
 	u64 last_access_ns;
 };
 
-struct ks_cache_stats {
-	u64 lookups;
-	u64 hits;
-	u64 misses;
-	u64 inserts;
-	u64 evictions;
-	u64 invalidations;
-};
-
-int ks_cache_init(void);
-void ks_cache_cleanup(void);
 struct ks_cache_entry *ks_cache_lookup(const char *struct_name,
 				       const char *field_path);
 int ks_cache_insert(const char *struct_name, const char *field_path,
 		    u32 offset, u32 size, u32 type_id, u8 flags);
-void ks_cache_invalidate(void);
-void ks_cache_get_stats(struct ks_cache_stats *stats);
-void ks_cache_print_stats(struct seq_file *m);
-
-/* Debugfs interface */
-int ks_debug_init(void);
-void ks_debug_cleanup(void);
-
-/**
- * ks_query_cgroup - Query fields from a cgroup using BTF (legacy wrapper)
- * @cgrp: Target cgroup
- * @schema: User-provided field list
- * @result: Output buffer for TLV-encoded data
- *
- * Returns: 0 on success, negative error code on failure
- */
-static inline int ks_query_cgroup(struct cgroup *cgrp, const struct ks_schema *schema,
-				   struct ks_result *result)
-{
-	return ks_query_struct(cgrp, "cgroup", schema, result);
-}
 
 #endif /* __KERNEL__ */
 
