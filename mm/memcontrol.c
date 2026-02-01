@@ -3956,6 +3956,8 @@ static void mem_cgroup_css_free(struct cgroup_subsys_state *css)
 #ifdef CONFIG_KSERIAL
 	kfree(memcg->stat_ks_config);
 	memcg->stat_ks_config = NULL;
+	kfree(memcg->numa_stat_ks_config);
+	memcg->numa_stat_ks_config = NULL;
 #endif
 	mem_cgroup_free(memcg);
 }
@@ -4823,28 +4825,52 @@ static int memory_numa_stat_show(struct seq_file *m, void *v)
 }
 
 #ifdef CONFIG_KSERIAL
-/**
- * memory_numa_stat_ks_show - kserial optimized memory.numa_stat (for performance demo)
- *
- * This outputs the SAME fields as memory_numa_stat_show for fair comparison:
- * - Same field count (all per-node memory_stats[])
- * - Same data (using lruvec_page_state_output())
- * - Optimization: Direct seq_printf (no intermediate buffer)
- * - Built-in profiling
- */
+/* Map vmstats.state[] index to stat item for numa_stat.ks filter */
+static int memcg_ks_state_index_to_stat_item(unsigned int state_idx)
+{
+	if (state_idx < NR_MEMCG_NODE_STAT_ITEMS)
+		return memcg_node_stat_items[state_idx];
+	if (state_idx < MEMCG_VMSTAT_SIZE)
+		return memcg_stat_items[state_idx - NR_MEMCG_NODE_STAT_ITEMS];
+	return -1;
+}
+
 static int memory_numa_stat_ks_show(struct seq_file *m, void *v)
 {
 	struct mem_cgroup *memcg = mem_cgroup_from_seq(m);
-	int i;
+	struct memcg_stat_ks_config *cfg = memcg->numa_stat_ks_config;
+	int i, nid;
+	unsigned int state_idx;
+	int stat_item;
 
 	mem_cgroup_flush_stats(memcg);
 
-	for (i = 0; i < ARRAY_SIZE(memory_stats); i++) {
-		int nid;
+	if (cfg && cfg->schema.nr_fields > 0) {
+		/* Filtered: only requested vmstats.state[N] rows */
+		for (i = 0; i < cfg->schema.nr_fields; i++) {
+			const char *fname = cfg->schema.field_names[i];
 
+			if (strncmp(fname, "vmstats.state[", 14) != 0 ||
+			    kstrtouint(fname + 14, 10, &state_idx) != 0)
+				continue;
+			stat_item = memcg_ks_state_index_to_stat_item(state_idx);
+			if (stat_item < 0 || stat_item >= NR_VM_NODE_STAT_ITEMS)
+				continue;
+			seq_printf(m, "%s", fname);
+			for_each_node_state(nid, N_MEMORY) {
+				struct lruvec *lruvec = mem_cgroup_lruvec(memcg, NODE_DATA(nid));
+				u64 size = lruvec_page_state_output(lruvec, stat_item);
+				seq_printf(m, " N%d=%llu", nid, size);
+			}
+			seq_putc(m, '\n');
+		}
+		return 0;
+	}
+
+	/* Legacy: all fields, same as memory_numa_stat_show */
+	for (i = 0; i < ARRAY_SIZE(memory_stats); i++) {
 		if (memory_stats[i].idx >= NR_VM_NODE_STAT_ITEMS)
 			continue;
-
 		seq_printf(m, "%s", memory_stats[i].name);
 		for_each_node_state(nid, N_MEMORY) {
 			u64 size;
@@ -4857,8 +4883,85 @@ static int memory_numa_stat_ks_show(struct seq_file *m, void *v)
 		}
 		seq_putc(m, '\n');
 	}
-
 	return 0;
+}
+
+static ssize_t memory_numa_stat_ks_write(struct kernfs_open_file *of,
+					 char *buf, size_t nbytes, loff_t off)
+{
+	struct mem_cgroup *memcg = mem_cgroup_from_css(of_css(of));
+	struct memcg_stat_ks_config *cfg;
+	char *pos, *token;
+	int i;
+
+	if (!of || !of->kn)
+		return -EINVAL;
+
+	if (nbytes == 0 || buf[0] == '\n') {
+		cfg = memcg->numa_stat_ks_config;
+		if (cfg) {
+			memcg->numa_stat_ks_config = NULL;
+			kfree(cfg);
+		}
+		return nbytes;
+	}
+
+	cfg = memcg->numa_stat_ks_config;
+	if (!cfg) {
+		cfg = kzalloc(sizeof(*cfg), GFP_KERNEL);
+		if (!cfg)
+			return -ENOMEM;
+		memcg->numa_stat_ks_config = cfg;
+	}
+	memset(&cfg->schema, 0, sizeof(cfg->schema));
+
+	pos = buf;
+	i = 0;
+	while (i < KS_MAX_FIELDS) {
+		size_t span = nbytes - (pos - (char *)buf);
+		if (span == 0)
+			break;
+		token = memchr(pos, ',', span);
+		if (!token)
+			token = pos + span;
+		while (pos < token && (*pos == ' ' || *pos == '\t' || *pos == '\n'))
+			pos++;
+		{
+			char *end = token;
+			while (end > pos && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\n'))
+				end--;
+			if (end > pos) {
+				size_t len = min_t(size_t, end - pos, KS_FIELD_NAME_LEN - 1);
+				memcpy(cfg->schema.field_names[i], pos, len);
+				cfg->schema.field_names[i][len] = '\0';
+				i++;
+			}
+		}
+		if (token < buf + nbytes)
+			pos = token + 1;
+		else
+			break;
+	}
+
+	if (i == 0) {
+		if (memcg->numa_stat_ks_config) {
+			kfree(memcg->numa_stat_ks_config);
+			memcg->numa_stat_ks_config = NULL;
+		}
+		return nbytes;
+	}
+
+	cfg->schema.nr_fields = i;
+	return nbytes;
+}
+
+static int memory_numa_stat_ks_open(struct kernfs_open_file *of)
+{
+	return 0;
+}
+
+static void memory_numa_stat_ks_release(struct kernfs_open_file *of)
+{
 }
 #endif /* CONFIG_KSERIAL */
 #endif /* CONFIG_NUMA */
@@ -4979,6 +5082,9 @@ static struct cftype memory_files[] = {
 	{
 		.name = "numa_stat.ks",
 		.seq_show = memory_numa_stat_ks_show,
+		.write = memory_numa_stat_ks_write,
+		.open = memory_numa_stat_ks_open,
+		.release = memory_numa_stat_ks_release,
 	},
 #endif
 #endif

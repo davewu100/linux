@@ -281,6 +281,8 @@ struct mem_cgroup {
 #ifdef CONFIG_KSERIAL
 	/* memory.stat.ks filter: schema + result buffer, NULL = show all */
 	struct memcg_stat_ks_config *stat_ks_config;
+	/* memory.numa_stat.ks filter: same, NULL = show all */
+	struct memcg_stat_ks_config *numa_stat_ks_config;
 #endif
 
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
