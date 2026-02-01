@@ -27,6 +27,9 @@
 struct mem_cgroup;
 struct obj_cgroup;
 struct page;
+#ifdef CONFIG_KSERIAL
+struct memcg_stat_ks_config;
+#endif
 struct mm_struct;
 struct kmem_cache;
 
@@ -273,6 +276,11 @@ struct mem_cgroup {
 	struct list_head cgwb_list;
 	struct wb_domain cgwb_domain;
 	struct memcg_cgwb_frn cgwb_frn[MEMCG_CGWB_FRN_CNT];
+#endif
+
+#ifdef CONFIG_KSERIAL
+	/* memory.stat.ks filter: schema + result buffer, NULL = show all */
+	struct memcg_stat_ks_config *stat_ks_config;
 #endif
 
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
