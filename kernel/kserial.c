@@ -415,7 +415,8 @@ static int ks_write_tlv(struct ks_result *result, u16 field_id,
  * Returns: 0 on success, negative error code on failure
  */
 int ks_query_struct(void *struct_addr, const char *struct_name,
-		    const struct ks_schema *schema, struct ks_result *result)
+		    const struct ks_schema *schema, struct ks_result *result,
+		    struct ks_resolved_field *resolved_out)
 {
 	const struct btf *btf;
 	s32 struct_type_id;
@@ -522,6 +523,10 @@ int ks_query_struct(void *struct_addr, const char *struct_name,
 				field_size, field_type_id, 0);
 
 read_value:
+		if (resolved_out) {
+			resolved_out[i].offset = field_offset;
+			resolved_out[i].size = field_size;
+		}
 		/* Read value (zero-extend for smaller types, sign-extend for signed types) */
 		value = 0;
 		if (field_size > sizeof(value)) {

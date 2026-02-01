@@ -4538,6 +4538,9 @@ int memory_stat_show(struct seq_file *m, void *v)
 struct memcg_stat_ks_config {
 	struct ks_schema schema;
 	struct ks_result result;
+	/* Lightweight cache: resolved (offset, size) per field; skip rhashtable on next read */
+	struct ks_resolved_field resolved[KS_MAX_FIELDS];
+	bool resolved_valid;
 };
 
 /*
@@ -4604,7 +4607,8 @@ static int memory_stat_ks_show_btf(struct seq_file *m,
 				    struct memcg_stat_ks_config *cfg)
 {
 	u8 *p, *end;
-	int ret, field_idx;
+	int ret, i;
+	u32 nr;
 
 	if (!cfg || cfg->schema.nr_fields == 0)
 		return -EINVAL;
@@ -4612,56 +4616,79 @@ static int memory_stat_ks_show_btf(struct seq_file *m,
 	if (cfg->schema.flags & KS_FLAG_FLUSH)
 		mem_cgroup_flush_stats(memcg);
 
-	cfg->result.total_len = 0;
+	nr = cfg->schema.nr_fields;
 
-	ret = ks_query_struct(memcg, "mem_cgroup", &cfg->schema, &cfg->result);
+	/* Fast path: use cached (offset, size), read directly from memcg */
+	if (cfg->resolved_valid) {
+		for (i = 0; i < nr; i++) {
+			u32 off = cfg->resolved[i].offset;
+			u32 sz = cfg->resolved[i].size;
+			u64 value = 0;
+			void *addr;
+
+			if (sz == 0 || sz > sizeof(value))
+				continue;
+			addr = (char *)memcg + off;
+			memcpy(&value, addr, sz);
+			if (sz == 8)
+				seq_printf(m, "%s %llu\n",
+					   cfg->schema.field_names[i], value);
+			else if (sz == 4)
+				seq_printf(m, "%s %u\n",
+					   cfg->schema.field_names[i], (u32)value);
+			else if (sz == 2)
+				seq_printf(m, "%s %u\n",
+					   cfg->schema.field_names[i], (u16)value);
+			else
+				seq_printf(m, "%s %llu\n",
+					   cfg->schema.field_names[i], value);
+		}
+		return 0;
+	}
+
+	/* Cold path: resolve via BTF, fill resolved cache, output from result */
+	cfg->result.total_len = 0;
+	ret = ks_query_struct(memcg, "mem_cgroup", &cfg->schema, &cfg->result,
+			      cfg->resolved);
 	if (ret < 0) {
 		seq_printf(m, "# Error: BTF query failed: %d\n", ret);
 		return ret;
 	}
+	cfg->resolved_valid = true;
 
 	p = cfg->result.data;
 	end = p + cfg->result.total_len;
-	field_idx = 0;
-
-	while (p < end && field_idx < cfg->schema.nr_fields) {
+	for (i = 0; i < nr && p + 4 <= end; i++) {
 		u16 len;
 		u64 value;
-
-		if (p + 4 > end)
-			break;
 
 		p += 2;
 		len = *(u16 *)p;
 		p += 2;
-
 		if (p + len > end)
 			break;
 
 		if (len == 8) {
 			value = *(u64 *)p;
 			seq_printf(m, "%s %llu\n",
-				   cfg->schema.field_names[field_idx], value);
+				   cfg->schema.field_names[i], value);
 		} else if (len == 4) {
 			value = *(u32 *)p;
 			seq_printf(m, "%s %u\n",
-				   cfg->schema.field_names[field_idx], (u32)value);
+				   cfg->schema.field_names[i], (u32)value);
 		} else if (len == 2) {
 			value = *(u16 *)p;
 			seq_printf(m, "%s %u\n",
-				   cfg->schema.field_names[field_idx], (u16)value);
+				   cfg->schema.field_names[i], (u16)value);
 		} else {
 			int j;
-			seq_printf(m, "%s 0x", cfg->schema.field_names[field_idx]);
+			seq_printf(m, "%s 0x", cfg->schema.field_names[i]);
 			for (j = 0; j < len && j < 8; j++)
 				seq_printf(m, "%02x", p[j]);
 			seq_printf(m, "\n");
 		}
-
 		p += len;
-		field_idx++;
 	}
-
 	return 0;
 }
 
@@ -4730,6 +4757,7 @@ static ssize_t memory_stat_ks_write(struct kernfs_open_file *of,
 		memcg->stat_ks_config = cfg;
 	}
 	memset(&cfg->schema, 0, sizeof(cfg->schema));
+	cfg->resolved_valid = false;
 
 	/* Parse comma-separated field names from buf (not necessarily NUL-terminated) */
 	pos = buf;

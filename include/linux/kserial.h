@@ -41,6 +41,12 @@ struct ks_result {
 	__u8  data[KS_MAX_OUTPUT_SIZE];
 };
 
+/* Optional output: resolved (offset, size) per field for direct read cache */
+struct ks_resolved_field {
+	__u32 offset;
+	__u32 size;
+};
+
 #ifdef __KERNEL__
 
 #include <linux/btf.h>
@@ -48,7 +54,8 @@ struct ks_result {
 #include <linux/rhashtable.h>
 
 int ks_query_struct(void *struct_addr, const char *struct_name,
-		    const struct ks_schema *schema, struct ks_result *result);
+		    const struct ks_schema *schema, struct ks_result *result,
+		    struct ks_resolved_field *resolved_out);
 
 struct ks_cache_entry {
 	struct rhash_head node;
