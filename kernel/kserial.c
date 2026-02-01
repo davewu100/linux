@@ -465,19 +465,17 @@ int ks_query_struct(void *struct_addr, const char *struct_name,
 			return ret;
 		}
 
-		/* Try cache first (non-array paths only) for performance */
-		if (array_index < 0) {
-			cache_entry = ks_cache_lookup(struct_name, base_name);
-			if (cache_entry) {
-				field_offset = cache_entry->offset;
-				field_type_id = cache_entry->type_id;
-				field_size = cache_entry->size;
-				field_addr = (char *)struct_addr + field_offset;
-				goto read_value;
-			}
+		/* Try cache first (same cgroup + same schema => reuse resolution) */
+		cache_entry = ks_cache_lookup(struct_name, field_path);
+		if (cache_entry) {
+			field_offset = cache_entry->offset;
+			field_type_id = cache_entry->type_id;
+			field_size = cache_entry->size;
+			field_addr = (char *)struct_addr + field_offset;
+			goto read_value;
 		}
 
-		/* Cache miss or array: resolve field path via BTF */
+		/* Cache miss: resolve field path via BTF */
 		ret = ks_resolve_field_path(btf, struct_type_id, struct_addr,
 					     base_name, schema->flags,
 					     &field_addr, &field_type_id);
@@ -498,6 +496,7 @@ int ks_query_struct(void *struct_addr, const char *struct_name,
 					field_path);
 				return ret;
 			}
+			field_offset = (u32)((char *)field_addr - (char *)struct_addr);
 		}
 
 		/* Handle NULL pointer case (if flag set) */
@@ -518,10 +517,9 @@ int ks_query_struct(void *struct_addr, const char *struct_name,
 			continue;
 		}
 
-		/* Cache resolved field for next time (non-array only) */
-		if (array_index < 0 && !cache_entry)
-			ks_cache_insert(struct_name, base_name, field_offset,
-					field_size, field_type_id, 0);
+		/* Cache resolved field for next time (full path, incl. array) */
+		ks_cache_insert(struct_name, field_path, field_offset,
+				field_size, field_type_id, 0);
 
 read_value:
 		/* Read value (zero-extend for smaller types, sign-extend for signed types) */
