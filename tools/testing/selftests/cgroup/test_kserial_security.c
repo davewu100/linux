@@ -16,22 +16,7 @@
 #include <fcntl.h>
 #include <stdint.h>
 #include <errno.h>
-
-/* k-serial UAPI structures */
-#define KS_MAX_FIELDS 32
-#define KS_FIELD_NAME_LEN 64
-#define KS_MAX_OUTPUT_SIZE 4096
-
-struct ks_schema {
-	uint32_t nr_fields;
-	uint32_t flags;
-	char field_names[KS_MAX_FIELDS][KS_FIELD_NAME_LEN];
-};
-
-struct ks_result {
-	uint32_t total_len;
-	uint8_t  data[KS_MAX_OUTPUT_SIZE];
-};
+#include <linux/kserial.h>
 
 /* Test helper - expects query to FAIL */
 static int test_should_fail(const char *test_name, const char *field_name)

@@ -13,35 +13,7 @@
 #include <errno.h>
 #include <unistd.h>
 #include <fcntl.h>
-
-/* k-serial UAPI structures (must match kernel) */
-#define KS_MAX_FIELDS 32
-#define KS_FIELD_NAME_LEN 64
-#define KS_MAX_OUTPUT_SIZE 4096
-
-struct ks_schema {
-	uint32_t nr_fields;
-	uint32_t flags;
-	char struct_name[KS_FIELD_NAME_LEN];
-	uint32_t target_pid;
-	uint32_t reserved[3];
-	uint32_t block_offset;
-	uint32_t block_size;
-	uint32_t array_start;
-	uint32_t array_count;
-	char field_names[KS_MAX_FIELDS][KS_FIELD_NAME_LEN];
-};
-
-struct ks_tlv {
-	uint16_t field_id;
-	uint16_t len;
-	uint8_t  data[];
-} __attribute__((packed));
-
-struct ks_result {
-	uint32_t total_len;
-	uint8_t  data[KS_MAX_OUTPUT_SIZE];
-};
+#include <linux/kserial.h>
 
 /* Procfs interface path */
 #define KS_PROCFS_PATH "/dev/kserial"

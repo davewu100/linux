@@ -68,7 +68,7 @@ slab 11111111
 
 - `memory.stat.ks` flushes on every read (aligned with `memory.stat`).
 - `memory.numa_stat.ks` flushes on every read (aligned with `memory.numa_stat`).
-- `KS_MAX_FIELDS` is 32.
+- `KS_MAX_FIELDS` is 128.
 
 ## Examples
 
@@ -197,7 +197,7 @@ struct ks_memcg_context {
 
 struct ks_schema {
     char struct_name[64];                 /* "mem_cgroup" */
-    char field_names[32][64];             /* Parsed fields */
+    char field_names[128][64];            /* Parsed fields */
     u32 nr_fields;                        /* Field count */
     u32 flags;                            /* Query flags */
     // ... more fields ...

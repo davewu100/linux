@@ -84,7 +84,7 @@ The schema structure specifies which fields to query::
     struct ks_schema {
         uint32_t nr_fields;              /* Number of fields to query */
         uint32_t flags;                  /* Flags (e.g., KS_FLAG_ALLOW_NULL) */
-        char field_names[32][64];        /* Field names or paths */
+        char field_names[128][64];       /* Field names or paths */
     };
 
 Flags:
@@ -126,7 +126,7 @@ Query simple fields from current cgroup::
     struct ks_schema {
         uint32_t nr_fields;
         uint32_t flags;
-        char field_names[32][64];
+        char field_names[128][64];
     };
     
     struct ks_result {
