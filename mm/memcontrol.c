@@ -4541,6 +4541,9 @@ struct memcg_stat_ks_config {
 	/* Lightweight cache: resolved (offset, size) per field; skip rhashtable on next read */
 	struct ks_resolved_field resolved[KS_MAX_FIELDS];
 	bool resolved_valid;
+	/* numa_stat.ks: cached stat_item per field (write-time resolve; -1 = skip) */
+	int numa_stat_items[KS_MAX_FIELDS];
+	bool numa_resolved_valid;
 };
 
 /*
@@ -4613,8 +4616,11 @@ static int memory_stat_ks_show_btf(struct seq_file *m,
 	if (!cfg || cfg->schema.nr_fields == 0)
 		return -EINVAL;
 
-	/* Flush to match memory.stat freshness */
-	mem_cgroup_flush_stats(memcg);
+	/* Flush only when user asked for fresh data (e.g. "flush,anon,file"); else ratelimited */
+	if (cfg->schema.flags & KS_FLAG_FLUSH)
+		mem_cgroup_flush_stats(memcg);
+	else
+		mem_cgroup_flush_stats_ratelimited(memcg);
 
 	nr = cfg->schema.nr_fields;
 
@@ -4807,6 +4813,11 @@ static ssize_t memory_stat_ks_write(struct kernfs_open_file *of,
 	cfg->schema.nr_fields = i;
 	cfg->schema.target_pid = 0;
 
+	/* Resolve schema at write time so first read uses fast path (no BTF cold path) */
+	if (ks_query_struct(memcg, "mem_cgroup", &cfg->schema, &cfg->result,
+			    cfg->resolved) == 0)
+		cfg->resolved_valid = true;
+
 	return nbytes;
 }
 
@@ -4878,24 +4889,38 @@ static int memory_numa_stat_ks_show(struct seq_file *m, void *v)
 	unsigned int state_idx;
 	int stat_item;
 
-	mem_cgroup_flush_stats(memcg);
+	/* Full flush only when filtered and user wrote "flush"; else ratelimited; legacy = full flush */
+	if (cfg && cfg->schema.nr_fields > 0) {
+		if (cfg->schema.flags & KS_FLAG_FLUSH)
+			mem_cgroup_flush_stats(memcg);
+		else
+			mem_cgroup_flush_stats_ratelimited(memcg);
+	} else
+		mem_cgroup_flush_stats(memcg);
 
 	if (cfg && cfg->schema.nr_fields > 0) {
-		/* Filtered: only requested vmstats.state[N] rows */
+		/* Filtered: use cached stat_item when valid (write-time resolve); else parse once per read */
 		for (i = 0; i < cfg->schema.nr_fields; i++) {
 			const char *fname = cfg->schema.field_names[i];
-			const char *p;
 
-			if (strncmp(fname, "vmstats.state[", 14) != 0)
-				continue;
-			state_idx = 0;
-			for (p = fname + 14; *p >= '0' && *p <= '9'; p++)
-				state_idx = state_idx * 10 + (*p - '0');
-			if (p == fname + 14)
-				continue;
-			stat_item = memcg_ks_state_index_to_stat_item(state_idx);
-			if (stat_item < 0 || stat_item >= NR_VM_NODE_STAT_ITEMS)
-				continue;
+			if (cfg->numa_resolved_valid) {
+				stat_item = cfg->numa_stat_items[i];
+				if (stat_item < 0 || stat_item >= NR_VM_NODE_STAT_ITEMS)
+					continue;
+			} else {
+				const char *p;
+
+				if (strncmp(fname, "vmstats.state[", 14) != 0)
+					continue;
+				state_idx = 0;
+				for (p = fname + 14; *p >= '0' && *p <= '9'; p++)
+					state_idx = state_idx * 10 + (*p - '0');
+				if (p == fname + 14)
+					continue;
+				stat_item = memcg_ks_state_index_to_stat_item(state_idx);
+				if (stat_item < 0 || stat_item >= NR_VM_NODE_STAT_ITEMS)
+					continue;
+			}
 			seq_printf(m, "%s", fname);
 			for_each_node_state(nid, N_MEMORY) {
 				struct lruvec *lruvec = mem_cgroup_lruvec(memcg, NODE_DATA(nid));
@@ -4932,7 +4957,7 @@ static ssize_t memory_numa_stat_ks_write(struct kernfs_open_file *of,
 	struct mem_cgroup *memcg = mem_cgroup_from_css(of_css(of));
 	struct memcg_stat_ks_config *cfg;
 	char *pos, *token;
-	int i;
+	int i, stat_item;
 
 	if (!of || !of->kn)
 		return -EINVAL;
@@ -4954,6 +4979,7 @@ static ssize_t memory_numa_stat_ks_write(struct kernfs_open_file *of,
 		memcg->numa_stat_ks_config = cfg;
 	}
 	memset(&cfg->schema, 0, sizeof(cfg->schema));
+	cfg->numa_resolved_valid = false;
 
 	pos = buf;
 	i = 0;
@@ -4972,9 +4998,13 @@ static ssize_t memory_numa_stat_ks_write(struct kernfs_open_file *of,
 				end--;
 			if (end > pos) {
 				size_t len = min_t(size_t, end - pos, KS_FIELD_NAME_LEN - 1);
-				memcpy(cfg->schema.field_names[i], pos, len);
-				cfg->schema.field_names[i][len] = '\0';
-				i++;
+				if (len == 5 && memcmp(pos, "flush", 5) == 0)
+					cfg->schema.flags |= KS_FLAG_FLUSH;
+				else {
+					memcpy(cfg->schema.field_names[i], pos, len);
+					cfg->schema.field_names[i][len] = '\0';
+					i++;
+				}
 			}
 		}
 		if (token < buf + nbytes)
@@ -4992,6 +5022,30 @@ static ssize_t memory_numa_stat_ks_write(struct kernfs_open_file *of,
 	}
 
 	cfg->schema.nr_fields = i;
+
+	/* Resolve vmstats.state[N] -> stat_item at write time so read path needs no parsing */
+	for (i = 0; i < cfg->schema.nr_fields; i++) {
+		const char *fname = cfg->schema.field_names[i];
+		const char *p;
+		unsigned int state_idx;
+
+		if (strncmp(fname, "vmstats.state[", 14) != 0) {
+			cfg->numa_stat_items[i] = -1;
+			continue;
+		}
+		state_idx = 0;
+		for (p = fname + 14; *p >= '0' && *p <= '9'; p++)
+			state_idx = state_idx * 10 + (*p - '0');
+		if (p == fname + 14 || *p != ']') {
+			cfg->numa_stat_items[i] = -1;
+			continue;
+		}
+		stat_item = memcg_ks_state_index_to_stat_item(state_idx);
+		cfg->numa_stat_items[i] = (stat_item >= 0 && stat_item < NR_VM_NODE_STAT_ITEMS) ?
+					  stat_item : -1;
+	}
+	cfg->numa_resolved_valid = true;
+
 	return nbytes;
 }
 

@@ -3,22 +3,41 @@
 #
 # Test memory.stat.ks with BTF query support
 # This demonstrates TRUE kserial functionality
+#
+# Usage:
+#   ./test_memstat_btf.sh       - test a new empty cgroup (all stats 0)
+#   ./test_memstat_btf.sh --root - test root cgroup (shows system-wide stats;
+#                                  may need sudo for writes)
 
 set -e
 
 CGROUP_ROOT="/sys/fs/cgroup"
 TEST_CGROUP="test_btf_$$"
-TEST_PATH="$CGROUP_ROOT/$TEST_CGROUP"
+TEST_ROOT=0
+for arg in "$@"; do
+	case "$arg" in
+		--root) TEST_ROOT=1; break ;;
+	esac
+done
+if [ "$TEST_ROOT" -eq 1 ]; then
+	TEST_PATH="$CGROUP_ROOT"
+else
+	TEST_PATH="$CGROUP_ROOT/$TEST_CGROUP"
+fi
 
-# Colors
-GREEN='\033[0;32m'
-BLUE='\033[0;34m'
-YELLOW='\033[1;33m'
-RED='\033[0;31m'
-NC='\033[0m'
+# Colors (use $'...' so escape sequences are actual bytes; works with echo)
+GREEN=$'\033[0;32m'
+BLUE=$'\033[0;34m'
+YELLOW=$'\033[1;33m'
+RED=$'\033[0;31m'
+NC=$'\033[0m'
 
 KERNEL_SRC="$(realpath "$(dirname "$0")/../../../..")"
 MEMCONTROL_C="${KERNEL_SRC}/mm/memcontrol.c"
+if [ ! -f "$MEMCONTROL_C" ]; then
+	echo "Error: ${MEMCONTROL_C} not found (run from kernel source tree)." 1>&2
+	exit 1
+fi
 CONFIG_GZ="/proc/config.gz"
 BOOT_CONFIG="/boot/config-$(uname -r)"
 AUTOCONF_H="${KERNEL_SRC}/include/generated/autoconf.h"
@@ -129,7 +148,8 @@ extract_memory_stats() {
 		$0 ~ "static const struct memory_stat memory_stats\\[\\] = \\{" { in_array=1; next; }
 		in_array && $0 ~ /^};/ { in_array=0; next; }
 		in_array && active[depth] {
-			if (match($0, /\\{[ \t]*\\"([^\\"]+)\\",[ \t]*([A-Z0-9_]+)[ \t]*\\}/, m))
+			# Match "name", SYMBOL (use ["] for portability with mawk)
+			if (match($0, /["]([^"]+)["],[ \t]*([A-Z0-9_]+)/, m))
 				print m[1] ":" m[2];
 		}
 	' "$MEMCONTROL_C"
@@ -191,6 +211,7 @@ build_full_schema() {
 	for entry in "${memory_stats[@]}"; do
 		name="${entry%%:*}"
 		symbol="${entry##*:}"
+		symbol="${symbol//[[:space:]]/}"
 		idx="${state_index[$symbol]}"
 		if [ -z "$idx" ]; then
 			continue
@@ -205,7 +226,8 @@ build_full_schema() {
 
 	IFS=','; echo "${schema_fields[*]}" > "$schema_file"; IFS=' '
 
-	echo "${memory_stat_names[@]}"
+	# One entry per line so compare_outputs can parse (while read -r line)
+	printf '%s\n' "${memory_stat_names[@]}"
 	echo "::EVENTS::"
 	for ((i=0; i<${#event_symbols[@]}; i++)); do
 		echo "${event_symbols[i]}:${event_names[i]}:$i"
@@ -254,7 +276,8 @@ compare_outputs() {
 			local unit="$page_size"
 			if [ "$line" = "NR_KERNEL_STACK_KB" ]; then
 				unit=1024
-			elif grep -q "^${line}$" <<< "$UNIT_ONE_LIST"; then
+			elif grep -q "^${line}$" <<< "$UNIT_ONE_LIST" || \
+			     case "$line" in MEMCG_PERCPU_B|MEMCG_ZSWAP_B|NR_SLAB_RECLAIMABLE_B|NR_SLAB_UNRECLAIMABLE_B) true ;; *) false ;; esac; then
 				unit=1
 			fi
 			local expected=$((raw * unit))
@@ -350,10 +373,15 @@ fi
 echo "${GREEN}✅ CONFIG_KSERIAL is enabled${NC}"
 echo ""
 
-# Create test cgroup
-mkdir -p "$TEST_PATH"
-echo "Created test cgroup: $TEST_PATH"
-echo ""
+# Create test cgroup (skip when testing root)
+if [ "$TEST_ROOT" -eq 1 ]; then
+	echo "Testing root cgroup: $TEST_PATH"
+	echo ""
+else
+	mkdir -p "$TEST_PATH"
+	echo "Created test cgroup: $TEST_PATH"
+	echo ""
+fi
 
 echo "=========================================="
 echo "${BLUE}Test 1: Default Mode (No Write)${NC}"
@@ -365,7 +393,7 @@ cat "$TEST_PATH/memory.stat.ks" | head -10
 echo "..."
 echo ""
 echo "Mode line:"
-cat "$TEST_PATH/memory.stat.ks" | grep "# Mode:"
+cat "$TEST_PATH/memory.stat.ks" | grep "# Mode:" || true
 echo ""
 
 LINE_COUNT=$(cat "$TEST_PATH/memory.stat.ks" | grep -v "^#" | wc -l)
@@ -401,9 +429,14 @@ echo ""
 
 SCHEMA_FILE="$(mktemp)"
 SCHEMA_META="$(build_full_schema "$SCHEMA_FILE")"
+if ! grep -q "vmstats\.state\[" "$SCHEMA_FILE"; then
+	echo "${RED}❌ Full schema has no vmstats.state[] fields (extraction from ${MEMCONTROL_C} failed).${NC}" 1>&2
+	rm -f "$SCHEMA_FILE"
+	exit 1
+fi
 cat "$SCHEMA_FILE" > "$TEST_PATH/memory.stat.ks"
 RESULT=$(cat "$TEST_PATH/memory.stat.ks")
-echo "$RESULT" | head -10
+echo "$RESULT" | head -15
 echo "..."
 echo ""
 
@@ -432,54 +465,129 @@ fi
 echo ""
 
 echo "=========================================="
-echo "${BLUE}Test 5: 100x Read Comparison${NC}"
+N_READS=1000
+echo "${BLUE}Test 5: ${N_READS}x Read Comparison${NC}"
 echo "=========================================="
-echo "Compare: memory.stat vs memory.stat.ks (full BTF)"
-echo "         memory.numa_stat vs memory.numa_stat.ks (legacy)"
+echo "memory.stat / memory.stat.ks: full read vs full BTF vs 10-field BTF"
+echo "memory.numa_stat / memory.numa_stat.ks: full read vs full BTF (all fields via schema, max 128)"
 echo ""
 
-# memory.stat legacy
+# memory.stat: full read (legacy, all fields)
 START=$(date +%s%N)
-for i in {1..100}; do
+for i in $(seq 1 "$N_READS"); do
     cat "$TEST_PATH/memory.stat" > /dev/null
 done
 END=$(date +%s%N)
 STAT_TIME=$((END - START))
-STAT_AVG=$((STAT_TIME / 100 / 1000))
-echo "memory.stat:     $STAT_AVG μs per read"
+STAT_AVG=$((STAT_TIME / N_READS / 1000))
+echo "memory.stat (full):        $STAT_AVG μs per read"
 
-# memory.stat.ks full BTF
-cat "$SCHEMA_FILE" > "$TEST_PATH/memory.stat.ks"
+# memory.stat.ks: full BTF (write full schema + flush for fair vs legacy, bypass first read, then N_READS reads)
+{ echo -n "flush,"; cat "$SCHEMA_FILE"; } > "$TEST_PATH/memory.stat.ks"
+cat "$TEST_PATH/memory.stat.ks" > /dev/null
 START=$(date +%s%N)
-for i in {1..100}; do
+for i in $(seq 1 "$N_READS"); do
     cat "$TEST_PATH/memory.stat.ks" > /dev/null
 done
 END=$(date +%s%N)
 STAT_KS_TIME=$((END - START))
-STAT_KS_AVG=$((STAT_KS_TIME / 100 / 1000))
-echo "memory.stat.ks:  $STAT_KS_AVG μs per read"
+STAT_KS_AVG=$((STAT_KS_TIME / N_READS / 1000))
+echo "memory.stat.ks (full BTF): $STAT_KS_AVG μs per read ($N_READS reads, first bypassed)"
+
+# memory.stat.ks: 10-field BTF only (selective read) + flush for fair vs legacy, bypass first, then N_READS reads
+SCHEMA_10=$(head -1 "$SCHEMA_FILE" | tr ',' '\n' | grep "vmstats\.state\[" | head -10 | paste -sd, -)
+if [ -n "$SCHEMA_10" ]; then
+	echo "flush,$SCHEMA_10" > "$TEST_PATH/memory.stat.ks"
+	cat "$TEST_PATH/memory.stat.ks" > /dev/null
+	START=$(date +%s%N)
+	for i in $(seq 1 "$N_READS"); do
+		cat "$TEST_PATH/memory.stat.ks" > /dev/null
+	done
+	END=$(date +%s%N)
+	STAT_KS_10_TIME=$((END - START))
+	STAT_KS_10_AVG=$((STAT_KS_10_TIME / N_READS / 1000))
+	echo "memory.stat.ks (10 fields): $STAT_KS_10_AVG μs per read"
+	if [ "$STAT_AVG" -gt 0 ]; then
+		PCT=$((STAT_KS_10_AVG * 100 / STAT_AVG))
+		SAVE=$((100 - PCT))
+		if [ "$SAVE" -gt 0 ]; then
+			echo "  → 10-field vs full (legacy): ${PCT}% of full (${SAVE}% faster)"
+		else
+			echo "  → 10-field vs full (legacy): ${PCT}% of full ($((-SAVE))% slower)"
+		fi
+	fi
+fi
 echo ""
 
 if [ -f "$TEST_PATH/memory.numa_stat" ] && [ -f "$TEST_PATH/memory.numa_stat.ks" ]; then
+	# memory.numa_stat: full read (legacy)
 	START=$(date +%s%N)
-	for i in {1..100}; do
+	for i in $(seq 1 "$N_READS"); do
 		cat "$TEST_PATH/memory.numa_stat" > /dev/null
 	done
 	END=$(date +%s%N)
 	NUMA_TIME=$((END - START))
-	NUMA_AVG=$((NUMA_TIME / 100 / 1000))
-	echo "memory.numa_stat:     $NUMA_AVG μs per read"
+	NUMA_AVG=$((NUMA_TIME / N_READS / 1000))
+	echo "memory.numa_stat (full):        $NUMA_AVG μs per read"
 
-	START=$(date +%s%N)
-	for i in {1..100}; do
+	# memory.numa_stat.ks (full BTF): write full schema + flush for fair vs legacy, bypass first read, then N_READS reads
+	mapfile -t numa_node_items < <(extract_array_items "memcg_node_stat_items")
+	nr_numa_node=${#numa_node_items[@]}
+	if [ "$nr_numa_node" -gt 0 ]; then
+		numa_schema="flush"
+		for ((i=0; i<nr_numa_node; i++)); do
+			numa_schema+=",vmstats.state[$i]"
+		done
+		echo "$numa_schema" > "$TEST_PATH/memory.numa_stat.ks"
 		cat "$TEST_PATH/memory.numa_stat.ks" > /dev/null
-	done
-	END=$(date +%s%N)
-	NUMA_KS_TIME=$((END - START))
-	NUMA_KS_AVG=$((NUMA_KS_TIME / 100 / 1000))
-	echo "memory.numa_stat.ks:  $NUMA_KS_AVG μs per read"
-	compare_plain_outputs "$TEST_PATH/memory.numa_stat" "$TEST_PATH/memory.numa_stat.ks" \
-		"memory.numa_stat vs memory.numa_stat.ks"
+		START=$(date +%s%N)
+		for i in $(seq 1 "$N_READS"); do
+			cat "$TEST_PATH/memory.numa_stat.ks" > /dev/null
+		done
+		END=$(date +%s%N)
+		NUMA_KS_BTF_TIME=$((END - START))
+		NUMA_KS_BTF_AVG=$((NUMA_KS_BTF_TIME / N_READS / 1000))
+		echo "memory.numa_stat.ks (full BTF): $NUMA_KS_BTF_AVG μs per read ($nr_numa_node fields: vmstats.state[0]..[$((nr_numa_node-1))], first bypassed)"
+		NUMA_BTF_RESULT=$(cat "$TEST_PATH/memory.numa_stat.ks")
+		NUMA_BTF_LINES=$(echo "$NUMA_BTF_RESULT" | grep -v "^#" | wc -l)
+		if [ "$NUMA_BTF_LINES" -eq "$nr_numa_node" ]; then
+			echo "${GREEN}✅ memory.numa_stat.ks (full BTF) line count matches schema${NC}"
+		else
+			echo "${YELLOW}⚠️  memory.numa_stat.ks (full BTF) expected $nr_numa_node lines, got $NUMA_BTF_LINES${NC}"
+		fi
+
+		# memory.numa_stat.ks (10 fields): write flush + vmstats.state[0]..[9] for fair vs legacy, bypass first, N_READS reads
+		numa_schema_10="flush"
+		for ((i=0; i<10 && i<nr_numa_node; i++)); do
+			numa_schema_10+=",vmstats.state[$i]"
+		done
+		if [ "$numa_schema_10" != "flush" ]; then
+			echo "$numa_schema_10" > "$TEST_PATH/memory.numa_stat.ks"
+			cat "$TEST_PATH/memory.numa_stat.ks" > /dev/null
+			START=$(date +%s%N)
+			for i in $(seq 1 "$N_READS"); do
+				cat "$TEST_PATH/memory.numa_stat.ks" > /dev/null
+			done
+			END=$(date +%s%N)
+			NUMA_KS_10_TIME=$((END - START))
+			NUMA_KS_10_AVG=$((NUMA_KS_10_TIME / N_READS / 1000))
+			echo "memory.numa_stat.ks (10 fields): $NUMA_KS_10_AVG μs per read"
+			if [ "$NUMA_AVG" -gt 0 ]; then
+				NUMA_PCT=$((NUMA_KS_10_AVG * 100 / NUMA_AVG))
+				NUMA_SAVE=$((100 - NUMA_PCT))
+				if [ "$NUMA_SAVE" -gt 0 ]; then
+					echo "  → 10-field vs full (legacy): ${NUMA_PCT}% of full (${NUMA_SAVE}% faster)"
+				else
+					echo "  → 10-field vs full (legacy): ${NUMA_PCT}% of full ($((-NUMA_SAVE))% slower)"
+				fi
+			fi
+		fi
+
+		# One-time compare: legacy numa_stat.ks vs memory.numa_stat (same content, format differs in BTF mode)
+		echo "" > "$TEST_PATH/memory.numa_stat.ks"
+		compare_plain_outputs "$TEST_PATH/memory.numa_stat" "$TEST_PATH/memory.numa_stat.ks" \
+			"memory.numa_stat vs memory.numa_stat.ks (legacy, content match)"
+	fi
 else
 	echo "${YELLOW}⚠️  NUMA stat files not found, skipping${NC}"
 fi
@@ -557,8 +665,10 @@ echo ""
 
 # Cleanup
 rm -f "$SCHEMA_FILE"
-rmdir "$TEST_PATH"
-echo "Cleaned up test cgroup"
+if [ "$TEST_ROOT" -eq 0 ]; then
+	rmdir "$TEST_PATH"
+	echo "Cleaned up test cgroup"
+fi
 echo ""
 
 echo "${GREEN}All tests complete!${NC}"
