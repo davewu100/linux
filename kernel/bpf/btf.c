@@ -563,6 +563,7 @@ s32 btf_find_by_name_kind(const struct btf *btf, const char *name, u8 kind)
 
 	return -ENOENT;
 }
+EXPORT_SYMBOL_GPL(btf_find_by_name_kind);
 
 s32 bpf_find_btf_id(const char *name, u32 kind, struct btf **btf_p)
 {
@@ -624,6 +625,7 @@ const struct btf_type *btf_type_skip_modifiers(const struct btf *btf,
 
 	return t;
 }
+EXPORT_SYMBOL_GPL(btf_type_skip_modifiers);
 
 const struct btf_type *btf_type_resolve_ptr(const struct btf *btf,
 					    u32 id, u32 *res_id)
@@ -844,6 +846,7 @@ const char *btf_name_by_offset(const struct btf *btf, u32 offset)
 {
 	return btf_str_by_offset(btf, offset);
 }
+EXPORT_SYMBOL_GPL(btf_name_by_offset);
 
 const struct btf_type *btf_type_by_id(const struct btf *btf, u32 type_id)
 {
