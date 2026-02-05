@@ -3952,6 +3952,12 @@ static void mem_cgroup_css_free(struct cgroup_subsys_state *css)
 	cancel_work_sync(&memcg->high_work);
 	memcg1_remove_from_trees(memcg);
 	free_shrinker_info(memcg);
+#ifdef CONFIG_KSERIAL
+	kfree(memcg->stat_ks_config);
+	memcg->stat_ks_config = NULL;
+	kfree(memcg->numa_stat_ks_config);
+	memcg->numa_stat_ks_config = NULL;
+#endif
 	mem_cgroup_free(memcg);
 }
 
@@ -4523,6 +4529,310 @@ int memory_stat_show(struct seq_file *m, void *v)
 	return 0;
 }
 
+#ifdef CONFIG_KSERIAL
+
+#include <linux/kserial.h>
+
+/* Per-memcg config for memory.stat.ks filter (persists across open/close) */
+struct memcg_stat_ks_config {
+	struct ks_schema schema;
+	/* Per-memcg resolved cache: (offset, size) per field for direct read */
+	struct ks_resolved_field resolved[KS_MAX_FIELDS];
+	bool resolved_valid;
+};
+
+static const char *translate_btf_to_field_name(const char *btf_path);
+
+/*
+ * BTF mode: Query specified fields using kserial BTF engine.
+ * Events (pgscan, pgsteal, etc.) are exposed via vmstats.events[N] in BTF.
+ */
+static int memory_stat_ks_show_btf(struct seq_file *m,
+				    struct mem_cgroup *memcg,
+				    struct memcg_stat_ks_config *cfg)
+{
+	int ret, i;
+	u32 nr;
+
+	if (!cfg || cfg->schema.nr_fields == 0)
+		return -EINVAL;
+
+	/* Flush to match memory.stat freshness */
+	mem_cgroup_flush_stats(memcg);
+
+	nr = cfg->schema.nr_fields;
+
+	/* Fast path: use cached (offset, size), read directly from memcg */
+	if (cfg->resolved_valid) {
+		for (i = 0; i < nr; i++) {
+			u32 off = cfg->resolved[i].offset;
+			u32 sz = cfg->resolved[i].size;
+			u64 value = 0;
+			void *addr;
+			const char *display_name;
+
+			if (sz == 0 || sz > sizeof(value))
+				continue;
+			addr = (char *)memcg + off;
+			memcpy(&value, addr, sz);
+
+			/* Translate BTF path back to simple name for display */
+			display_name = translate_btf_to_field_name(cfg->schema.field_names[i]);
+
+			if (sz == 8)
+				seq_printf(m, "%s %llu\n", display_name, value);
+			else if (sz == 4)
+				seq_printf(m, "%s %u\n", display_name, (u32)value);
+			else if (sz == 2)
+				seq_printf(m, "%s %u\n", display_name, (u16)value);
+			else
+				seq_printf(m, "%s %llu\n", display_name, value);
+		}
+		return 0;
+	}
+
+	/* Cold path: resolve via BTF, fill resolved cache */
+	ret = ks_query_struct(memcg, "mem_cgroup", &cfg->schema, cfg->resolved);
+	if (ret < 0) {
+		seq_printf(m, "# Error: BTF query failed: %d\n", ret);
+		return ret;
+	}
+	cfg->resolved_valid = true;
+
+	/* Output using resolved cache (same as fast path) */
+	for (i = 0; i < nr; i++) {
+		u32 off = cfg->resolved[i].offset;
+		u32 sz = cfg->resolved[i].size;
+		u64 value = 0;
+		void *addr;
+		const char *display_name;
+
+		if (sz == 0 || sz > sizeof(value))
+			continue;
+		addr = (char *)memcg + off;
+		memcpy(&value, addr, sz);
+
+		/* Translate BTF path back to simple name for display */
+		display_name = translate_btf_to_field_name(cfg->schema.field_names[i]);
+
+		if (sz == 8)
+			seq_printf(m, "%s %llu\n", display_name, value);
+		else if (sz == 4)
+			seq_printf(m, "%s %u\n", display_name, (u32)value);
+		else if (sz == 2)
+			seq_printf(m, "%s %u\n", display_name, (u16)value);
+		else
+			seq_printf(m, "%s %llu\n", display_name, value);
+	}
+	return 0;
+}
+
+/**
+ * memory_stat_ks_show - kserial with BTF query support
+ *
+ * Two modes:
+ * 1. Default (no write): Show all fields (backward compatible)
+ * 2. Selective (after write): Use BTF to query only specified fields
+ *
+ * Examples:
+ *   cat /sys/fs/cgroup/memory.stat.ks
+ *   → All fields (legacy mode)
+ *
+ *   echo "anon,file,slab" > /sys/fs/cgroup/memory.stat.ks
+ *   cat /sys/fs/cgroup/memory.stat.ks
+ *   → Only 3 fields via BTF query
+ *
+ *   echo "flush,anon,file" > /sys/fs/cgroup/memory.stat.ks
+ *   cat /sys/fs/cgroup/memory.stat.ks
+ *   → Flush stats + read 2 fields
+ */
+static int memory_stat_ks_show(struct seq_file *m, void *v)
+{
+	struct mem_cgroup *memcg = mem_cgroup_from_seq(m);
+	struct memcg_stat_ks_config *cfg;
+
+	cfg = memcg->stat_ks_config;
+	if (cfg && cfg->schema.nr_fields > 0)
+		return memory_stat_ks_show_btf(m, memcg, cfg);
+	else
+		return memory_stat_show(m, v);
+}
+
+/*
+ * Translate simple field name to BTF path.
+ * e.g. "anon" -> "vmstats.state[14]"
+ *
+ * Returns true if translated, false if field name should be used as-is.
+ */
+static bool translate_field_name_to_btf(const char *name, char *btf_path, size_t len)
+{
+	int i;
+
+	/* Search memory_stats[] for matching name */
+	for (i = 0; i < ARRAY_SIZE(memory_stats); i++) {
+		if (strcmp(name, memory_stats[i].name) == 0) {
+			/* Found match, generate BTF path */
+			snprintf(btf_path, len, "vmstats.state[%u]", memory_stats[i].idx);
+			return true;
+		}
+	}
+
+	/* Search event names (vmstats.events[N]) */
+	for (i = 0; i < ARRAY_SIZE(memcg_vm_event_stat); i++) {
+		if (strcmp(name, vm_event_name(memcg_vm_event_stat[i])) == 0) {
+			snprintf(btf_path, len, "vmstats.events[%u]", i);
+			return true;
+		}
+	}
+
+	/* Not a simple field name, treat as BTF path */
+	return false;
+}
+
+/*
+ * Translate BTF path back to simple field name for display.
+ * e.g. "vmstats.state[14]" -> "anon", "vmstats.events[0]" -> "pswpin"
+ *
+ * Returns the simple name if found, otherwise returns the BTF path.
+ */
+static const char *translate_btf_to_field_name(const char *btf_path)
+{
+	unsigned int idx;
+	int i;
+
+	/* Parse "vmstats.state[N]" format */
+	if (sscanf(btf_path, "vmstats.state[%u]", &idx) == 1) {
+		/* Search memory_stats[] for matching index */
+		for (i = 0; i < ARRAY_SIZE(memory_stats); i++) {
+			if (memory_stats[i].idx == idx)
+				return memory_stats[i].name;
+		}
+	}
+
+	/* Parse "vmstats.events[N]" format */
+	if (sscanf(btf_path, "vmstats.events[%u]", &idx) == 1 &&
+	    idx < ARRAY_SIZE(memcg_vm_event_stat))
+		return vm_event_name(memcg_vm_event_stat[idx]);
+
+	/* Not a recognized BTF path, return as-is */
+	return btf_path;
+}
+
+/*
+ * Handle write to memory.stat.ks: parse and store field list per mem_cgroup.
+ * Filter persists across file open/close. Empty write resets to "show all".
+ *
+ * Format: Comma-separated field names, supports both:
+ *   - Simple names: "anon,file" or event names "pgfault,pgscan_kswapd"
+ *   - BTF paths: "vmstats.state[14],vmstats.events[0]"
+ * Events (pgscan, pgsteal, etc.) are in vmstats.events[N] via BTF, not C-code append.
+ */
+static ssize_t memory_stat_ks_write(struct kernfs_open_file *of,
+				     char *buf, size_t nbytes, loff_t off)
+{
+	struct mem_cgroup *memcg = mem_cgroup_from_css(of_css(of));
+	struct memcg_stat_ks_config *cfg;
+	char *pos, *token;
+	int i;
+
+	if (!of || !of->kn)
+		return -EINVAL;
+
+	/* Empty write = reset to legacy (show all) */
+	if (nbytes == 0 || buf[0] == '\n') {
+		cfg = memcg->stat_ks_config;
+		if (cfg) {
+			memcg->stat_ks_config = NULL;
+			kfree(cfg);
+		}
+		return nbytes;
+	}
+
+	cfg = memcg->stat_ks_config;
+	if (!cfg) {
+		cfg = kzalloc(sizeof(*cfg), GFP_KERNEL);
+		if (!cfg)
+			return -ENOMEM;
+		memcg->stat_ks_config = cfg;
+	}
+	memset(&cfg->schema, 0, sizeof(cfg->schema));
+	cfg->resolved_valid = false;
+
+	/* Parse comma-separated field names from buf (not necessarily NUL-terminated) */
+	pos = buf;
+	i = 0;
+	while (i < KS_MAX_FIELDS) {
+		size_t span = nbytes - (pos - (char *)buf);
+		char field_buf[KS_FIELD_NAME_LEN];
+		char btf_path[KS_FIELD_NAME_LEN];
+
+		if (span == 0)
+			break;
+		token = memchr(pos, ',', span);
+		if (!token)
+			token = pos + span;
+		/* token..token+len is one field (may include leading/trailing space) */
+		while (pos < token && (*pos == ' ' || *pos == '\t' || *pos == '\n'))
+			pos++;
+		{
+			char *end = token;
+			while (end > pos && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\n'))
+				end--;
+			if (end > pos) {
+				size_t field_len = min_t(size_t, end - pos, KS_FIELD_NAME_LEN - 1);
+
+				/* Copy field to temp buffer */
+				memcpy(field_buf, pos, field_len);
+				field_buf[field_len] = '\0';
+
+				/* Optional "flush" token: flush stats before read */
+				if (strcmp(field_buf, "flush") == 0) {
+					cfg->schema.flags |= KS_FLAG_FLUSH;
+				} else {
+					/* Try to translate simple name to BTF path */
+					if (translate_field_name_to_btf(field_buf, btf_path, sizeof(btf_path))) {
+						strscpy(cfg->schema.field_names[i], btf_path, KS_FIELD_NAME_LEN);
+					} else {
+						/* Use as-is (already a BTF path or css.id) */
+						strscpy(cfg->schema.field_names[i], field_buf, KS_FIELD_NAME_LEN);
+					}
+					i++;
+				}
+			}
+		}
+		if (token < buf + nbytes)
+			pos = token + 1;
+		else
+			break;
+	}
+
+	if (i == 0) {
+		/* No valid fields: remove config so we show all */
+		if (memcg->stat_ks_config) {
+			kfree(memcg->stat_ks_config);
+			memcg->stat_ks_config = NULL;
+		}
+		return nbytes;
+	}
+
+	strscpy(cfg->schema.struct_name, "mem_cgroup", KS_FIELD_NAME_LEN);
+	cfg->schema.nr_fields = i;
+
+	return nbytes;
+}
+
+static int memory_stat_ks_open(struct kernfs_open_file *of)
+{
+	return 0;
+}
+
+static void memory_stat_ks_release(struct kernfs_open_file *of)
+{
+	/* Filter is stored in mem_cgroup; nothing to release per open */
+}
+
+#endif /* CONFIG_KSERIAL */
+
 #ifdef CONFIG_NUMA
 static inline unsigned long lruvec_page_state_output(struct lruvec *lruvec,
 						     int item)
@@ -4559,7 +4869,166 @@ static int memory_numa_stat_show(struct seq_file *m, void *v)
 
 	return 0;
 }
-#endif
+
+#ifdef CONFIG_KSERIAL
+/* Map vmstats.state[] index to stat item for numa_stat.ks filter */
+static int memcg_ks_state_index_to_stat_item(unsigned int state_idx)
+{
+	if (state_idx < NR_MEMCG_NODE_STAT_ITEMS)
+		return memcg_node_stat_items[state_idx];
+	if (state_idx < MEMCG_VMSTAT_SIZE)
+		return memcg_stat_items[state_idx - NR_MEMCG_NODE_STAT_ITEMS];
+	return -1;
+}
+
+static int memory_numa_stat_ks_show(struct seq_file *m, void *v)
+{
+	struct mem_cgroup *memcg = mem_cgroup_from_seq(m);
+	struct memcg_stat_ks_config *cfg = memcg->numa_stat_ks_config;
+	int i, nid;
+	unsigned int state_idx;
+	int stat_item;
+
+	mem_cgroup_flush_stats(memcg);
+
+	if (cfg && cfg->schema.nr_fields > 0) {
+		/* Filtered: only requested vmstats.state[N] rows */
+		for (i = 0; i < cfg->schema.nr_fields; i++) {
+			const char *fname = cfg->schema.field_names[i];
+			const char *p;
+
+			if (strncmp(fname, "vmstats.state[", 14) != 0)
+				continue;
+			state_idx = 0;
+			for (p = fname + 14; *p >= '0' && *p <= '9'; p++)
+				state_idx = state_idx * 10 + (*p - '0');
+			if (p == fname + 14)
+				continue;
+			stat_item = memcg_ks_state_index_to_stat_item(state_idx);
+			if (stat_item < 0 || stat_item >= NR_VM_NODE_STAT_ITEMS)
+				continue;
+			seq_printf(m, "%s", fname);
+			for_each_node_state(nid, N_MEMORY) {
+				struct lruvec *lruvec = mem_cgroup_lruvec(memcg, NODE_DATA(nid));
+				u64 size = lruvec_page_state_output(lruvec, stat_item);
+				seq_printf(m, " N%d=%llu", nid, size);
+			}
+			seq_putc(m, '\n');
+		}
+		return 0;
+	}
+
+	/* Legacy: all fields, same as memory_numa_stat_show */
+	for (i = 0; i < ARRAY_SIZE(memory_stats); i++) {
+		if (memory_stats[i].idx >= NR_VM_NODE_STAT_ITEMS)
+			continue;
+		seq_printf(m, "%s", memory_stats[i].name);
+		for_each_node_state(nid, N_MEMORY) {
+			u64 size;
+			struct lruvec *lruvec;
+
+			lruvec = mem_cgroup_lruvec(memcg, NODE_DATA(nid));
+			size = lruvec_page_state_output(lruvec,
+							memory_stats[i].idx);
+			seq_printf(m, " N%d=%llu", nid, size);
+		}
+		seq_putc(m, '\n');
+	}
+	return 0;
+}
+
+static ssize_t memory_numa_stat_ks_write(struct kernfs_open_file *of,
+					 char *buf, size_t nbytes, loff_t off)
+{
+	struct mem_cgroup *memcg = mem_cgroup_from_css(of_css(of));
+	struct memcg_stat_ks_config *cfg;
+	char *pos, *token;
+	int i;
+
+	if (!of || !of->kn)
+		return -EINVAL;
+
+	if (nbytes == 0 || buf[0] == '\n') {
+		cfg = memcg->numa_stat_ks_config;
+		if (cfg) {
+			memcg->numa_stat_ks_config = NULL;
+			kfree(cfg);
+		}
+		return nbytes;
+	}
+
+	cfg = memcg->numa_stat_ks_config;
+	if (!cfg) {
+		cfg = kzalloc(sizeof(*cfg), GFP_KERNEL);
+		if (!cfg)
+			return -ENOMEM;
+		memcg->numa_stat_ks_config = cfg;
+	}
+	memset(&cfg->schema, 0, sizeof(cfg->schema));
+
+	pos = buf;
+	i = 0;
+	while (i < KS_MAX_FIELDS) {
+		size_t span = nbytes - (pos - (char *)buf);
+		char field_buf[KS_FIELD_NAME_LEN];
+		char btf_path[KS_FIELD_NAME_LEN];
+
+		if (span == 0)
+			break;
+		token = memchr(pos, ',', span);
+		if (!token)
+			token = pos + span;
+		while (pos < token && (*pos == ' ' || *pos == '\t' || *pos == '\n'))
+			pos++;
+		{
+			char *end = token;
+			while (end > pos && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\n'))
+				end--;
+			if (end > pos) {
+				size_t field_len = min_t(size_t, end - pos, KS_FIELD_NAME_LEN - 1);
+
+				/* Copy field to temp buffer */
+				memcpy(field_buf, pos, field_len);
+				field_buf[field_len] = '\0';
+
+				/* Try to translate simple name to BTF path */
+				if (translate_field_name_to_btf(field_buf, btf_path, sizeof(btf_path))) {
+					strscpy(cfg->schema.field_names[i], btf_path, KS_FIELD_NAME_LEN);
+				} else {
+					/* Use as-is (already a BTF path) */
+					strscpy(cfg->schema.field_names[i], field_buf, KS_FIELD_NAME_LEN);
+				}
+				i++;
+			}
+		}
+		if (token < buf + nbytes)
+			pos = token + 1;
+		else
+			break;
+	}
+
+	if (i == 0) {
+		if (memcg->numa_stat_ks_config) {
+			kfree(memcg->numa_stat_ks_config);
+			memcg->numa_stat_ks_config = NULL;
+		}
+		return nbytes;
+	}
+
+	cfg->schema.nr_fields = i;
+	return nbytes;
+}
+
+static int memory_numa_stat_ks_open(struct kernfs_open_file *of)
+{
+	return 0;
+}
+
+static void memory_numa_stat_ks_release(struct kernfs_open_file *of)
+{
+}
+#endif /* CONFIG_KSERIAL */
+#endif /* CONFIG_NUMA */
 
 static int memory_oom_group_show(struct seq_file *m, void *v)
 {
@@ -4659,11 +5128,29 @@ static struct cftype memory_files[] = {
 		.name = "stat",
 		.seq_show = memory_stat_show,
 	},
+#ifdef CONFIG_KSERIAL
+	{
+		.name = "stat.ks",
+		.seq_show = memory_stat_ks_show,
+		.write = memory_stat_ks_write,
+		.open = memory_stat_ks_open,
+		.release = memory_stat_ks_release,
+	},
+#endif
 #ifdef CONFIG_NUMA
 	{
 		.name = "numa_stat",
 		.seq_show = memory_numa_stat_show,
 	},
+#ifdef CONFIG_KSERIAL
+	{
+		.name = "numa_stat.ks",
+		.seq_show = memory_numa_stat_ks_show,
+		.write = memory_numa_stat_ks_write,
+		.open = memory_numa_stat_ks_open,
+		.release = memory_numa_stat_ks_release,
+	},
+#endif
 #endif
 	{
 		.name = "oom.group",
