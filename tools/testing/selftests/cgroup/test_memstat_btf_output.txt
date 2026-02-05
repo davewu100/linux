@@ -1,0 +1,186 @@
+==========================================
+memory.stat.ks BTF Query Tests
+==========================================
+
+PASS: CONFIG_KSERIAL is enabled
+
+Using root cgroup: /sys/fs/cgroup
+
+==========================================
+Test 1: Default Mode (No Write)
+==========================================
+Expectation: Show all fields (legacy mode)
+
+nonexistent_field 1
+...
+
+Mode line:
+
+Total fields: 1
+PASS: Test 1 passed: Default mode works
+
+==========================================
+Test 2: Single Field BTF Query
+==========================================
+Query: anon
+
+anon 723
+
+PASS: Test 2 passed: Single field query works
+
+==========================================
+Test 2.5: Multiple Fields with Simple Names
+==========================================
+Query: anon,file,slab (simple names)
+
+anon 723
+file 296299
+
+FAIL: Test 2.5 failed: Expected 3 fields, got 2
+
+==========================================
+Test 3: Full Schema BTF Query
+==========================================
+Query: All fields via generated schema
+
+pgpgin 62339387
+pgpgout 60472936
+pswpin 0
+pswpout 0
+pgscan_kswapd 0
+pgscan_direct 0
+pgscan_khugepaged 0
+pgscan_proactive 0
+pgsteal_kswapd 0
+pgsteal_direct 0
+...
+
+Total fields via BTF: 31
+PASS: memory.stat vs memory.stat.ks (full BTF) outputs match
+
+==========================================
+Test 4: Reset to Default Mode
+==========================================
+Action: Write empty line
+
+PASS: Test 4 passed: Reset to default mode
+Field count: 70 (all fields)
+
+==========================================
+Test 5: Open-once Read Comparison (N-field)
+==========================================
+Compare: memory.stat vs memory.stat.ks (N-field + flush)
+         memory.numa_stat vs memory.numa_stat.ks (N-field + flush)
+Fields: 3,16,32,64,128
+Note: First read (cold) resolves all fields via BTF and fills per-memcg cache;
+      subsequent reads (hot) use cached offset/size only, hence much faster.
+      BTF can be faster than legacy when N is small (fewer lines) or N~full (cached);
+      when N is medium, per-line overhead (offset jump + translate) may make BTF slower.
+
+memory.stat (full):        16 μs per read (open-once)
+memory.numa_stat (full):   13 μs per read (open-once)
+
+Setting filter: 3-field + flush (effective: stat=3, numa=3)
+  memory.stat.ks (1st read, cold): 1253 μs
+  memory.stat.ks (avg 100x, hot): 18 μs per read
+  → Cold/Hot ratio: 69x
+  memory.numa_stat.ks (1st read, cold): 1130 μs
+  memory.numa_stat.ks (avg 100x, hot): 11 μs per read
+  → Cold/Hot ratio: 102x
+
+Setting filter: 16-field + flush (effective: stat=16, numa=16)
+  memory.stat.ks (1st read, cold): 1095 μs
+  memory.stat.ks (avg 100x, hot): 16 μs per read
+  → Cold/Hot ratio: 68x
+  memory.numa_stat.ks (1st read, cold): 1173 μs
+  memory.numa_stat.ks (avg 100x, hot): 12 μs per read
+  → Cold/Hot ratio: 97x
+
+Setting filter: 32-field + flush (effective: stat=32, numa=32)
+  memory.stat.ks (1st read, cold): 1198 μs
+  memory.stat.ks (avg 100x, hot): 18 μs per read
+  → Cold/Hot ratio: 66x
+  memory.numa_stat.ks (1st read, cold): 1108 μs
+  memory.numa_stat.ks (avg 100x, hot): 11 μs per read
+  → Cold/Hot ratio: 100x
+
+Setting filter: 64-field + flush (effective: stat=64, numa=33)
+  memory.stat.ks (1st read, cold): 1116 μs
+  memory.stat.ks (avg 100x, hot): 15 μs per read
+  → Cold/Hot ratio: 74x
+  memory.numa_stat.ks (1st read, cold): 1277 μs
+  memory.numa_stat.ks (avg 100x, hot): 11 μs per read
+  → Cold/Hot ratio: 116x
+
+Setting filter: 128-field + flush (effective: stat=70, numa=33)
+  memory.stat.ks (1st read, cold): 1109 μs
+  memory.stat.ks (avg 100x, hot): 16 μs per read
+  → Cold/Hot ratio: 69x
+  memory.numa_stat.ks (1st read, cold): 1132 μs
+  memory.numa_stat.ks (avg 100x, hot): 10 μs per read
+  → Cold/Hot ratio: 113x
+
+Summary (open-once, μs per read)
+  n_stat/n_numa = number of lines; stat(.ks)/numa(.ks) = legacy stat/numa or .ks μs per read.
+fields   n_stat     stat(.ks)      n_numa     numa(.ks)     
+legacy   70         16             33         13            
+3        3          18             3          11            
+16       16         16             16         12            
+32       32         18             32         11            
+64       64         15             33         11            
+128      70         16             33         10            
+
+==========================================
+Test 6: Internal Field Access
+==========================================
+This tests accessing fields beyond memory.stat
+
+Querying internal fields (if supported):
+  css.id - cgroup subsys ID
+  css.serial_nr - cgroup serial number
+
+css.id 1
+css.serial_nr 5
+
+PASS: Test 6 passed: Internal field access works
+
+==========================================
+Test 7: Invalid Field Handling
+==========================================
+Query: nonexistent_field
+
+WARN: No error message for invalid field
+
+==========================================
+Summary
+==========================================
+
+memory.stat.ks supports BTF queries for selective reads:
+
+Mode 1: Legacy (no write)
+   cat memory.stat.ks
+   Shows all fields (backward compatible)
+
+Mode 2: BTF Query (after write)
+   Simple field names (recommended):
+     echo "anon,file,slab" > memory.stat.ks
+     cat memory.stat.ks
+
+   BTF paths (advanced):
+     echo "vmstats.state[14],vmstats.state[16]" > memory.stat.ks
+     cat memory.stat.ks
+
+   With flush flag:
+     echo "flush,anon,file" > memory.stat.ks
+     cat memory.stat.ks
+
+   Shows only requested fields via BTF query
+
+Key Benefits:
+  - Real BTF-based field resolution
+  - Selective field access (lower overhead)
+  - Simple names auto-translated to BTF paths
+  - Can query internal mem_cgroup fields (via BTF paths)
+  - Automatic cgroup context binding
+
+All tests complete
