@@ -63,6 +63,7 @@
 #include <linux/seq_buf.h>
 #include <linux/sched/isolation.h>
 #include <linux/kmemleak.h>
+#include <linux/memcontrol-atomic.h>
 #include "internal.h"
 #include <net/sock.h>
 #include <net/ip.h>
@@ -344,9 +345,9 @@ static const unsigned int memcg_stat_items[] = {
 };
 
 #define NR_MEMCG_NODE_STAT_ITEMS ARRAY_SIZE(memcg_node_stat_items)
-#define MEMCG_VMSTAT_SIZE (NR_MEMCG_NODE_STAT_ITEMS + \
-			   ARRAY_SIZE(memcg_stat_items))
-#define BAD_STAT_IDX(index) ((u32)(index) >= U8_MAX)
+/* Verify that our fixed MEMCG_VMSTAT_SIZE is large enough */
+static_assert(MEMCG_VMSTAT_SIZE >= NR_MEMCG_NODE_STAT_ITEMS + ARRAY_SIZE(memcg_stat_items),
+	      "MEMCG_VMSTAT_SIZE too small");
 static u8 mem_cgroup_stats_index[MEMCG_NR_STAT] __read_mostly;
 
 static void init_memcg_stats(void)
@@ -364,10 +365,11 @@ static void init_memcg_stats(void)
 		mem_cgroup_stats_index[memcg_stat_items[i]] = j;
 }
 
-static inline int memcg_stats_index(int idx)
+int memcg_stats_index(int idx)
 {
 	return mem_cgroup_stats_index[idx];
 }
+EXPORT_SYMBOL(memcg_stats_index);
 
 struct lruvec_stats_percpu {
 	/* Local (CPU and cgroup) state */
@@ -478,7 +480,9 @@ static const unsigned int memcg_vm_event_stat[] = {
 #endif
 };
 
-#define NR_MEMCG_EVENTS ARRAY_SIZE(memcg_vm_event_stat)
+/* Verify that our fixed NR_MEMCG_EVENTS is large enough */
+static_assert(NR_MEMCG_EVENTS >= ARRAY_SIZE(memcg_vm_event_stat),
+	      "NR_MEMCG_EVENTS too small");
 static u8 mem_cgroup_events_index[NR_VM_EVENT_ITEMS] __read_mostly;
 
 static void init_memcg_events(void)
@@ -490,14 +494,22 @@ static void init_memcg_events(void)
 	memset(mem_cgroup_events_index, U8_MAX,
 	       sizeof(mem_cgroup_events_index));
 
-	for (i = 0; i < NR_MEMCG_EVENTS; ++i)
+	/*
+	 * Use ARRAY_SIZE() instead of NR_MEMCG_EVENTS here because:
+	 * - NR_MEMCG_EVENTS (32) is a fixed capacity now for array declarations
+	 * - memcg_vm_event_stat[] contains actual elements (~31, varies by config)
+	 * - Iterating beyond actual array size would access memcg_vm_event_stat[31]
+	 *   which doesn't exist (array has 31 elements: index 0-30)
+	 */
+	for (i = 0; i < ARRAY_SIZE(memcg_vm_event_stat); ++i)
 		mem_cgroup_events_index[memcg_vm_event_stat[i]] = i;
 }
 
-static inline int memcg_events_index(enum vm_event_item idx)
+int memcg_events_index(enum vm_event_item idx)
 {
 	return mem_cgroup_events_index[idx];
 }
+EXPORT_SYMBOL(memcg_events_index);
 
 struct memcg_vmstats_percpu {
 	/* Stats updates since the last flush */
@@ -650,12 +662,25 @@ static void flush_memcg_stats_dwork(struct work_struct *w)
 unsigned long memcg_page_state(struct mem_cgroup *memcg, int idx)
 {
 	long x;
+
+#ifdef CONFIG_MEMCG_RSTAT_COUNTER
 	int i = memcg_stats_index(idx);
 
 	if (WARN_ONCE(BAD_STAT_IDX(i), "%s: missing stat item %d\n", __func__, idx))
 		return 0;
 
 	x = READ_ONCE(memcg->vmstats->state[i]);
+#elif defined(CONFIG_MEMCG_ATOMIC_COUNTER)
+	/*
+	 * Use cached read (force=false) for performance - O(1) when cache valid.
+	 * Similar to rstat's direct READ_ONCE() above, this reads from cache
+	 * without forcing a tree traversal.
+	 */
+	x = css_atomic_page_state(memcg, idx, false);
+#else
+	return 0;
+#endif
+
 #ifdef CONFIG_SMP
 	if (x < 0)
 		x = 0;
@@ -689,7 +714,7 @@ void mod_memcg_state(struct mem_cgroup *memcg, enum memcg_stat_item idx,
 		       int val)
 {
 	int i = memcg_stats_index(idx);
-	int cpu;
+	int val_pages;
 
 	if (mem_cgroup_disabled())
 		return;
@@ -697,14 +722,24 @@ void mod_memcg_state(struct mem_cgroup *memcg, enum memcg_stat_item idx,
 	if (WARN_ONCE(BAD_STAT_IDX(i), "%s: missing stat item %d\n", __func__, idx))
 		return;
 
-	cpu = get_cpu();
-
+	val_pages = memcg_state_val_in_pages(idx, val);
+#ifdef CONFIG_MEMCG_RSTAT_COUNTER
+	int cpu = get_cpu();
 	this_cpu_add(memcg->vmstats_percpu->state[i], val);
-	val = memcg_state_val_in_pages(idx, val);
-	memcg_rstat_updated(memcg, val, cpu);
-	trace_mod_memcg_state(memcg, idx, val);
-
+	memcg_rstat_updated(memcg, val_pages, cpu);
 	put_cpu();
+#endif
+
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER
+	/*
+	 * Use raw val (not val_pages) - both rstat and atomic store the same
+	 * original value (e.g., bytes for slab). val_pages is only for rstat
+	 * flush threshold calculation. memory.stat will show the stored value.
+	 */
+	css_atomic_mod_state(memcg, i, val);
+#endif
+
+	trace_mod_memcg_state(memcg, idx, val_pages);
 }
 
 #ifdef CONFIG_MEMCG_V1
@@ -717,7 +752,20 @@ unsigned long memcg_page_state_local(struct mem_cgroup *memcg, int idx)
 	if (WARN_ONCE(BAD_STAT_IDX(i), "%s: missing stat item %d\n", __func__, idx))
 		return 0;
 
+#ifdef CONFIG_MEMCG_RSTAT_COUNTER
 	x = READ_ONCE(memcg->vmstats->state_local[i]);
+#elif defined(CONFIG_MEMCG_ATOMIC_COUNTER)
+	/* Read local counter */
+	struct memcg_atomic_counter *counter = READ_ONCE(memcg->atomic_counter);
+
+	if (unlikely(!counter))
+		return 0;
+
+	x = READ_ONCE(counter->state_local[i].counter);
+#else
+	x = 0;
+#endif
+
 #ifdef CONFIG_SMP
 	if (x < 0)
 		x = 0;
@@ -733,7 +781,7 @@ static void mod_memcg_lruvec_state(struct lruvec *lruvec,
 	struct mem_cgroup_per_node *pn;
 	struct mem_cgroup *memcg;
 	int i = memcg_stats_index(idx);
-	int cpu;
+	int val_pages;
 
 	if (WARN_ONCE(BAD_STAT_IDX(i), "%s: missing stat item %d\n", __func__, idx))
 		return;
@@ -741,19 +789,22 @@ static void mod_memcg_lruvec_state(struct lruvec *lruvec,
 	pn = container_of(lruvec, struct mem_cgroup_per_node, lruvec);
 	memcg = pn->memcg;
 
-	cpu = get_cpu();
-
+	val_pages = memcg_state_val_in_pages(idx, val);
+#ifdef CONFIG_MEMCG_RSTAT_COUNTER
+	int cpu = get_cpu();
 	/* Update memcg */
 	this_cpu_add(memcg->vmstats_percpu->state[i], val);
-
 	/* Update lruvec */
 	this_cpu_add(pn->lruvec_stats_percpu->state[i], val);
-
-	val = memcg_state_val_in_pages(idx, val);
-	memcg_rstat_updated(memcg, val, cpu);
-	trace_mod_memcg_lruvec_state(memcg, idx, val);
-
+	memcg_rstat_updated(memcg, val_pages, cpu);
 	put_cpu();
+#endif
+
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER
+	css_atomic_mod_lruvec_state(memcg, pn, i, val);
+#endif
+
+	trace_mod_memcg_lruvec_state(memcg, idx, val_pages);
 }
 
 /**
@@ -832,32 +883,49 @@ void mod_lruvec_kmem_state(void *p, enum node_stat_item idx, int val)
 void count_memcg_events(struct mem_cgroup *memcg, enum vm_event_item idx,
 			  unsigned long count)
 {
-	int i = memcg_events_index(idx);
-	int cpu;
+	int i;
 
 	if (mem_cgroup_disabled())
 		return;
 
-	if (WARN_ONCE(BAD_STAT_IDX(i), "%s: missing stat item %d\n", __func__, idx))
+	i = memcg_events_index(idx);
+	if (WARN_ONCE(BAD_STAT_IDX(i), "%s: missing event item %d\n", __func__, idx))
 		return;
 
-	cpu = get_cpu();
-
+#ifdef CONFIG_MEMCG_RSTAT_COUNTER
+	int cpu = get_cpu();
 	this_cpu_add(memcg->vmstats_percpu->events[i], count);
 	memcg_rstat_updated(memcg, count, cpu);
-	trace_count_memcg_events(memcg, idx, count);
-
 	put_cpu();
+#endif
+
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER
+	css_atomic_count_events(memcg, i, count);
+#endif
 }
 
 unsigned long memcg_events(struct mem_cgroup *memcg, int event)
 {
+	long x;
+
+#ifdef CONFIG_MEMCG_RSTAT_COUNTER
 	int i = memcg_events_index(event);
 
-	if (WARN_ONCE(BAD_STAT_IDX(i), "%s: missing stat item %d\n", __func__, event))
+	if (WARN_ONCE(BAD_STAT_IDX(i), "%s: missing event item %d\n", __func__, event))
 		return 0;
 
-	return READ_ONCE(memcg->vmstats->events[i]);
+	x = READ_ONCE(memcg->vmstats->events[i]);
+#elif defined(CONFIG_MEMCG_ATOMIC_COUNTER)
+	x = css_atomic_events(memcg, event, false);
+#else
+	return 0;
+#endif
+
+#ifdef CONFIG_SMP
+	if (x < 0)
+		x = 0;
+#endif
+	return x;
 }
 
 #ifdef CONFIG_MEMCG_V1
@@ -865,10 +933,22 @@ unsigned long memcg_events_local(struct mem_cgroup *memcg, int event)
 {
 	int i = memcg_events_index(event);
 
-	if (WARN_ONCE(BAD_STAT_IDX(i), "%s: missing stat item %d\n", __func__, event))
+	if (WARN_ONCE(BAD_STAT_IDX(i), "%s: missing event item %d\n", __func__, event))
 		return 0;
 
+#ifdef CONFIG_MEMCG_RSTAT_COUNTER
 	return READ_ONCE(memcg->vmstats->events_local[i]);
+#elif defined(CONFIG_MEMCG_ATOMIC_COUNTER)
+	/* Read local event counter */
+	struct memcg_atomic_counter *counter = READ_ONCE(memcg->atomic_counter);
+
+	if (unlikely(!counter))
+		return 0;
+
+	return READ_ONCE(counter->events_local[i].counter);
+#else
+	return 0;
+#endif
 }
 #endif
 
@@ -1460,6 +1540,7 @@ static bool memcg_accounts_hugetlb(void)
 }
 #endif /* CONFIG_HUGETLB_PAGE */
 
+#ifdef CONFIG_MEMCG_RSTAT_COUNTER
 static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 {
 	int i;
@@ -1481,7 +1562,7 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 
 #ifdef CONFIG_HUGETLB_PAGE
 		if (unlikely(memory_stats[i].idx == NR_HUGETLB) &&
-			!memcg_accounts_hugetlb())
+		    !memcg_accounts_hugetlb())
 			continue;
 #endif
 		size = memcg_page_state_output(memcg, memory_stats[i].idx);
@@ -1517,6 +1598,101 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 			       memcg_events(memcg, memcg_vm_event_stat[i]));
 	}
 }
+#elif defined(CONFIG_MEMCG_ATOMIC_COUNTER)
+static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
+{
+	int i;
+
+	/*
+	 * Provide statistics on the state of the memory subsystem as
+	 * well as cumulative event counters that show past behavior.
+	 *
+	 * This list is ordered following a combination of these gradients:
+	 * 1) generic big picture -> specifics and details
+	 * 2) reflecting userspace activity -> reflecting kernel heuristics
+	 *
+	 * Current memory state:
+	 */
+	css_atomic_flush(memcg, false);
+
+	for (i = 0; i < ARRAY_SIZE(memory_stats); i++) {
+		int idx = memory_stats[i].idx;
+
+#ifdef CONFIG_HUGETLB_PAGE
+		if (unlikely(idx == NR_HUGETLB) &&
+		    !memcg_accounts_hugetlb())
+			continue;
+#endif
+
+		if (memcg->atomic_counter) {
+			u64 size_atomic;
+
+			size_atomic = css_atomic_page_state(memcg, idx, false);
+			size_atomic *= memcg_page_state_output_unit(idx);
+			seq_buf_printf(s, "%s %llu\n", memory_stats[i].name,
+				       size_atomic);
+		}
+
+		if (unlikely(idx == NR_SLAB_UNRECLAIMABLE_B) &&
+		    memcg->atomic_counter) {
+			u64 slab_unreclaimable_atomic, slab_reclaimable_atomic;
+			u64 slab_total_atomic;
+
+			slab_unreclaimable_atomic = css_atomic_page_state(
+				memcg, NR_SLAB_UNRECLAIMABLE_B, false);
+			slab_reclaimable_atomic = css_atomic_page_state(
+				memcg, NR_SLAB_RECLAIMABLE_B, false);
+
+			slab_unreclaimable_atomic *=
+				memcg_page_state_output_unit(NR_SLAB_UNRECLAIMABLE_B);
+			slab_reclaimable_atomic *=
+				memcg_page_state_output_unit(NR_SLAB_RECLAIMABLE_B);
+			slab_total_atomic = slab_unreclaimable_atomic +
+					    slab_reclaimable_atomic;
+			seq_buf_printf(s, "slab %llu\n", slab_total_atomic);
+		}
+	}
+
+	/* Accumulated memory events */
+	if (memcg->atomic_counter) {
+		unsigned long pgscan_atomic, pgsteal_atomic;
+
+		pgscan_atomic = css_atomic_events(memcg, PGSCAN_KSWAPD, false) +
+				css_atomic_events(memcg, PGSCAN_DIRECT, false) +
+				css_atomic_events(memcg, PGSCAN_PROACTIVE, false) +
+				css_atomic_events(memcg, PGSCAN_KHUGEPAGED, false);
+		pgsteal_atomic = css_atomic_events(memcg, PGSTEAL_KSWAPD, false) +
+				 css_atomic_events(memcg, PGSTEAL_DIRECT, false) +
+				 css_atomic_events(memcg, PGSTEAL_PROACTIVE, false) +
+				 css_atomic_events(memcg, PGSTEAL_KHUGEPAGED, false);
+
+		seq_buf_printf(s, "pgscan %lu\n", pgscan_atomic);
+		seq_buf_printf(s, "pgsteal %lu\n", pgsteal_atomic);
+	}
+
+	for (i = 0; i < ARRAY_SIZE(memcg_vm_event_stat); i++) {
+#ifdef CONFIG_MEMCG_V1
+		if (memcg_vm_event_stat[i] == PGPGIN ||
+		    memcg_vm_event_stat[i] == PGPGOUT)
+			continue;
+#endif
+		if (memcg->atomic_counter) {
+			unsigned long count_atomic;
+
+			count_atomic = css_atomic_events(memcg,
+				memcg_vm_event_stat[i], false);
+
+			seq_buf_printf(s, "%s %lu\n",
+				       vm_event_name(memcg_vm_event_stat[i]),
+				       count_atomic);
+		}
+	}
+}
+#else
+static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
+{
+}
+#endif
 
 static void memory_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 {
@@ -3398,6 +3574,9 @@ void mem_cgroup_wb_stats(struct bdi_writeback *wb, unsigned long *pfilepages,
 	struct mem_cgroup *parent;
 
 	mem_cgroup_flush_stats_ratelimited(memcg);
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER
+	css_atomic_flush_ratelimited(memcg);
+#endif
 
 	*pdirty = memcg_page_state(memcg, NR_FILE_DIRTY);
 	*pwriteback = memcg_page_state(memcg, NR_WRITEBACK);
@@ -3672,6 +3851,9 @@ static void free_mem_cgroup_per_node_info(struct mem_cgroup_per_node *pn)
 
 	free_percpu(pn->lruvec_stats_percpu);
 	kfree(pn->lruvec_stats);
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER
+	css_atomic_exit_per_node(pn);
+#endif
 	kfree(pn);
 }
 
@@ -3694,6 +3876,11 @@ static bool alloc_mem_cgroup_per_node_info(struct mem_cgroup *memcg, int node)
 	if (!pn->lruvec_stats_percpu)
 		goto fail;
 
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER
+	if (css_atomic_init_per_node(pn, node))
+		goto fail;
+#endif
+
 	lruvec_init(&pn->lruvec);
 	pn->memcg = memcg;
 
@@ -3708,6 +3895,16 @@ static void __mem_cgroup_free(struct mem_cgroup *memcg)
 {
 	int node;
 
+	/*
+	 * This function is called from mem_cgroup_css_free(), which is
+	 * invoked by the cgroup framework AFTER an RCU grace period following
+	 * css_offline. This ensures that any concurrent RCU readers accessing
+	 * this memcg (e.g., in atomic counter recursive traversal) have
+	 * completed before we free the memory.
+	 *
+	 * See mem_cgroup_css_offline() for detailed RCU synchronization notes.
+	 */
+
 	obj_cgroup_put(memcg->orig_objcg);
 
 	for_each_node(node)
@@ -3715,6 +3912,9 @@ static void __mem_cgroup_free(struct mem_cgroup *memcg)
 	memcg1_free_events(memcg);
 	kfree(memcg->vmstats);
 	free_percpu(memcg->vmstats_percpu);
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER
+	css_atomic_exit(memcg);
+#endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
 	kfree(memcg);
 }
 
@@ -3753,6 +3953,13 @@ static struct mem_cgroup *mem_cgroup_alloc(struct mem_cgroup *parent)
 						 GFP_KERNEL_ACCOUNT);
 	if (!memcg->vmstats_percpu)
 		goto fail;
+
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER
+	/* Allocate per-cgroup atomic counter stats (experimental) */
+	error = css_atomic_init(memcg);
+	if (error)
+		goto fail;
+#endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
 
 	if (!memcg1_alloc_events(memcg))
 		goto fail;
@@ -3876,6 +4083,10 @@ static int mem_cgroup_css_online(struct cgroup_subsys_state *css)
 				   FLUSH_TIME);
 	lru_gen_online_memcg(memcg);
 
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER
+	css_atomic_online(memcg);
+#endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
+
 	/* Online state pins memcg ID, memcg ID pins CSS */
 	refcount_set(&memcg->id.ref, 1);
 	css_get(css);
@@ -3918,6 +4129,10 @@ static void mem_cgroup_css_offline(struct cgroup_subsys_state *css)
 	lru_gen_offline_memcg(memcg);
 
 	drain_all_stock(memcg);
+
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER
+	css_atomic_offline(memcg);
+#endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
 
 	mem_cgroup_id_put(memcg);
 }
@@ -4508,6 +4723,7 @@ static int memory_events_local_show(struct seq_file *m, void *v)
 	return 0;
 }
 
+#ifdef CONFIG_MEMCG_RSTAT_COUNTER
 int memory_stat_show(struct seq_file *m, void *v)
 {
 	struct mem_cgroup *memcg = mem_cgroup_from_seq(m);
@@ -4522,6 +4738,108 @@ int memory_stat_show(struct seq_file *m, void *v)
 	kfree(buf);
 	return 0;
 }
+#endif /* CONFIG_MEMCG_RSTAT_COUNTER */
+
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER
+/*
+ * memory_stat_show_atomic - Display memory stats using atomic counters
+ *
+ * Dedicated interface for atomic counter backend, available at
+ * /sys/fs/cgroup/memory.stat.atomic. This allows users to explicitly
+ * query atomic stats independent of the default backend.
+ */
+static int memory_stat_show_atomic(struct seq_file *m, void *v)
+{
+	struct mem_cgroup *memcg = mem_cgroup_from_seq(m);
+	char *buf = kmalloc(SEQ_BUF_SIZE, GFP_KERNEL);
+	struct seq_buf s;
+	int i;
+
+	if (!buf)
+		return -ENOMEM;
+	seq_buf_init(&s, buf, SEQ_BUF_SIZE);
+	
+	/* Flush atomic counters */
+	css_atomic_flush(memcg, false);
+	
+	/* Output memory stats using atomic counters */
+	for (i = 0; i < ARRAY_SIZE(memory_stats); i++) {
+		int idx = memory_stats[i].idx;
+		u64 size_atomic;
+
+#ifdef CONFIG_HUGETLB_PAGE
+		if (unlikely(idx == NR_HUGETLB) &&
+		    !memcg_accounts_hugetlb())
+			continue;
+#endif
+
+		if (memcg->atomic_counter) {
+			size_atomic = css_atomic_page_state(memcg, idx, false);
+			size_atomic *= memcg_page_state_output_unit(idx);
+			seq_buf_printf(&s, "%s %llu\n", memory_stats[i].name,
+				       size_atomic);
+		}
+
+		if (unlikely(idx == NR_SLAB_UNRECLAIMABLE_B) &&
+		    memcg->atomic_counter) {
+			u64 slab_unreclaimable_atomic, slab_reclaimable_atomic;
+			u64 slab_total_atomic;
+
+			slab_unreclaimable_atomic = css_atomic_page_state(
+				memcg, NR_SLAB_UNRECLAIMABLE_B, false);
+			slab_reclaimable_atomic = css_atomic_page_state(
+				memcg, NR_SLAB_RECLAIMABLE_B, false);
+
+			slab_unreclaimable_atomic *=
+				memcg_page_state_output_unit(NR_SLAB_UNRECLAIMABLE_B);
+			slab_reclaimable_atomic *=
+				memcg_page_state_output_unit(NR_SLAB_RECLAIMABLE_B);
+			slab_total_atomic = slab_unreclaimable_atomic +
+					    slab_reclaimable_atomic;
+			seq_buf_printf(&s, "slab %llu\n", slab_total_atomic);
+		}
+	}
+
+	/* Accumulated memory events */
+	if (memcg->atomic_counter) {
+		unsigned long pgscan_atomic, pgsteal_atomic;
+
+		pgscan_atomic = css_atomic_events(memcg, PGSCAN_KSWAPD, false) +
+				css_atomic_events(memcg, PGSCAN_DIRECT, false) +
+				css_atomic_events(memcg, PGSCAN_PROACTIVE, false) +
+				css_atomic_events(memcg, PGSCAN_KHUGEPAGED, false);
+		pgsteal_atomic = css_atomic_events(memcg, PGSTEAL_KSWAPD, false) +
+				 css_atomic_events(memcg, PGSTEAL_DIRECT, false) +
+				 css_atomic_events(memcg, PGSTEAL_PROACTIVE, false) +
+				 css_atomic_events(memcg, PGSTEAL_KHUGEPAGED, false);
+
+		seq_buf_printf(&s, "pgscan %lu\n", pgscan_atomic);
+		seq_buf_printf(&s, "pgsteal %lu\n", pgsteal_atomic);
+	}
+
+	for (i = 0; i < ARRAY_SIZE(memcg_vm_event_stat); i++) {
+#ifdef CONFIG_MEMCG_V1
+		if (memcg_vm_event_stat[i] == PGPGIN ||
+		    memcg_vm_event_stat[i] == PGPGOUT)
+			continue;
+#endif
+		if (memcg->atomic_counter) {
+			unsigned long count_atomic;
+
+			count_atomic = css_atomic_events(memcg,
+				memcg_vm_event_stat[i], false);
+
+			seq_buf_printf(&s, "%s %lu\n",
+				       vm_event_name(memcg_vm_event_stat[i]),
+				       count_atomic);
+		}
+	}
+	
+	seq_puts(m, buf);
+	kfree(buf);
+	return 0;
+}
+#endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
 
 #ifdef CONFIG_NUMA
 static inline unsigned long lruvec_page_state_output(struct lruvec *lruvec,
@@ -4531,6 +4849,52 @@ static inline unsigned long lruvec_page_state_output(struct lruvec *lruvec,
 		memcg_page_state_output_unit(item);
 }
 
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER
+static inline unsigned long lruvec_page_state_output_atomic(
+	struct lruvec *lruvec, int item)
+{
+	return css_atomic_lruvec_page_state(lruvec, item) *
+		memcg_page_state_output_unit(item);
+}
+
+/*
+ * memory_numa_stat_show_atomic - Display NUMA memory stats using atomic counters
+ *
+ * Dedicated interface for atomic counter backend, available at
+ * /sys/fs/cgroup/memory.numa_stat.atomic.
+ */
+static int memory_numa_stat_show_atomic(struct seq_file *m, void *v)
+{
+	int i;
+	struct mem_cgroup *memcg = mem_cgroup_from_seq(m);
+
+	/* Flush atomic counters */
+	css_atomic_flush(memcg, false);
+
+	for (i = 0; i < ARRAY_SIZE(memory_stats); i++) {
+		int nid;
+
+		if (memory_stats[i].idx >= NR_VM_NODE_STAT_ITEMS)
+			continue;
+
+		if (memcg->atomic_counter) {
+			seq_printf(m, "%s", memory_stats[i].name);
+			for_each_node_state(nid, N_MEMORY) {
+				struct lruvec *lruvec = mem_cgroup_lruvec(memcg, NODE_DATA(nid));
+				u64 size_atomic = lruvec_page_state_output_atomic(
+					lruvec, memory_stats[i].idx);
+
+				seq_printf(m, " N%d=%llu", nid, size_atomic);
+			}
+			seq_putc(m, '\n');
+		}
+	}
+
+	return 0;
+}
+#endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
+
+#ifdef CONFIG_MEMCG_RSTAT_COUNTER
 static int memory_numa_stat_show(struct seq_file *m, void *v)
 {
 	int i;
@@ -4559,7 +4923,8 @@ static int memory_numa_stat_show(struct seq_file *m, void *v)
 
 	return 0;
 }
-#endif
+#endif /* CONFIG_MEMCG_RSTAT_COUNTER */
+#endif /* CONFIG_NUMA */
 
 static int memory_oom_group_show(struct seq_file *m, void *v)
 {
@@ -4655,15 +5020,31 @@ static struct cftype memory_files[] = {
 		.file_offset = offsetof(struct mem_cgroup, events_local_file),
 		.seq_show = memory_events_local_show,
 	},
+#ifdef CONFIG_MEMCG_RSTAT_COUNTER
 	{
 		.name = "stat",
 		.seq_show = memory_stat_show,
 	},
+#endif
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER
+	{
+		.name = "stat.atomic",
+		.seq_show = memory_stat_show_atomic,
+	},
+#endif
 #ifdef CONFIG_NUMA
+#ifdef CONFIG_MEMCG_RSTAT_COUNTER
 	{
 		.name = "numa_stat",
 		.seq_show = memory_numa_stat_show,
 	},
+#endif
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER
+	{
+		.name = "numa_stat.atomic",
+		.seq_show = memory_numa_stat_show_atomic,
+	},
+#endif
 #endif
 	{
 		.name = "oom.group",
@@ -5454,6 +5835,9 @@ bool obj_cgroup_may_zswap(struct obj_cgroup *objcg)
 
 		/* Force flush to get accurate stats for charging */
 		__mem_cgroup_flush_stats(memcg, true);
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER
+		css_atomic_flush(memcg, true);
+#endif
 		pages = memcg_page_state(memcg, MEMCG_ZSWAP_B) / PAGE_SIZE;
 		if (pages < max)
 			continue;
@@ -5534,6 +5918,9 @@ static u64 zswap_current_read(struct cgroup_subsys_state *css,
 	struct mem_cgroup *memcg = mem_cgroup_from_css(css);
 
 	mem_cgroup_flush_stats(memcg);
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER
+	css_atomic_flush(memcg, false);
+#endif
 	return memcg_page_state(memcg, MEMCG_ZSWAP_B);
 }
 
