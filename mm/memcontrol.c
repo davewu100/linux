@@ -916,7 +916,7 @@ unsigned long memcg_events(struct mem_cgroup *memcg, int event)
 
 	x = READ_ONCE(memcg->vmstats->events[i]);
 #elif defined(CONFIG_MEMCG_ATOMIC_COUNTER)
-	x = css_atomic_events(memcg, event, false);
+	x = memcg_atomic_read_events_cached(memcg, event, false);
 #else
 	return 0;
 #endif
@@ -1603,6 +1603,9 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 {
 	int i;
 
+	if (!memcg->atomic_counter)
+		return;
+
 	/*
 	 * Provide statistics on the state of the memory subsystem as
 	 * well as cumulative event counters that show past behavior.
@@ -1617,6 +1620,7 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 
 	for (i = 0; i < ARRAY_SIZE(memory_stats); i++) {
 		int idx = memory_stats[i].idx;
+		u64 size_atomic;
 
 #ifdef CONFIG_HUGETLB_PAGE
 		if (unlikely(idx == NR_HUGETLB) &&
@@ -1624,24 +1628,19 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 			continue;
 #endif
 
-		if (memcg->atomic_counter) {
-			u64 size_atomic;
+		size_atomic = memcg_atomic_read_state_cached(memcg, idx);
+		size_atomic *= memcg_page_state_output_unit(idx);
+		seq_buf_printf(s, "%s %llu\n", memory_stats[i].name,
+			       size_atomic);
 
-			size_atomic = css_atomic_page_state(memcg, idx, false);
-			size_atomic *= memcg_page_state_output_unit(idx);
-			seq_buf_printf(s, "%s %llu\n", memory_stats[i].name,
-				       size_atomic);
-		}
-
-		if (unlikely(idx == NR_SLAB_UNRECLAIMABLE_B) &&
-		    memcg->atomic_counter) {
+		if (unlikely(idx == NR_SLAB_UNRECLAIMABLE_B)) {
 			u64 slab_unreclaimable_atomic, slab_reclaimable_atomic;
 			u64 slab_total_atomic;
 
-			slab_unreclaimable_atomic = css_atomic_page_state(
-				memcg, NR_SLAB_UNRECLAIMABLE_B, false);
-			slab_reclaimable_atomic = css_atomic_page_state(
-				memcg, NR_SLAB_RECLAIMABLE_B, false);
+			slab_unreclaimable_atomic = memcg_atomic_read_state_cached(
+				memcg, NR_SLAB_UNRECLAIMABLE_B);
+			slab_reclaimable_atomic = memcg_atomic_read_state_cached(
+				memcg, NR_SLAB_RECLAIMABLE_B);
 
 			slab_unreclaimable_atomic *=
 				memcg_page_state_output_unit(NR_SLAB_UNRECLAIMABLE_B);
@@ -1657,14 +1656,14 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 	if (memcg->atomic_counter) {
 		unsigned long pgscan_atomic, pgsteal_atomic;
 
-		pgscan_atomic = css_atomic_events(memcg, PGSCAN_KSWAPD, false) +
-				css_atomic_events(memcg, PGSCAN_DIRECT, false) +
-				css_atomic_events(memcg, PGSCAN_PROACTIVE, false) +
-				css_atomic_events(memcg, PGSCAN_KHUGEPAGED, false);
-		pgsteal_atomic = css_atomic_events(memcg, PGSTEAL_KSWAPD, false) +
-				 css_atomic_events(memcg, PGSTEAL_DIRECT, false) +
-				 css_atomic_events(memcg, PGSTEAL_PROACTIVE, false) +
-				 css_atomic_events(memcg, PGSTEAL_KHUGEPAGED, false);
+		pgscan_atomic = memcg_atomic_read_events_cached(memcg, PGSCAN_KSWAPD) +
+				memcg_atomic_read_events_cached(memcg, PGSCAN_DIRECT) +
+				memcg_atomic_read_events_cached(memcg, PGSCAN_PROACTIVE) +
+				memcg_atomic_read_events_cached(memcg, PGSCAN_KHUGEPAGED);
+		pgsteal_atomic = memcg_atomic_read_events_cached(memcg, PGSTEAL_KSWAPD) +
+				 memcg_atomic_read_events_cached(memcg, PGSTEAL_DIRECT) +
+				 memcg_atomic_read_events_cached(memcg, PGSTEAL_PROACTIVE, false) +
+				 memcg_atomic_read_events_cached(memcg, PGSTEAL_KHUGEPAGED);
 
 		seq_buf_printf(s, "pgscan %lu\n", pgscan_atomic);
 		seq_buf_printf(s, "pgsteal %lu\n", pgsteal_atomic);
@@ -1679,8 +1678,8 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 		if (memcg->atomic_counter) {
 			unsigned long count_atomic;
 
-			count_atomic = css_atomic_events(memcg,
-				memcg_vm_event_stat[i], false);
+			count_atomic = memcg_atomic_read_events_cached(memcg,
+				memcg_vm_event_stat[i]);
 
 			seq_buf_printf(s, "%s %lu\n",
 				       vm_event_name(memcg_vm_event_stat[i]),
@@ -4742,6 +4741,37 @@ int memory_stat_show(struct seq_file *m, void *v)
 
 #ifdef CONFIG_MEMCG_ATOMIC_COUNTER
 /*
+ * Inlined cache reads for memory_stat_show_atomic hot path.
+ * Use after css_atomic_flush() only; avoids cross-module calls to atomic.c.
+ */
+static inline u64 memcg_atomic_read_state_cached(struct mem_cgroup *memcg, int idx)
+{
+	struct memcg_atomic_cache *cache = memcg->atomic_cache;
+	int i;
+
+	if (!cache)
+		return 0;
+	i = memcg_stats_index(idx);
+	if (WARN_ONCE(BAD_STAT_IDX(i), "%s: missing stat item %d\n", __func__, idx))
+		return 0;
+	return READ_ONCE(cache->stats[i]);
+}
+
+static inline unsigned long memcg_atomic_read_events_cached(struct mem_cgroup *memcg,
+							    enum vm_event_item idx)
+{
+	struct memcg_atomic_cache *cache = memcg->atomic_cache;
+	int i;
+
+	if (!cache)
+		return 0;
+	i = memcg_events_index(idx);
+	if (WARN_ONCE(BAD_STAT_IDX(i), "%s: missing event item %d\n", __func__, idx))
+		return 0;
+	return READ_ONCE(cache->events[i]);
+}
+
+/*
  * memory_stat_show_atomic - Display memory stats using atomic counters
  *
  * Dedicated interface for atomic counter backend, available at
@@ -4758,11 +4788,18 @@ static int memory_stat_show_atomic(struct seq_file *m, void *v)
 	if (!buf)
 		return -ENOMEM;
 	seq_buf_init(&s, buf, SEQ_BUF_SIZE);
-	
+
+	/* Early exit: no atomic backend for this cgroup (avoids ~66 branches/read) */
+	if (!memcg->atomic_counter) {
+		seq_puts(m, buf);
+		kfree(buf);
+		return 0;
+	}
+
 	/* Flush atomic counters */
 	css_atomic_flush(memcg, false);
-	
-	/* Output memory stats using atomic counters */
+
+	/* Output memory stats using inlined cache reads (same-file, inlinable) */
 	for (i = 0; i < ARRAY_SIZE(memory_stats); i++) {
 		int idx = memory_stats[i].idx;
 		u64 size_atomic;
@@ -4773,22 +4810,19 @@ static int memory_stat_show_atomic(struct seq_file *m, void *v)
 			continue;
 #endif
 
-		if (memcg->atomic_counter) {
-			size_atomic = css_atomic_page_state(memcg, idx, false);
-			size_atomic *= memcg_page_state_output_unit(idx);
-			seq_buf_printf(&s, "%s %llu\n", memory_stats[i].name,
-				       size_atomic);
-		}
+		size_atomic = memcg_atomic_read_state_cached(memcg, idx);
+		size_atomic *= memcg_page_state_output_unit(idx);
+		seq_buf_printf(&s, "%s %llu\n", memory_stats[i].name,
+			       size_atomic);
 
-		if (unlikely(idx == NR_SLAB_UNRECLAIMABLE_B) &&
-		    memcg->atomic_counter) {
+		if (unlikely(idx == NR_SLAB_UNRECLAIMABLE_B)) {
 			u64 slab_unreclaimable_atomic, slab_reclaimable_atomic;
 			u64 slab_total_atomic;
 
-			slab_unreclaimable_atomic = css_atomic_page_state(
-				memcg, NR_SLAB_UNRECLAIMABLE_B, false);
-			slab_reclaimable_atomic = css_atomic_page_state(
-				memcg, NR_SLAB_RECLAIMABLE_B, false);
+			slab_unreclaimable_atomic = memcg_atomic_read_state_cached(
+				memcg, NR_SLAB_UNRECLAIMABLE_B);
+			slab_reclaimable_atomic = memcg_atomic_read_state_cached(
+				memcg, NR_SLAB_RECLAIMABLE_B);
 
 			slab_unreclaimable_atomic *=
 				memcg_page_state_output_unit(NR_SLAB_UNRECLAIMABLE_B);
@@ -4804,14 +4838,14 @@ static int memory_stat_show_atomic(struct seq_file *m, void *v)
 	if (memcg->atomic_counter) {
 		unsigned long pgscan_atomic, pgsteal_atomic;
 
-		pgscan_atomic = css_atomic_events(memcg, PGSCAN_KSWAPD, false) +
-				css_atomic_events(memcg, PGSCAN_DIRECT, false) +
-				css_atomic_events(memcg, PGSCAN_PROACTIVE, false) +
-				css_atomic_events(memcg, PGSCAN_KHUGEPAGED, false);
-		pgsteal_atomic = css_atomic_events(memcg, PGSTEAL_KSWAPD, false) +
-				 css_atomic_events(memcg, PGSTEAL_DIRECT, false) +
-				 css_atomic_events(memcg, PGSTEAL_PROACTIVE, false) +
-				 css_atomic_events(memcg, PGSTEAL_KHUGEPAGED, false);
+		pgscan_atomic = memcg_atomic_read_events_cached(memcg, PGSCAN_KSWAPD) +
+				memcg_atomic_read_events_cached(memcg, PGSCAN_DIRECT) +
+				memcg_atomic_read_events_cached(memcg, PGSCAN_PROACTIVE) +
+				memcg_atomic_read_events_cached(memcg, PGSCAN_KHUGEPAGED);
+		pgsteal_atomic = memcg_atomic_read_events_cached(memcg, PGSTEAL_KSWAPD) +
+				 memcg_atomic_read_events_cached(memcg, PGSTEAL_DIRECT) +
+				 memcg_atomic_read_events_cached(memcg, PGSTEAL_PROACTIVE, false) +
+				 memcg_atomic_read_events_cached(memcg, PGSTEAL_KHUGEPAGED);
 
 		seq_buf_printf(&s, "pgscan %lu\n", pgscan_atomic);
 		seq_buf_printf(&s, "pgsteal %lu\n", pgsteal_atomic);
@@ -4826,8 +4860,8 @@ static int memory_stat_show_atomic(struct seq_file *m, void *v)
 		if (memcg->atomic_counter) {
 			unsigned long count_atomic;
 
-			count_atomic = css_atomic_events(memcg,
-				memcg_vm_event_stat[i], false);
+			count_atomic = memcg_atomic_read_events_cached(memcg,
+				memcg_vm_event_stat[i]);
 
 			seq_buf_printf(&s, "%s %lu\n",
 				       vm_event_name(memcg_vm_event_stat[i]),
