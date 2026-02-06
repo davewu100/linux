@@ -9,4 +9,5 @@ test_kmem
 test_memcontrol
 test_pids
 test_zswap
+memstat_read_open_once
 wait_inotify
