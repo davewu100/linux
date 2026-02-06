@@ -916,7 +916,7 @@ unsigned long memcg_events(struct mem_cgroup *memcg, int event)
 
 	x = READ_ONCE(memcg->vmstats->events[i]);
 #elif defined(CONFIG_MEMCG_ATOMIC_COUNTER)
-	x = memcg_atomic_read_events_cached(memcg, event, false);
+	x = memcg_atomic_read_events_cached(memcg, event);
 #else
 	return 0;
 #endif
@@ -1662,7 +1662,7 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 				memcg_atomic_read_events_cached(memcg, PGSCAN_KHUGEPAGED);
 		pgsteal_atomic = memcg_atomic_read_events_cached(memcg, PGSTEAL_KSWAPD) +
 				 memcg_atomic_read_events_cached(memcg, PGSTEAL_DIRECT) +
-				 memcg_atomic_read_events_cached(memcg, PGSTEAL_PROACTIVE, false) +
+				 memcg_atomic_read_events_cached(memcg, PGSTEAL_PROACTIVE) +
 				 memcg_atomic_read_events_cached(memcg, PGSTEAL_KHUGEPAGED);
 
 		seq_buf_printf(s, "pgscan %lu\n", pgscan_atomic);
@@ -4844,7 +4844,7 @@ static int memory_stat_show_atomic(struct seq_file *m, void *v)
 				memcg_atomic_read_events_cached(memcg, PGSCAN_KHUGEPAGED);
 		pgsteal_atomic = memcg_atomic_read_events_cached(memcg, PGSTEAL_KSWAPD) +
 				 memcg_atomic_read_events_cached(memcg, PGSTEAL_DIRECT) +
-				 memcg_atomic_read_events_cached(memcg, PGSTEAL_PROACTIVE, false) +
+				 memcg_atomic_read_events_cached(memcg, PGSTEAL_PROACTIVE) +
 				 memcg_atomic_read_events_cached(memcg, PGSTEAL_KHUGEPAGED);
 
 		seq_buf_printf(&s, "pgscan %lu\n", pgscan_atomic);
@@ -4868,7 +4868,7 @@ static int memory_stat_show_atomic(struct seq_file *m, void *v)
 				       count_atomic);
 		}
 	}
-	
+
 	seq_puts(m, buf);
 	kfree(buf);
 	return 0;
