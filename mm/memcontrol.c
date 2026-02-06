@@ -736,7 +736,7 @@ void mod_memcg_state(struct mem_cgroup *memcg, enum memcg_stat_item idx,
 	 * original value (e.g., bytes for slab). val_pages is only for rstat
 	 * flush threshold calculation. memory.stat will show the stored value.
 	 */
-	css_atomic_mod_state(memcg, i, val);
+	memcg_atomic_mod_state(memcg, i, val);
 #endif
 
 	trace_mod_memcg_state(memcg, idx, val_pages);
@@ -801,7 +801,7 @@ static void mod_memcg_lruvec_state(struct lruvec *lruvec,
 #endif
 
 #ifdef CONFIG_MEMCG_ATOMIC_COUNTER
-	css_atomic_mod_lruvec_state(memcg, pn, i, val);
+	memcg_atomic_mod_lruvec_state(memcg, pn, i, val);
 #endif
 
 	trace_mod_memcg_lruvec_state(memcg, idx, val_pages);
@@ -900,7 +900,7 @@ void count_memcg_events(struct mem_cgroup *memcg, enum vm_event_item idx,
 #endif
 
 #ifdef CONFIG_MEMCG_ATOMIC_COUNTER
-	css_atomic_count_events(memcg, i, count);
+	memcg_atomic_count_events(memcg, i, count);
 #endif
 }
 
@@ -1616,7 +1616,7 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 	 *
 	 * Current memory state:
 	 */
-	css_atomic_flush(memcg, false);
+	memcg_atomic_flush(memcg, false);
 
 	for (i = 0; i < ARRAY_SIZE(memory_stats); i++) {
 		int idx = memory_stats[i].idx;
@@ -3574,7 +3574,7 @@ void mem_cgroup_wb_stats(struct bdi_writeback *wb, unsigned long *pfilepages,
 
 	mem_cgroup_flush_stats_ratelimited(memcg);
 #ifdef CONFIG_MEMCG_ATOMIC_COUNTER
-	css_atomic_flush_ratelimited(memcg);
+	memcg_atomic_flush_ratelimited(memcg);
 #endif
 
 	*pdirty = memcg_page_state(memcg, NR_FILE_DIRTY);
@@ -3851,7 +3851,7 @@ static void free_mem_cgroup_per_node_info(struct mem_cgroup_per_node *pn)
 	free_percpu(pn->lruvec_stats_percpu);
 	kfree(pn->lruvec_stats);
 #ifdef CONFIG_MEMCG_ATOMIC_COUNTER
-	css_atomic_exit_per_node(pn);
+	memcg_atomic_exit_per_node(pn);
 #endif
 	kfree(pn);
 }
@@ -3876,7 +3876,7 @@ static bool alloc_mem_cgroup_per_node_info(struct mem_cgroup *memcg, int node)
 		goto fail;
 
 #ifdef CONFIG_MEMCG_ATOMIC_COUNTER
-	if (css_atomic_init_per_node(pn, node))
+	if (memcg_atomic_init_per_node(pn, node))
 		goto fail;
 #endif
 
@@ -3912,7 +3912,7 @@ static void __mem_cgroup_free(struct mem_cgroup *memcg)
 	kfree(memcg->vmstats);
 	free_percpu(memcg->vmstats_percpu);
 #ifdef CONFIG_MEMCG_ATOMIC_COUNTER
-	css_atomic_exit(memcg);
+	memcg_atomic_exit(memcg);
 #endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
 	kfree(memcg);
 }
@@ -3955,7 +3955,7 @@ static struct mem_cgroup *mem_cgroup_alloc(struct mem_cgroup *parent)
 
 #ifdef CONFIG_MEMCG_ATOMIC_COUNTER
 	/* Allocate per-cgroup atomic counter stats (experimental) */
-	error = css_atomic_init(memcg);
+	error = memcg_atomic_init(memcg);
 	if (error)
 		goto fail;
 #endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
@@ -4083,7 +4083,7 @@ static int mem_cgroup_css_online(struct cgroup_subsys_state *css)
 	lru_gen_online_memcg(memcg);
 
 #ifdef CONFIG_MEMCG_ATOMIC_COUNTER
-	css_atomic_online(memcg);
+	memcg_atomic_online(memcg);
 #endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
 
 	/* Online state pins memcg ID, memcg ID pins CSS */
@@ -4130,7 +4130,7 @@ static void mem_cgroup_css_offline(struct cgroup_subsys_state *css)
 	drain_all_stock(memcg);
 
 #ifdef CONFIG_MEMCG_ATOMIC_COUNTER
-	css_atomic_offline(memcg);
+	memcg_atomic_offline(memcg);
 #endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
 
 	mem_cgroup_id_put(memcg);
@@ -4742,7 +4742,7 @@ int memory_stat_show(struct seq_file *m, void *v)
 #ifdef CONFIG_MEMCG_ATOMIC_COUNTER
 /*
  * Inlined cache reads for memory_stat_show_atomic hot path.
- * Use after css_atomic_flush() only; avoids cross-module calls to atomic.c.
+ * Use after memcg_atomic_flush() only; avoids cross-module calls to atomic.c.
  */
 static inline u64 memcg_atomic_read_state_cached(struct mem_cgroup *memcg, int idx)
 {
@@ -4797,7 +4797,7 @@ static int memory_stat_show_atomic(struct seq_file *m, void *v)
 	}
 
 	/* Flush atomic counters */
-	css_atomic_flush(memcg, false);
+	memcg_atomic_flush(memcg, false);
 
 	/* Output memory stats using inlined cache reads (same-file, inlinable) */
 	for (i = 0; i < ARRAY_SIZE(memory_stats); i++) {
@@ -4887,7 +4887,7 @@ static inline unsigned long lruvec_page_state_output(struct lruvec *lruvec,
 static inline unsigned long lruvec_page_state_output_atomic(
 	struct lruvec *lruvec, int item)
 {
-	return css_atomic_lruvec_page_state(lruvec, item) *
+	return memcg_atomic_lruvec_page_state(lruvec, item) *
 		memcg_page_state_output_unit(item);
 }
 
@@ -4903,7 +4903,7 @@ static int memory_numa_stat_show_atomic(struct seq_file *m, void *v)
 	struct mem_cgroup *memcg = mem_cgroup_from_seq(m);
 
 	/* Flush atomic counters */
-	css_atomic_flush(memcg, false);
+	memcg_atomic_flush(memcg, false);
 
 	for (i = 0; i < ARRAY_SIZE(memory_stats); i++) {
 		int nid;
@@ -5870,7 +5870,7 @@ bool obj_cgroup_may_zswap(struct obj_cgroup *objcg)
 		/* Force flush to get accurate stats for charging */
 		__mem_cgroup_flush_stats(memcg, true);
 #ifdef CONFIG_MEMCG_ATOMIC_COUNTER
-		css_atomic_flush(memcg, true);
+		memcg_atomic_flush(memcg, true);
 #endif
 		pages = memcg_page_state(memcg, MEMCG_ZSWAP_B) / PAGE_SIZE;
 		if (pages < max)
@@ -5953,7 +5953,7 @@ static u64 zswap_current_read(struct cgroup_subsys_state *css,
 
 	mem_cgroup_flush_stats(memcg);
 #ifdef CONFIG_MEMCG_ATOMIC_COUNTER
-	css_atomic_flush(memcg, false);
+	memcg_atomic_flush(memcg, false);
 #endif
 	return memcg_page_state(memcg, MEMCG_ZSWAP_B);
 }

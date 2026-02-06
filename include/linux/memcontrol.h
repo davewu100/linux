@@ -46,7 +46,7 @@ enum memcg_stat_item {
  * Fixed array sizes for structures that need compile-time constants.
  *
  * NOTE: This is a workaround to allow memcontrol.c, mm/memcontrol-atomic.c
- * and kernel/cgroup/atomic.c to use these array sizes. The actual arrays (memcg_node_stat_items,
+ * and mm/memcontrol-atomic.c to use these array sizes. The actual arrays (memcg_node_stat_items,
  * memcg_stat_items, memcg_vm_event_stat) are defined in mm/memcontrol.c with
  * the precise elements for the current config, but their sizes need to be
  * available as compile-time constants for struct declarations in the header.

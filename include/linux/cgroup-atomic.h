@@ -54,7 +54,7 @@ struct memcg_atomic_counter_per_node {
  *
  * Key insight: Internal reads NEVER trigger flush!
  * - memcg_page_state(): just READ_ONCE(cache)
- * - memory.stat read: calls css_atomic_flush() which checks threshold
+ * - memory.stat read: calls memcg_atomic_flush() which checks threshold
  *
  * Trade-offs:
  * - Pros: Very fast reads (O(1) always), writes cheap (atomic + counter inc)
@@ -98,13 +98,13 @@ struct memcg_atomic_cache {
  */
 
 /* Cache flush - rstat-like threshold + rate limit check */
-void css_atomic_flush(struct mem_cgroup *memcg, bool force);
-void css_atomic_flush_ratelimited(struct mem_cgroup *memcg);
+void memcg_atomic_flush(struct mem_cgroup *memcg, bool force);
+void memcg_atomic_flush_ratelimited(struct mem_cgroup *memcg);
 
 #else /* !CONFIG_MEMCG_ATOMIC_COUNTER */
 
-static inline void css_atomic_flush(struct mem_cgroup *memcg, bool force) { }
-static inline void css_atomic_flush_ratelimited(struct mem_cgroup *memcg) { }
+static inline void memcg_atomic_flush(struct mem_cgroup *memcg, bool force) { }
+static inline void memcg_atomic_flush_ratelimited(struct mem_cgroup *memcg) { }
 
 #endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
 
