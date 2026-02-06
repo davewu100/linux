@@ -79,7 +79,7 @@ struct memcg_atomic_cache {
 	/* Update tracking (like rstat's stats_updates) */
 	atomic_t stats_updates;		/* Number of unflushed updates */
 	unsigned long flush_time;	/* jiffies when cache was last flushed */
-	
+
 	/* Cached aggregated values (self + all descendants) */
 	u64 stats[MEMCG_VMSTAT_SIZE] ____cacheline_aligned_in_smp;
 	unsigned long events[NR_MEMCG_EVENTS];
@@ -91,12 +91,11 @@ struct memcg_atomic_cache {
 /* Rate limit interval (like rstat's FLUSH_TIME) */
 #define ATOMIC_FLUSH_TIME (2UL * HZ)  /* 2 seconds, same as rstat */
 
-/* Core read functions - cache-based with 2s TTL */
-u64 css_atomic_page_state(struct mem_cgroup *memcg, int idx, bool force);
-unsigned long css_atomic_events(struct mem_cgroup *memcg,
-				enum vm_event_item idx, bool force);
-unsigned long css_atomic_events_recursive(struct mem_cgroup *memcg,
-					  enum vm_event_item idx);
+/*
+ * Note: css_atomic_page_state() and css_atomic_events() have been removed.
+ * Use memcg_atomic_read_state_cached() and memcg_atomic_read_events_cached()
+ * in memcontrol.c instead for better performance (inlined, no cross-module calls).
+ */
 
 /* Cache flush - rstat-like threshold + rate limit check */
 void css_atomic_flush(struct mem_cgroup *memcg, bool force);
@@ -104,21 +103,6 @@ void css_atomic_flush_ratelimited(struct mem_cgroup *memcg);
 
 #else /* !CONFIG_MEMCG_ATOMIC_COUNTER */
 
-static inline u64 css_atomic_page_state(struct mem_cgroup *memcg, int idx,
-					bool force)
-{
-	return 0;
-}
-static inline unsigned long css_atomic_events(struct mem_cgroup *memcg,
-					      enum vm_event_item idx, bool force)
-{
-	return 0;
-}
-static inline unsigned long css_atomic_events_recursive(struct mem_cgroup *memcg,
-							enum vm_event_item idx)
-{
-	return 0;
-}
 static inline void css_atomic_flush(struct mem_cgroup *memcg, bool force) { }
 static inline void css_atomic_flush_ratelimited(struct mem_cgroup *memcg) { }
 

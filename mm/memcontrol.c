@@ -672,11 +672,11 @@ unsigned long memcg_page_state(struct mem_cgroup *memcg, int idx)
 	x = READ_ONCE(memcg->vmstats->state[i]);
 #elif defined(CONFIG_MEMCG_ATOMIC_COUNTER)
 	/*
-	 * Use cached read (force=false) for performance - O(1) when cache valid.
+	 * Use inlined cached read for performance - O(1) when cache valid.
 	 * Similar to rstat's direct READ_ONCE() above, this reads from cache
-	 * without forcing a tree traversal.
+	 * without forcing a tree traversal. Inlined to avoid cross-module call.
 	 */
-	x = css_atomic_page_state(memcg, idx, false);
+	x = (long)memcg_atomic_read_state_cached(memcg, idx);
 #else
 	return 0;
 #endif

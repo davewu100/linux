@@ -37,99 +37,12 @@ static void css_atomic_refresh_cache(struct mem_cgroup *memcg);
 static u64 css_atomic_aggregate_stats(struct mem_cgroup *memcg, int idx);
 static unsigned long css_atomic_aggregate_events(struct mem_cgroup *memcg, int idx);
 
-/**
- * css_atomic_page_state - read atomic counter with rstat-like caching
- * @memcg: the memory cgroup
- * @idx: the stat item (enum memcg_stat_item or node_stat_item)
- * @force: if true, force cache refresh
- *
- * RSTAT-LIKE DESIGN (EXACTLY LIKE RSTAT):
- * - Normal read: directly return cached value, NO flush check!
- * - Force read: flush first, then return
- * - This is exactly how rstat works: memcg_page_state() directly reads vmstats
- *
- * Flush is ONLY triggered by:
- * - Explicit css_atomic_flush() calls (e.g., from memory.stat read)
- * - Those check threshold and rate limit
- *
- * Returns: hierarchical stat value (self + all descendants)
+/*
+ * Note: css_atomic_page_state() and css_atomic_events() have been removed.
+ * All callers now use the inlined memcg_atomic_read_state_cached() and
+ * memcg_atomic_read_events_cached() functions in memcontrol.c for better
+ * performance (avoiding cross-module calls).
  */
-u64 css_atomic_page_state(struct mem_cgroup *memcg, int idx, bool force)
-{
-	struct memcg_atomic_cache *cache;
-	int i = memcg_stats_index(idx);
-
-	if (WARN_ONCE(BAD_STAT_IDX(i), "%s: missing stat item %d\n", __func__, idx))
-		return 0;
-
-	/* BOOT SAFETY: Check if memcg is fully online */
-	if (unlikely(!mem_cgroup_online(memcg)))
-		return 0;
-
-	cache = memcg->atomic_cache;
-	if (unlikely(!cache))
-		return 0;
-
-	/*
-	 * RSTAT-LIKE READ:
-	 * - force=false: directly return cache, like rstat's READ_ONCE(vmstats->state[i])
-	 * - force=true: flush first, then return
-	 *
-	 * NO automatic flush based on time or threshold here!
-	 * That's handled by explicit css_atomic_flush() calls.
-	 */
-	if (force)
-		css_atomic_refresh_cache(memcg);
-
-	return READ_ONCE(cache->stats[i]);
-}
-
-/**
- * css_atomic_events - read atomic counter events with rstat-like caching
- * @memcg: the memory cgroup
- * @idx: the event item
- * @force: if true, force cache refresh
- *
- * Same rstat-like caching logic as css_atomic_page_state().
- *
- * Returns: hierarchical event count
- */
-unsigned long css_atomic_events(struct mem_cgroup *memcg, enum vm_event_item idx,
-				bool force)
-{
-	struct memcg_atomic_cache *cache;
-	int i = memcg_events_index(idx);
-
-	if (WARN_ONCE(BAD_STAT_IDX(i), "%s: missing event item %d\n", __func__, idx))
-		return 0;
-
-	/* BOOT SAFETY */
-	if (unlikely(!mem_cgroup_online(memcg)))
-		return 0;
-
-	cache = memcg->atomic_cache;
-	if (unlikely(!cache))
-		return 0;
-
-	/* RSTAT-LIKE: directly read cache, no automatic flush */
-	if (force)
-		css_atomic_refresh_cache(memcg);
-
-	return READ_ONCE(cache->events[i]);
-}
-
-/**
- * css_atomic_events_recursive - alias for css_atomic_events
- * @memcg: the memory cgroup
- * @idx: the event item
- *
- * Returns: hierarchical event count
- */
-unsigned long css_atomic_events_recursive(struct mem_cgroup *memcg,
-					  enum vm_event_item idx)
-{
-	return css_atomic_events(memcg, idx, false);
-}
 
 /**
  * css_atomic_flush - flush cache if needed (EXACTLY like rstat)

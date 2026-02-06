@@ -318,9 +318,9 @@ void css_atomic_offline(struct mem_cgroup *memcg)
 	 * RCU synchronization and memory safety:
 	 * - list_del_rcu() marks the node as deleted but keeps it accessible
 	 *   to concurrent RCU readers during their grace period
-	 * - Concurrent readers in css_atomic_page_state_recursive()
-	 *   and css_atomic_events_recursive() use rcu_read_lock()
-	 *   to traverse the children list safely
+	 * - Concurrent readers in css_atomic_aggregate_stats() and
+	 *   css_atomic_aggregate_events() (via css_atomic_refresh_cache)
+	 *   use rcu_read_lock() to traverse the children list safely
 	 * - The cgroup framework guarantees that css_free (which calls
 	 *   __mem_cgroup_free) is invoked AFTER an RCU grace period,
 	 *   ensuring all RCU readers have completed before memcg structure
