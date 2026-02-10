@@ -3453,7 +3453,8 @@ config KSERIAL
 	depends on BPF
 	help
 	  Generic BTF layer to resolve (struct_name, field_path) to offset/size
-	  and read field values. When MEMCG is also enabled, adds memory.stat.ks
-	  and memory.numa_stat.ks to the memory cgroup.
+	  and read field values. When CONFIG_MEMCG is enabled, adds memory.stat.ks
+	  (text format with configurable schema) and memory.stat.ks.bin (binary
+	  format, same schema) to the memory cgroup for selective stat read.
 
 endmenu # Kernel hacking
