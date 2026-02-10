@@ -202,7 +202,7 @@ int kserial_btf_resolve(const char *struct_name, const char *field_path,
 	}
 	mutex_unlock(&kserial_btf_cache_mutex);
 
-	/* For "mem_cgroup", use cached BTF+type_id so we do O(n) vmlinux scan only once. */
+	/* Use cached BTF + type_id for mem_cgroup to avoid repeated vmlinux scan. */
 	if (strcmp(struct_name, KSERIAL_MEMCG_STRUCT_NAME) == 0) {
 		mutex_lock(&kserial_btf_cache_mutex);
 		if (kserial_mem_cgroup_cached) {

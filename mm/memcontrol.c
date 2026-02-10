@@ -65,6 +65,7 @@
 #include <linux/kmemleak.h>
 #ifdef CONFIG_KSERIAL
 #include <linux/kserial.h>
+#include <linux/sort.h>
 #endif
 #include "internal.h"
 #include <net/sock.h>
@@ -4548,6 +4549,73 @@ enum ks_field_kind {
 	KS_FIELD_BTF_OFFSET,	/* read from (char *)memcg + field_btf_offset, size field_btf_size */
 };
 
+/*
+ * Build-time table: name -> (kind, index) for memory.stat.ks schema write.
+ * Filled once at init from memory_stats[] and memcg_vm_event_stat[]; no BTF
+ * on the hot path for these fields.
+ */
+#define MEMCG_KS_TABLE_MAX (ARRAY_SIZE(memory_stats) + ARRAY_SIZE(memcg_vm_event_stat) + 3)
+struct memcg_ks_field_entry {
+	char name[KS_DISPLAY_NAME_LEN];
+	u8 kind;
+	u32 idx;
+};
+static struct memcg_ks_field_entry memcg_ks_field_table[MEMCG_KS_TABLE_MAX];
+static u32 memcg_ks_table_nr;
+static bool memcg_ks_table_ready;
+
+static int memcg_ks_field_cmp(const void *a, const void *b)
+{
+	return strcmp(((const struct memcg_ks_field_entry *)a)->name,
+		     ((const struct memcg_ks_field_entry *)b)->name);
+}
+
+static void __init init_memcg_stat_ks_table(void)
+{
+	int i;
+	struct memcg_ks_field_entry *e = memcg_ks_field_table;
+
+	BUILD_BUG_ON(MEMCG_KS_TABLE_MAX < ARRAY_SIZE(memory_stats) + ARRAY_SIZE(memcg_vm_event_stat) + 3);
+
+	/* Composite fields */
+	strscpy(e->name, "slab", sizeof(e->name));
+	e->kind = KS_FIELD_COMPOSITE_SLAB;
+	e->idx = 0;
+	e++;
+	strscpy(e->name, "pgscan", sizeof(e->name));
+	e->kind = KS_FIELD_COMPOSITE_PGSCAN;
+	e->idx = 0;
+	e++;
+	strscpy(e->name, "pgsteal", sizeof(e->name));
+	e->kind = KS_FIELD_COMPOSITE_PGSTEAL;
+	e->idx = 0;
+	e++;
+
+	/* memory_stats[] state items */
+	for (i = 0; i < ARRAY_SIZE(memory_stats); i++, e++) {
+		strscpy(e->name, memory_stats[i].name, sizeof(e->name));
+		e->kind = KS_FIELD_STATE;
+		e->idx = memory_stats[i].idx;
+	}
+
+	/* Event names (memcg_vm_event_stat[]) */
+	for (i = 0; i < ARRAY_SIZE(memcg_vm_event_stat); i++) {
+#ifdef CONFIG_MEMCG_V1
+		if (memcg_vm_event_stat[i] == PGPGIN || memcg_vm_event_stat[i] == PGPGOUT)
+			continue;
+#endif
+		strscpy(e->name, vm_event_name(memcg_vm_event_stat[i]), sizeof(e->name));
+		e->kind = KS_FIELD_EVENT;
+		e->idx = i;
+		e++;
+	}
+
+	memcg_ks_table_nr = e - memcg_ks_field_table;
+	sort(memcg_ks_field_table, memcg_ks_table_nr, sizeof(*memcg_ks_field_table),
+	     memcg_ks_field_cmp, NULL);
+	memcg_ks_table_ready = true;
+}
+
 /* Per-memcg config for memory.stat.ks and memory.numa_stat.ks (persists across open/close) */
 struct memcg_stat_ks_config {
 	/* schema used by numa_stat.ks only (field_names e.g. "vmstats.state[N]") */
@@ -4605,6 +4673,7 @@ static int memory_stat_ks_show_index(struct seq_file *m,
 		u8 kind = cfg->field_kind[i];
 		u32 idx = cfg->field_index[i];
 
+		/* STATE/EVENT: single counter; COMPOSITE_*: sum of several (same as memory.stat). */
 		switch (kind) {
 		case KS_FIELD_STATE:
 			val = memcg_page_state_output(memcg, idx);
@@ -4887,6 +4956,28 @@ static bool memory_stat_ks_field_cb(const char *field_buf, void *ctx)
 		cfg->skip_flush = true;
 		return true;
 	}
+	/* Resolve from build-time table first (no BTF, no per-field loops). */
+	if (memcg_ks_table_ready && memcg_ks_table_nr > 0) {
+		struct memcg_ks_field_entry key;
+		struct memcg_ks_field_entry *ent;
+
+		strscpy(key.name, field_buf, sizeof(key.name));
+		ent = bsearch(&key, memcg_ks_field_table, memcg_ks_table_nr,
+			      sizeof(*memcg_ks_field_table), memcg_ks_field_cmp);
+		if (ent) {
+#ifdef CONFIG_HUGETLB_PAGE
+			if (unlikely(ent->kind == KS_FIELD_STATE && ent->idx == NR_HUGETLB) &&
+			    !memcg_accounts_hugetlb())
+				return true; /* skip hugetlb when disabled */
+#endif
+			cfg->field_kind[*j] = ent->kind;
+			cfg->field_index[*j] = ent->idx;
+			strscpy(cfg->field_name[*j], ent->name, KS_DISPLAY_NAME_LEN);
+			(*j)++;
+			return true;
+		}
+	}
+	/* Resolve via name table (vmstats.state[N], events[N]) or BTF. */
 	if (resolve_name_to_index(field_buf, (enum ks_field_kind *)&cfg->field_kind[*j],
 				  &cfg->field_index[*j],
 				  cfg->field_name[*j],
@@ -4894,7 +4985,7 @@ static bool memory_stat_ks_field_cb(const char *field_buf, void *ctx)
 		(*j)++;
 		return true;
 	}
-	/* Try BTF resolve (e.g. generic path or other struct fields) */
+	/* Fall back to BTF for other struct paths. */
 	{
 		char path_buf[KS_FIELD_NAME_LEN];
 		const char *path = field_buf;
@@ -5816,6 +5907,9 @@ int __init mem_cgroup_init(void)
 	memcg_pn_cachep = KMEM_CACHE(mem_cgroup_per_node,
 				     SLAB_PANIC | SLAB_HWCACHE_ALIGN);
 
+#ifdef CONFIG_KSERIAL
+	init_memcg_stat_ks_table();
+#endif
 	return 0;
 }
 

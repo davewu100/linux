@@ -680,15 +680,16 @@ echo ""
 
 READS=100
 WARMUP_READS=1
+COLD_READS=1
 declare -a KS_FIELDS
 declare -a KS_STAT_EFF
 declare -a KS_STAT_US
 declare -a KS_NUMA_EFF
 declare -a KS_NUMA_US
 
-# Legacy (full file) baseline - same method as .ks: 1st cold, then avg 100x hot (open-once)
+# Legacy baseline: same method as .ks — 1 cold read (timed here), then hot avg from helper
 START=$(date +%s%N)
-"$HELPER_BIN" "$TEST_PATH/memory.stat" 1
+"$HELPER_BIN" "$TEST_PATH/memory.stat" "$COLD_READS"
 END=$(date +%s%N)
 STAT_COLD_US=$(( (END - START) / 1000 ))
 echo "memory.stat (1st full-file read, cold): $STAT_COLD_US μs"
@@ -698,7 +699,7 @@ STAT_LINE_COUNT=$(grep -v "^#" "$TEST_PATH/memory.stat" | wc -l)
 
 if [ -f "$TEST_PATH/memory.numa_stat" ]; then
 	START=$(date +%s%N)
-	"$HELPER_BIN" "$TEST_PATH/memory.numa_stat" 1
+	"$HELPER_BIN" "$TEST_PATH/memory.numa_stat" "$COLD_READS"
 	END=$(date +%s%N)
 	NUMA_COLD_US=$(( (END - START) / 1000 ))
 	echo "memory.numa_stat (1st full-file read, cold): $NUMA_COLD_US μs"
@@ -746,9 +747,8 @@ for n in "${FIELD_COUNTS[@]}"; do
 	fi
 
 	# First full-file read (cold: BTF resolution + populate resolved[])
-	# date +%s%N gives nanoseconds; divide by 1000 for μs
 	START=$(date +%s%N)
-	"$HELPER_BIN" "$TEST_PATH/memory.stat.ks" 1
+	"$HELPER_BIN" "$TEST_PATH/memory.stat.ks" "$COLD_READS"
 	END=$(date +%s%N)
 	STAT_COLD_NS=$((END - START))
 	STAT_COLD_US=$((STAT_COLD_NS / 1000))
@@ -761,7 +761,7 @@ for n in "${FIELD_COUNTS[@]}"; do
 	NUMA_KS_AVG="-"
 	if [ -f "$TEST_PATH/memory.numa_stat.ks" ]; then
 		START=$(date +%s%N)
-		"$HELPER_BIN" "$TEST_PATH/memory.numa_stat.ks" 1
+		"$HELPER_BIN" "$TEST_PATH/memory.numa_stat.ks" "$COLD_READS"
 		END=$(date +%s%N)
 		NUMA_COLD_US=$(( (END - START) / 1000 ))
 		echo "  memory.numa_stat.ks (1st full-file read, cold): $NUMA_COLD_US μs"

@@ -17,7 +17,7 @@
 #include <unistd.h>
 
 #define DEFAULT_LOOPS 100
-#define BUF_SIZE 4096
+#define BUF_SIZE 8192	/* Enough for full memory.stat (e.g. 70+ lines). */
 
 static void do_reads(int fd, char *buf, size_t buf_size, long n)
 {
@@ -70,6 +70,7 @@ int main(int argc, char **argv)
 	}
 
 	if (warmup > 0) {
+		/* Timed run: warmup then measure loops. */
 		do_reads(fd, buf, sizeof(buf), warmup);
 		{
 			struct timespec t0, t1;
@@ -83,6 +84,7 @@ int main(int argc, char **argv)
 			printf("%lu\n", us);
 		}
 	} else {
+		/* No warmup: caller may time this run externally (e.g. cold read). */
 		do_reads(fd, buf, sizeof(buf), loops);
 	}
 
