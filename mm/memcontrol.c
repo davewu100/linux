@@ -63,6 +63,9 @@
 #include <linux/seq_buf.h>
 #include <linux/sched/isolation.h>
 #include <linux/kmemleak.h>
+#ifdef CONFIG_KSERIAL
+#include <linux/kserial.h>
+#endif
 #include "internal.h"
 #include <net/sock.h>
 #include <net/ip.h>
@@ -3713,6 +3716,12 @@ static void __mem_cgroup_free(struct mem_cgroup *memcg)
 	for_each_node(node)
 		free_mem_cgroup_per_node_info(memcg->nodeinfo[node]);
 	memcg1_free_events(memcg);
+#ifdef CONFIG_KSERIAL
+	kfree(memcg->stat_ks_config);
+	memcg->stat_ks_config = NULL;
+	kfree(memcg->stat_ks_buf);
+	memcg->stat_ks_buf = NULL;
+#endif
 	kfree(memcg->vmstats);
 	free_percpu(memcg->vmstats_percpu);
 	kfree(memcg);
@@ -4523,6 +4532,529 @@ int memory_stat_show(struct seq_file *m, void *v)
 	return 0;
 }
 
+#ifdef CONFIG_KSERIAL
+
+#define KS_DISPLAY_NAME_LEN 32
+
+/* Field kind for index-based read (same arrays as memory.stat, no BTF) */
+enum ks_field_kind {
+	KS_FIELD_STATE,		/* memcg_page_state_output(memcg, field_index) */
+	KS_FIELD_EVENT,		/* memcg_events(memcg, memcg_vm_event_stat[field_index]) */
+	KS_FIELD_COMPOSITE_SLAB,
+	KS_FIELD_COMPOSITE_PGSCAN,
+	KS_FIELD_COMPOSITE_PGSTEAL,
+	KS_FIELD_BTF_OFFSET,	/* read from (char *)memcg + field_btf_offset, size field_btf_size */
+};
+
+/* Per-memcg config for memory.stat.ks (persists across open/close) */
+struct memcg_stat_ks_config {
+	bool skip_flush;
+	u32 nr_index_fields;
+	u8 field_kind[KS_MAX_FIELDS];
+	u32 field_index[KS_MAX_FIELDS];
+	u32 field_btf_offset[KS_MAX_FIELDS];
+	u32 field_btf_size[KS_MAX_FIELDS];
+	char field_name[KS_MAX_FIELDS][KS_DISPLAY_NAME_LEN];
+};
+
+/*
+ * Index-based read: use same arrays as memory.stat (memory_stats[], memcg_vm_event_stat).
+ * No BTF, no string parsing on read - just array index + memcg_page_state_output/memcg_events.
+ * Output is batched into a buffer and written once (like memory_stat_show) to avoid
+ * per-line seq_printf overhead.
+ */
+#define KS_STAT_BUF_SIZE (KS_MAX_FIELDS * 64)
+
+/* Binary format for memory.stat.ks.bin: header then array of (kind, index, value). */
+#define MEMCG_KS_BIN_MAGIC 0x314d534bU	/* "KSM1" */
+#define MEMCG_KS_BIN_VERSION 1
+struct memcg_ks_bin_header {
+	u32 magic;
+	u8 version;
+	u8 reserved[3];
+	u32 nr_fields;
+} __packed;
+struct memcg_ks_bin_entry {
+	u8 kind;
+	u8 reserved[3];
+	u32 index;
+	u64 value;
+} __packed;
+
+/* Get value for one field; return 0 on success, -1 to skip. */
+static int memory_stat_ks_get_field_value(struct mem_cgroup *memcg,
+					  struct memcg_stat_ks_config *cfg,
+					  u32 i, u64 *val)
+{
+	u8 kind = cfg->field_kind[i];
+	u32 idx = cfg->field_index[i];
+
+	switch (kind) {
+	case KS_FIELD_STATE:
+		*val = memcg_page_state_output(memcg, idx);
+		break;
+	case KS_FIELD_EVENT:
+		*val = memcg_events(memcg, memcg_vm_event_stat[idx]);
+		break;
+	case KS_FIELD_COMPOSITE_SLAB:
+		*val = memcg_page_state_output(memcg, NR_SLAB_RECLAIMABLE_B) +
+		       memcg_page_state_output(memcg, NR_SLAB_UNRECLAIMABLE_B);
+		break;
+	case KS_FIELD_COMPOSITE_PGSCAN:
+		*val = memcg_events(memcg, PGSCAN_KSWAPD) +
+		       memcg_events(memcg, PGSCAN_DIRECT) +
+		       memcg_events(memcg, PGSCAN_PROACTIVE) +
+		       memcg_events(memcg, PGSCAN_KHUGEPAGED);
+		break;
+	case KS_FIELD_COMPOSITE_PGSTEAL:
+		*val = memcg_events(memcg, PGSTEAL_KSWAPD) +
+		       memcg_events(memcg, PGSTEAL_DIRECT) +
+		       memcg_events(memcg, PGSTEAL_PROACTIVE) +
+		       memcg_events(memcg, PGSTEAL_KHUGEPAGED);
+		break;
+	case KS_FIELD_BTF_OFFSET:
+		*val = kserial_read_field(memcg, cfg->field_btf_offset[i],
+					  cfg->field_btf_size[i]);
+		break;
+	default:
+		return -1;
+	}
+	return 0;
+}
+
+static int memory_stat_ks_show_index(struct seq_file *m,
+				     struct mem_cgroup *memcg,
+				     struct memcg_stat_ks_config *cfg)
+{
+	u32 nr = cfg->nr_index_fields;
+	u32 i;
+	u64 val;
+	char *buf;
+	struct seq_buf s;
+
+	if (nr == 0)
+		return -EINVAL;
+
+	if (!cfg->skip_flush)
+		mem_cgroup_flush_stats(memcg);
+
+	buf = memcg->stat_ks_buf;
+	if (!buf) {
+		buf = kmalloc(KS_STAT_BUF_SIZE, GFP_KERNEL);
+		if (!buf)
+			return -ENOMEM;
+		memcg->stat_ks_buf = buf;
+	}
+	seq_buf_init(&s, buf, KS_STAT_BUF_SIZE);
+
+	for (i = 0; i < nr; i++) {
+		if (memory_stat_ks_get_field_value(memcg, cfg, i, &val) != 0)
+			continue;
+		seq_buf_printf(&s, "%s %llu\n", cfg->field_name[i], val);
+	}
+	if (seq_buf_has_overflowed(&s))
+		pr_warn_ratelimited("memory.stat.ks: buffer overflow, %u fields\n", nr);
+	seq_puts(m, buf);
+	return 0;
+}
+
+/**
+ * memory.stat.ks.bin - binary output, same schema as .ks (no string formatting).
+ * Layout: header (magic, version, nr_fields) then nr_fields entries of
+ * (kind, index, value) each 16 bytes. Configure schema by writing to memory.stat.ks.
+ */
+static int memory_stat_ks_bin_show(struct seq_file *m, void *v)
+{
+	struct mem_cgroup *memcg = mem_cgroup_from_seq(m);
+	struct memcg_stat_ks_config *cfg = memcg->stat_ks_config;
+	struct memcg_ks_bin_header *hdr;
+	struct memcg_ks_bin_entry *ent;
+	char *buf;
+	u32 nr, i;
+	size_t bin_size;
+	u64 val;
+
+	if (!cfg || (nr = cfg->nr_index_fields) == 0)
+		return 0;
+
+	if (!cfg->skip_flush)
+		mem_cgroup_flush_stats(memcg);
+
+	bin_size = sizeof(*hdr) + nr * sizeof(*ent);
+	if (bin_size > KS_STAT_BUF_SIZE)
+		return -EINVAL;
+
+	buf = memcg->stat_ks_buf;
+	if (!buf) {
+		buf = kmalloc(KS_STAT_BUF_SIZE, GFP_KERNEL);
+		if (!buf)
+			return -ENOMEM;
+		memcg->stat_ks_buf = buf;
+	}
+
+	hdr = (struct memcg_ks_bin_header *)buf;
+	hdr->magic = MEMCG_KS_BIN_MAGIC;
+	hdr->version = MEMCG_KS_BIN_VERSION;
+	hdr->nr_fields = nr;
+
+	ent = (struct memcg_ks_bin_entry *)(hdr + 1);
+	for (i = 0; i < nr; i++) {
+		if (memory_stat_ks_get_field_value(memcg, cfg, i, &val) != 0) {
+			ent->kind = 0;
+			ent->index = 0;
+			ent->value = 0;
+		} else {
+			ent->kind = cfg->field_kind[i];
+			ent->index = cfg->field_index[i];
+			ent->value = val;
+		}
+		ent++;
+	}
+
+	seq_write(m, buf, bin_size);
+	return 0;
+}
+
+/**
+ * memory_stat_ks_show - index-based selective read (same arrays as memory.stat)
+ *
+ * 1. Default (no write): Show all fields (memory_stat_show)
+ * 2. After write with valid names (anon, file, slab, ...): Show only those via index path
+ */
+static int memory_stat_ks_show(struct seq_file *m, void *v)
+{
+	struct mem_cgroup *memcg = mem_cgroup_from_seq(m);
+	struct memcg_stat_ks_config *cfg = memcg->stat_ks_config;
+
+	if (cfg && cfg->nr_index_fields > 0)
+		return memory_stat_ks_show_index(m, memcg, cfg);
+	return memory_stat_show(m, v);
+}
+
+/* Parse BTF-style path vmstats.state[N] or vmstats.events[N]; return true if matched. */
+static bool resolve_btf_style_name(const char *name, enum ks_field_kind *kind,
+				   u32 *idx, char *name_out, size_t name_len)
+{
+	unsigned int n;
+	int i;
+
+	if (sscanf(name, "vmstats.state[%u]", &n) == 1) {
+		/* 1) N as memory_stats[] display order: state[0]=anon, state[1]=file, ... */
+		if (n < ARRAY_SIZE(memory_stats)) {
+#ifdef CONFIG_HUGETLB_PAGE
+			if (unlikely(memory_stats[n].idx == NR_HUGETLB) &&
+			    !memcg_accounts_hugetlb())
+				return false;
+#endif
+			*kind = KS_FIELD_STATE;
+			*idx = (u32)memory_stats[n].idx;
+			strscpy(name_out, memory_stats[n].name, name_len);
+			return true;
+		}
+		/* 2) N as VM stat item idx (e.g. state[17] for anon) */
+		for (i = 0; i < ARRAY_SIZE(memory_stats); i++) {
+			if (memory_stats[i].idx == (int)n) {
+#ifdef CONFIG_HUGETLB_PAGE
+				if (unlikely((int)n == NR_HUGETLB) &&
+				    !memcg_accounts_hugetlb())
+					return false;
+#endif
+				*kind = KS_FIELD_STATE;
+				*idx = (u32)n;
+				strscpy(name_out, memory_stats[i].name, name_len);
+				return true;
+			}
+		}
+		/* 3) N as index into memcg_node_stat_items/memcg_stat_items (script schema) */
+		if (n < MEMCG_VMSTAT_SIZE) {
+			int actual_idx = (n < NR_MEMCG_NODE_STAT_ITEMS) ?
+				(int)memcg_node_stat_items[n] :
+				(int)memcg_stat_items[n - NR_MEMCG_NODE_STAT_ITEMS];
+			for (i = 0; i < ARRAY_SIZE(memory_stats); i++) {
+				if (memory_stats[i].idx == actual_idx) {
+#ifdef CONFIG_HUGETLB_PAGE
+					if (unlikely(actual_idx == NR_HUGETLB) &&
+					    !memcg_accounts_hugetlb())
+						return false;
+#endif
+					*kind = KS_FIELD_STATE;
+					*idx = (u32)actual_idx;
+					strscpy(name_out, memory_stats[i].name, name_len);
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+	if (sscanf(name, "vmstats.events[%u]", &n) == 1) {
+		if (n >= ARRAY_SIZE(memcg_vm_event_stat))
+			return false;
+#ifdef CONFIG_MEMCG_V1
+		if (memcg_vm_event_stat[n] == PGPGIN ||
+		    memcg_vm_event_stat[n] == PGPGOUT)
+			return false;
+#endif
+		*kind = KS_FIELD_EVENT;
+		*idx = n;
+		strscpy(name_out, vm_event_name(memcg_vm_event_stat[n]), name_len);
+		return true;
+	}
+	return false;
+}
+
+/*
+ * Resolve field name to (kind, index) for index-based read path.
+ * Accepts: stat names (anon, file, ...), event names, composite (slab, pgscan, pgsteal),
+ * and BTF-style paths vmstats.state[N], vmstats.events[N]. First resolve may do
+ * string parse; result is cached in config so reads stay fast. No BTF on read path.
+ * Returns true if resolved; *kind and *idx and name_out are set.
+ */
+static bool resolve_name_to_index(const char *name, enum ks_field_kind *kind,
+				  u32 *idx, char *name_out, size_t name_len)
+{
+	int i;
+
+	/* Composite fields (one line each in memory.stat) */
+	if (strcmp(name, "slab") == 0) {
+		*kind = KS_FIELD_COMPOSITE_SLAB;
+		*idx = 0;
+		strscpy(name_out, "slab", name_len);
+		return true;
+	}
+	if (strcmp(name, "pgscan") == 0) {
+		*kind = KS_FIELD_COMPOSITE_PGSCAN;
+		*idx = 0;
+		strscpy(name_out, "pgscan", name_len);
+		return true;
+	}
+	if (strcmp(name, "pgsteal") == 0) {
+		*kind = KS_FIELD_COMPOSITE_PGSTEAL;
+		*idx = 0;
+		strscpy(name_out, "pgsteal", name_len);
+		return true;
+	}
+
+	/* memory_stats[] state items */
+	for (i = 0; i < ARRAY_SIZE(memory_stats); i++) {
+		if (strcmp(name, memory_stats[i].name) == 0) {
+#ifdef CONFIG_HUGETLB_PAGE
+			if (unlikely(memory_stats[i].idx == NR_HUGETLB) &&
+			    !memcg_accounts_hugetlb())
+				return false;
+#endif
+			*kind = KS_FIELD_STATE;
+			*idx = memory_stats[i].idx;
+			strscpy(name_out, memory_stats[i].name, name_len);
+			return true;
+		}
+	}
+
+	/* Event names (memcg_vm_event_stat[]) */
+	for (i = 0; i < ARRAY_SIZE(memcg_vm_event_stat); i++) {
+		if (strcmp(name, vm_event_name(memcg_vm_event_stat[i])) == 0) {
+#ifdef CONFIG_MEMCG_V1
+			if (memcg_vm_event_stat[i] == PGPGIN ||
+			    memcg_vm_event_stat[i] == PGPGOUT)
+				return false;
+#endif
+			*kind = KS_FIELD_EVENT;
+			*idx = i;
+			strscpy(name_out, vm_event_name(memcg_vm_event_stat[i]), name_len);
+			return true;
+		}
+	}
+
+	return resolve_btf_style_name(name, kind, idx, name_out, name_len);
+}
+
+/*
+ * Translate simple field name to BTF path.
+ * e.g. "anon" -> "vmstats.state[17]"
+ *
+ * Returns true if translated, false if field name should be used as-is.
+ */
+static bool translate_field_name_to_btf(const char *name, char *btf_path, size_t len)
+{
+	int i;
+
+	/* Search memory_stats[] for matching name */
+	for (i = 0; i < ARRAY_SIZE(memory_stats); i++) {
+		if (strcmp(name, memory_stats[i].name) == 0) {
+			/* Found match, generate BTF path */
+			snprintf(btf_path, len, "vmstats.state[%u]", memory_stats[i].idx);
+			return true;
+		}
+	}
+
+	/* Search event names (vmstats.events[N]) */
+	for (i = 0; i < ARRAY_SIZE(memcg_vm_event_stat); i++) {
+		if (strcmp(name, vm_event_name(memcg_vm_event_stat[i])) == 0) {
+			snprintf(btf_path, len, "vmstats.events[%u]", i);
+			return true;
+		}
+	}
+
+	/* Not a simple field name, treat as BTF path */
+	return false;
+}
+
+/*
+ * Iterate over comma-separated, trimmed fields in buf. Calls cb(field_buf, ctx)
+ * for each non-empty field. If cb returns false, iteration stops.
+ */
+typedef bool (*memcg_ks_field_cb)(const char *field_buf, void *ctx);
+static void memcg_ks_foreach_field(const char *buf, size_t nbytes,
+				   memcg_ks_field_cb cb, void *ctx)
+{
+	const char *pos = buf;
+	char field_buf[KS_FIELD_NAME_LEN];
+
+	while (1) {
+		size_t span = nbytes - (pos - buf);
+		const char *token;
+		const char *end;
+
+		if (span == 0)
+			break;
+		token = memchr(pos, ',', span);
+		if (!token)
+			token = pos + span;
+		while (pos < token && (*pos == ' ' || *pos == '\t' || *pos == '\n'))
+			pos++;
+		end = token;
+		while (end > pos && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\n'))
+			end--;
+		if (end > pos) {
+			size_t field_len = min_t(size_t, end - pos, KS_FIELD_NAME_LEN - 1);
+
+			memcpy(field_buf, pos, field_len);
+			field_buf[field_len] = '\0';
+			if (!cb(field_buf, ctx))
+				break;
+		}
+		if (token < buf + nbytes)
+			pos = token + 1;
+		else
+			break;
+	}
+}
+
+/* Context for stat.ks write field callback */
+struct memcg_ks_stat_write_ctx {
+	struct memcg_stat_ks_config *cfg;
+	int *j;
+};
+
+static bool memory_stat_ks_field_cb(const char *field_buf, void *ctx)
+{
+	struct memcg_ks_stat_write_ctx *c = ctx;
+	struct memcg_stat_ks_config *cfg = c->cfg;
+	int *j = c->j;
+
+	if (*j >= KS_MAX_FIELDS)
+		return true;
+	if (strcmp(field_buf, "flush") == 0)
+		return true;
+	if (strcmp(field_buf, "no_flush") == 0) {
+		cfg->skip_flush = true;
+		return true;
+	}
+	/* Resolve via name table (anon, file, vmstats.state[N], events[N]) or BTF. */
+	if (resolve_name_to_index(field_buf, (enum ks_field_kind *)&cfg->field_kind[*j],
+				  &cfg->field_index[*j],
+				  cfg->field_name[*j],
+				  KS_DISPLAY_NAME_LEN)) {
+		(*j)++;
+		return true;
+	}
+	/* Fall back to BTF for other struct paths. */
+	{
+		char path_buf[KS_FIELD_NAME_LEN];
+		const char *path = field_buf;
+
+		if (translate_field_name_to_btf(field_buf, path_buf, sizeof(path_buf)))
+			path = path_buf;
+		if (kserial_btf_resolve("mem_cgroup", path,
+					&cfg->field_btf_offset[*j],
+					&cfg->field_btf_size[*j]) == 0) {
+			cfg->field_kind[*j] = KS_FIELD_BTF_OFFSET;
+			strscpy(cfg->field_name[*j], field_buf, KS_DISPLAY_NAME_LEN);
+			(*j)++;
+			return true;
+		}
+	}
+	pr_warn_ratelimited("memory.stat.ks: unknown field \"%s\", skipped\n", field_buf);
+	return true;
+}
+
+/*
+ * Handle write to memory.stat.ks: parse and store field list per mem_cgroup.
+ * Filter persists across file open/close. Empty write resets to "show all".
+ *
+ * Format: Comma-separated field names (same as memory.stat): anon, file, slab,
+ *   pgscan, pgsteal, event names. Optional tokens: flush, no_flush.
+ */
+static ssize_t memory_stat_ks_write(struct kernfs_open_file *of,
+				     char *buf, size_t nbytes, loff_t off)
+{
+	struct mem_cgroup *memcg = mem_cgroup_from_css(of_css(of));
+	struct memcg_stat_ks_config *cfg;
+	struct memcg_ks_stat_write_ctx ctx;
+	int j = 0;
+
+	if (!of || !of->kn)
+		return -EINVAL;
+
+	if (nbytes == 0 || buf[0] == '\n') {
+		cfg = memcg->stat_ks_config;
+		if (cfg) {
+			memcg->stat_ks_config = NULL;
+			kfree(cfg);
+		}
+		kfree(memcg->stat_ks_buf);
+		memcg->stat_ks_buf = NULL;
+		return nbytes;
+	}
+
+	cfg = memcg->stat_ks_config;
+	if (!cfg) {
+		cfg = kzalloc(sizeof(*cfg), GFP_KERNEL);
+		if (!cfg)
+			return -ENOMEM;
+		memcg->stat_ks_config = cfg;
+	}
+	cfg->skip_flush = false;
+	cfg->nr_index_fields = 0;
+
+	ctx.cfg = cfg;
+	ctx.j = &j;
+	memcg_ks_foreach_field(buf, nbytes, memory_stat_ks_field_cb, &ctx);
+
+	if (j == 0) {
+		kfree(cfg);
+		memcg->stat_ks_config = NULL;
+		kfree(memcg->stat_ks_buf);
+		memcg->stat_ks_buf = NULL;
+		return nbytes;
+	}
+	cfg->nr_index_fields = j;
+	return nbytes;
+}
+
+/* Shared no-op open/release; filter is stored in mem_cgroup. */
+static int memcg_ks_noop_open(struct kernfs_open_file *of)
+{
+	return 0;
+}
+
+static void memcg_ks_noop_release(struct kernfs_open_file *of)
+{
+}
+
+#endif /* CONFIG_KSERIAL */
+
+
+
 #ifdef CONFIG_NUMA
 static inline unsigned long lruvec_page_state_output(struct lruvec *lruvec,
 						     int item)
@@ -4560,6 +5092,7 @@ static int memory_numa_stat_show(struct seq_file *m, void *v)
 	return 0;
 }
 #endif
+
 
 static int memory_oom_group_show(struct seq_file *m, void *v)
 {
@@ -4659,6 +5192,21 @@ static struct cftype memory_files[] = {
 		.name = "stat",
 		.seq_show = memory_stat_show,
 	},
+#ifdef CONFIG_KSERIAL
+	{
+		.name = "stat.ks",
+		.seq_show = memory_stat_ks_show,
+		.write = memory_stat_ks_write,
+		.open = memcg_ks_noop_open,
+		.release = memcg_ks_noop_release,
+	},
+	{
+		.name = "stat.ks.bin",
+		.seq_show = memory_stat_ks_bin_show,
+		.open = memcg_ks_noop_open,
+		.release = memcg_ks_noop_release,
+	},
+#endif
 #ifdef CONFIG_NUMA
 	{
 		.name = "numa_stat",
