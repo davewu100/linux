@@ -2037,10 +2037,12 @@ struct cftype mem_cgroup_legacy_files[] = {
 		.write = mem_cgroup_reset,
 		.read_u64 = mem_cgroup_read_u64,
 	},
+#ifdef CONFIG_MEMCG_RSTAT_COUNTER
 	{
 		.name = "stat",
 		.seq_show = memory_stat_show,
 	},
+#endif
 	{
 		.name = "force_empty",
 		.write = mem_cgroup_force_empty_write,
