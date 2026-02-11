@@ -18,10 +18,17 @@ TEST_GEN_PROGS += test_memcontrol
 TEST_GEN_PROGS += test_pids
 TEST_GEN_PROGS += test_zswap
 
+# test_memcg_perf is handled separately with custom rules
+TEST_GEN_PROGS += test_memcg_perf
+
 LOCAL_HDRS += $(selfdir)/clone3/clone3_selftests.h $(selfdir)/pidfd/pidfd.h
 
 include ../lib.mk
 include lib/libcgroup.mk
+
+# Simple rule for test_memcg_perf
+$(OUTPUT)/test_memcg_perf: test_memcg_perf.c $(LIBCGROUP_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(TARGET_ARCH) $< $(LIBCGROUP_O) $(LDLIBS) -o $@
 
 $(OUTPUT)/test_core: $(LIBCGROUP_O)
 $(OUTPUT)/test_cpu: $(LIBCGROUP_O)
