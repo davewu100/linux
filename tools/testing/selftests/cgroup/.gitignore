@@ -10,3 +10,4 @@ test_memcontrol
 test_pids
 test_zswap
 wait_inotify
+test_memcg_perf

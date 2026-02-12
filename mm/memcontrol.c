@@ -63,6 +63,7 @@
 #include <linux/seq_buf.h>
 #include <linux/sched/isolation.h>
 #include <linux/kmemleak.h>
+#include <linux/memcontrol-atomic.h>
 #include "internal.h"
 #include <net/sock.h>
 #include <net/ip.h>
@@ -344,9 +345,9 @@ static const unsigned int memcg_stat_items[] = {
 };
 
 #define NR_MEMCG_NODE_STAT_ITEMS ARRAY_SIZE(memcg_node_stat_items)
-#define MEMCG_VMSTAT_SIZE (NR_MEMCG_NODE_STAT_ITEMS + \
-			   ARRAY_SIZE(memcg_stat_items))
-#define BAD_STAT_IDX(index) ((u32)(index) >= U8_MAX)
+/* Verify that our fixed MEMCG_VMSTAT_SIZE is large enough */
+static_assert(MEMCG_VMSTAT_SIZE >= NR_MEMCG_NODE_STAT_ITEMS + ARRAY_SIZE(memcg_stat_items),
+	      "MEMCG_VMSTAT_SIZE too small");
 static u8 mem_cgroup_stats_index[MEMCG_NR_STAT] __read_mostly;
 
 static void init_memcg_stats(void)
@@ -364,10 +365,11 @@ static void init_memcg_stats(void)
 		mem_cgroup_stats_index[memcg_stat_items[i]] = j;
 }
 
-static inline int memcg_stats_index(int idx)
+int memcg_stats_index(int idx)
 {
 	return mem_cgroup_stats_index[idx];
 }
+EXPORT_SYMBOL(memcg_stats_index);
 
 struct lruvec_stats_percpu {
 	/* Local (CPU and cgroup) state */
@@ -478,7 +480,9 @@ static const unsigned int memcg_vm_event_stat[] = {
 #endif
 };
 
-#define NR_MEMCG_EVENTS ARRAY_SIZE(memcg_vm_event_stat)
+/* Verify that our fixed NR_MEMCG_EVENTS is large enough */
+static_assert(NR_MEMCG_EVENTS >= ARRAY_SIZE(memcg_vm_event_stat),
+	      "NR_MEMCG_EVENTS too small");
 static u8 mem_cgroup_events_index[NR_VM_EVENT_ITEMS] __read_mostly;
 
 static void init_memcg_events(void)
@@ -490,14 +494,55 @@ static void init_memcg_events(void)
 	memset(mem_cgroup_events_index, U8_MAX,
 	       sizeof(mem_cgroup_events_index));
 
-	for (i = 0; i < NR_MEMCG_EVENTS; ++i)
+	/*
+	 * Use ARRAY_SIZE() instead of NR_MEMCG_EVENTS here because:
+	 * - NR_MEMCG_EVENTS (32) is a fixed capacity now for array declarations
+	 * - memcg_vm_event_stat[] contains actual elements (~31, varies by config)
+	 * - Iterating beyond actual array size would access memcg_vm_event_stat[31]
+	 *   which doesn't exist (array has 31 elements: index 0-30)
+	 */
+	for (i = 0; i < ARRAY_SIZE(memcg_vm_event_stat); ++i)
 		mem_cgroup_events_index[memcg_vm_event_stat[i]] = i;
 }
 
-static inline int memcg_events_index(enum vm_event_item idx)
+int memcg_events_index(enum vm_event_item idx)
 {
 	return mem_cgroup_events_index[idx];
 }
+EXPORT_SYMBOL(memcg_events_index);
+
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER
+/*
+ * Inlined cache reads for atomic stat hot path.
+ * Use after css_atomic_flush() only; avoids cross-module calls to atomic.c.
+ */
+static inline u64 memcg_atomic_read_state_cached(struct mem_cgroup *memcg, int idx)
+{
+	struct memcg_atomic_aggregated *cache = memcg->atomic_aggregated;
+	int i;
+
+	if (!cache)
+		return 0;
+	i = memcg_stats_index(idx);
+	if (WARN_ONCE(BAD_STAT_IDX(i), "%s: missing stat item %d\n", __func__, idx))
+		return 0;
+	return READ_ONCE(cache->stats[i]);
+}
+
+static inline unsigned long memcg_atomic_read_events_cached(struct mem_cgroup *memcg,
+							    enum vm_event_item idx)
+{
+	struct memcg_atomic_aggregated *cache = memcg->atomic_aggregated;
+	int i;
+
+	if (!cache)
+		return 0;
+	i = memcg_events_index(idx);
+	if (WARN_ONCE(BAD_STAT_IDX(i), "%s: missing event item %d\n", __func__, idx))
+		return 0;
+	return READ_ONCE(cache->events[i]);
+}
+#endif
 
 struct memcg_vmstats_percpu {
 	/* Stats updates since the last flush */
@@ -550,9 +595,11 @@ struct memcg_vmstats {
  *    will let stats be out of sync by atmost (MEMCG_CHARGE_BATCH * nr_cpus) but
  *    only for 2 seconds due to (1).
  */
+static u64 flush_last_time;
+#ifdef CONFIG_MEMCG_RSTAT_COUNTER
 static void flush_memcg_stats_dwork(struct work_struct *w);
 static DECLARE_DEFERRABLE_WORK(stats_flush_dwork, flush_memcg_stats_dwork);
-static u64 flush_last_time;
+#endif
 
 #define FLUSH_TIME (2UL*HZ)
 
@@ -596,6 +643,7 @@ static inline void memcg_rstat_updated(struct mem_cgroup *memcg, int val,
 
 static void __mem_cgroup_flush_stats(struct mem_cgroup *memcg, bool force)
 {
+#ifdef CONFIG_MEMCG_RSTAT_COUNTER
 	bool needs_flush = memcg_vmstats_needs_flush(memcg->vmstats);
 
 	trace_memcg_flush_stats(memcg, atomic_read(&memcg->vmstats->stats_updates),
@@ -603,11 +651,18 @@ static void __mem_cgroup_flush_stats(struct mem_cgroup *memcg, bool force)
 
 	if (!force && !needs_flush)
 		return;
+#endif
 
 	if (mem_cgroup_is_root(memcg))
 		WRITE_ONCE(flush_last_time, jiffies_64);
 
+#ifdef CONFIG_MEMCG_RSTAT_COUNTER
 	css_rstat_flush(&memcg->css);
+#endif
+
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER
+	css_atomic_flush(memcg, force);
+#endif
 }
 
 /*
@@ -637,6 +692,7 @@ void mem_cgroup_flush_stats_ratelimited(struct mem_cgroup *memcg)
 		mem_cgroup_flush_stats(memcg);
 }
 
+#ifdef CONFIG_MEMCG_RSTAT_COUNTER
 static void flush_memcg_stats_dwork(struct work_struct *w)
 {
 	/*
@@ -646,16 +702,30 @@ static void flush_memcg_stats_dwork(struct work_struct *w)
 	__mem_cgroup_flush_stats(root_mem_cgroup, true);
 	queue_delayed_work(system_unbound_wq, &stats_flush_dwork, FLUSH_TIME);
 }
+#endif
 
 unsigned long memcg_page_state(struct mem_cgroup *memcg, int idx)
 {
 	long x;
+
+#ifdef CONFIG_MEMCG_RSTAT_COUNTER
 	int i = memcg_stats_index(idx);
 
 	if (WARN_ONCE(BAD_STAT_IDX(i), "%s: missing stat item %d\n", __func__, idx))
 		return 0;
 
 	x = READ_ONCE(memcg->vmstats->state[i]);
+#elif defined(CONFIG_MEMCG_ATOMIC_COUNTER)
+	/*
+	 * Use cached read (force=false) for performance - O(1) when cache valid.
+	 * Similar to rstat's direct READ_ONCE() above, this reads from cache
+	 * without forcing a tree traversal.
+	 */
+	x = css_atomic_page_state(memcg, idx, false);
+#else
+	return 0;
+#endif
+
 #ifdef CONFIG_SMP
 	if (x < 0)
 		x = 0;
@@ -689,7 +759,7 @@ void mod_memcg_state(struct mem_cgroup *memcg, enum memcg_stat_item idx,
 		       int val)
 {
 	int i = memcg_stats_index(idx);
-	int cpu;
+	int val_pages;
 
 	if (mem_cgroup_disabled())
 		return;
@@ -697,14 +767,24 @@ void mod_memcg_state(struct mem_cgroup *memcg, enum memcg_stat_item idx,
 	if (WARN_ONCE(BAD_STAT_IDX(i), "%s: missing stat item %d\n", __func__, idx))
 		return;
 
-	cpu = get_cpu();
-
+	val_pages = memcg_state_val_in_pages(idx, val);
+#ifdef CONFIG_MEMCG_RSTAT_COUNTER
+	int cpu = get_cpu();
 	this_cpu_add(memcg->vmstats_percpu->state[i], val);
-	val = memcg_state_val_in_pages(idx, val);
-	memcg_rstat_updated(memcg, val, cpu);
-	trace_mod_memcg_state(memcg, idx, val);
-
+	memcg_rstat_updated(memcg, val_pages, cpu);
 	put_cpu();
+#endif
+
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER
+	/*
+	 * Use raw val (not val_pages) - both rstat and atomic store the same
+	 * original value (e.g., bytes for slab). val_pages is only for rstat
+	 * flush threshold calculation. memory.stat will show the stored value.
+	 */
+	memcg_atomic_mod_state(memcg, i, val);
+#endif
+
+	trace_mod_memcg_state(memcg, idx, val_pages);
 }
 
 #ifdef CONFIG_MEMCG_V1
@@ -717,7 +797,20 @@ unsigned long memcg_page_state_local(struct mem_cgroup *memcg, int idx)
 	if (WARN_ONCE(BAD_STAT_IDX(i), "%s: missing stat item %d\n", __func__, idx))
 		return 0;
 
+#ifdef CONFIG_MEMCG_RSTAT_COUNTER
 	x = READ_ONCE(memcg->vmstats->state_local[i]);
+#elif defined(CONFIG_MEMCG_ATOMIC_COUNTER)
+	/* Read local counter */
+	struct memcg_atomic_local *counter = READ_ONCE(memcg->atomic_local);
+
+	if (unlikely(!counter))
+		return 0;
+
+	x = atomic64_read(&counter->state_local[i]);
+#else
+	x = 0;
+#endif
+
 #ifdef CONFIG_SMP
 	if (x < 0)
 		x = 0;
@@ -733,7 +826,7 @@ static void mod_memcg_lruvec_state(struct lruvec *lruvec,
 	struct mem_cgroup_per_node *pn;
 	struct mem_cgroup *memcg;
 	int i = memcg_stats_index(idx);
-	int cpu;
+	int val_pages;
 
 	if (WARN_ONCE(BAD_STAT_IDX(i), "%s: missing stat item %d\n", __func__, idx))
 		return;
@@ -741,19 +834,22 @@ static void mod_memcg_lruvec_state(struct lruvec *lruvec,
 	pn = container_of(lruvec, struct mem_cgroup_per_node, lruvec);
 	memcg = pn->memcg;
 
-	cpu = get_cpu();
-
+	val_pages = memcg_state_val_in_pages(idx, val);
+#ifdef CONFIG_MEMCG_RSTAT_COUNTER
+	int cpu = get_cpu();
 	/* Update memcg */
 	this_cpu_add(memcg->vmstats_percpu->state[i], val);
-
 	/* Update lruvec */
 	this_cpu_add(pn->lruvec_stats_percpu->state[i], val);
-
-	val = memcg_state_val_in_pages(idx, val);
-	memcg_rstat_updated(memcg, val, cpu);
-	trace_mod_memcg_lruvec_state(memcg, idx, val);
-
+	memcg_rstat_updated(memcg, val_pages, cpu);
 	put_cpu();
+#endif
+
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER
+	memcg_atomic_mod_lruvec_state(memcg, pn, i, val);
+#endif
+
+	trace_mod_memcg_lruvec_state(memcg, idx, val_pages);
 }
 
 /**
@@ -832,32 +928,49 @@ void mod_lruvec_kmem_state(void *p, enum node_stat_item idx, int val)
 void count_memcg_events(struct mem_cgroup *memcg, enum vm_event_item idx,
 			  unsigned long count)
 {
-	int i = memcg_events_index(idx);
-	int cpu;
+	int i;
 
 	if (mem_cgroup_disabled())
 		return;
 
-	if (WARN_ONCE(BAD_STAT_IDX(i), "%s: missing stat item %d\n", __func__, idx))
+	i = memcg_events_index(idx);
+	if (WARN_ONCE(BAD_STAT_IDX(i), "%s: missing event item %d\n", __func__, idx))
 		return;
 
-	cpu = get_cpu();
-
+#ifdef CONFIG_MEMCG_RSTAT_COUNTER
+	int cpu = get_cpu();
 	this_cpu_add(memcg->vmstats_percpu->events[i], count);
 	memcg_rstat_updated(memcg, count, cpu);
-	trace_count_memcg_events(memcg, idx, count);
-
 	put_cpu();
+#endif
+
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER
+	memcg_atomic_count_events(memcg, i, count);
+#endif
 }
 
 unsigned long memcg_events(struct mem_cgroup *memcg, int event)
 {
+	long x;
+
+#ifdef CONFIG_MEMCG_RSTAT_COUNTER
 	int i = memcg_events_index(event);
 
-	if (WARN_ONCE(BAD_STAT_IDX(i), "%s: missing stat item %d\n", __func__, event))
+	if (WARN_ONCE(BAD_STAT_IDX(i), "%s: missing event item %d\n", __func__, event))
 		return 0;
 
-	return READ_ONCE(memcg->vmstats->events[i]);
+	x = READ_ONCE(memcg->vmstats->events[i]);
+#elif defined(CONFIG_MEMCG_ATOMIC_COUNTER)
+	x = memcg_atomic_read_events_cached(memcg, event);
+#else
+	return 0;
+#endif
+
+#ifdef CONFIG_SMP
+	if (x < 0)
+		x = 0;
+#endif
+	return x;
 }
 
 #ifdef CONFIG_MEMCG_V1
@@ -865,10 +978,22 @@ unsigned long memcg_events_local(struct mem_cgroup *memcg, int event)
 {
 	int i = memcg_events_index(event);
 
-	if (WARN_ONCE(BAD_STAT_IDX(i), "%s: missing stat item %d\n", __func__, event))
+	if (WARN_ONCE(BAD_STAT_IDX(i), "%s: missing event item %d\n", __func__, event))
 		return 0;
 
+#ifdef CONFIG_MEMCG_RSTAT_COUNTER
 	return READ_ONCE(memcg->vmstats->events_local[i]);
+#elif defined(CONFIG_MEMCG_ATOMIC_COUNTER)
+	/* Read local event counter */
+	struct memcg_atomic_local *counter = READ_ONCE(memcg->atomic_local);
+
+	if (unlikely(!counter))
+		return 0;
+
+	return atomic64_read(&counter->events_local[i]);
+#else
+	return 0;
+#endif
 }
 #endif
 
@@ -1460,6 +1585,85 @@ static bool memcg_accounts_hugetlb(void)
 }
 #endif /* CONFIG_HUGETLB_PAGE */
 
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER
+/* Format atomic stats into seq_buf; caller must ensure memcg->atomic_local. */
+static void memcg_format_atomic_stats(struct mem_cgroup *memcg, struct seq_buf *s)
+{
+	int i;
+
+	css_atomic_flush(memcg, false);
+
+	for (i = 0; i < ARRAY_SIZE(memory_stats); i++) {
+		int idx = memory_stats[i].idx;
+		u64 size_atomic;
+
+#ifdef CONFIG_HUGETLB_PAGE
+		if (unlikely(idx == NR_HUGETLB) &&
+		    !memcg_accounts_hugetlb())
+			continue;
+#endif
+
+		size_atomic = memcg_atomic_read_state_cached(memcg, idx);
+		size_atomic *= memcg_page_state_output_unit(idx);
+		seq_buf_printf(s, "%s %llu\n", memory_stats[i].name,
+			       size_atomic);
+
+		if (unlikely(idx == NR_SLAB_UNRECLAIMABLE_B)) {
+			u64 slab_unreclaimable_atomic, slab_reclaimable_atomic;
+			u64 slab_total_atomic;
+
+			slab_unreclaimable_atomic = memcg_atomic_read_state_cached(
+				memcg, NR_SLAB_UNRECLAIMABLE_B);
+			slab_reclaimable_atomic = memcg_atomic_read_state_cached(
+				memcg, NR_SLAB_RECLAIMABLE_B);
+
+			slab_unreclaimable_atomic *=
+				memcg_page_state_output_unit(NR_SLAB_UNRECLAIMABLE_B);
+			slab_reclaimable_atomic *=
+				memcg_page_state_output_unit(NR_SLAB_RECLAIMABLE_B);
+			slab_total_atomic = slab_unreclaimable_atomic +
+					    slab_reclaimable_atomic;
+			seq_buf_printf(s, "slab %llu\n", slab_total_atomic);
+		}
+	}
+
+	{
+		unsigned long pgscan_atomic, pgsteal_atomic;
+
+		pgscan_atomic = memcg_atomic_read_events_cached(memcg, PGSCAN_KSWAPD) +
+				memcg_atomic_read_events_cached(memcg, PGSCAN_DIRECT) +
+				memcg_atomic_read_events_cached(memcg, PGSCAN_PROACTIVE) +
+				memcg_atomic_read_events_cached(memcg, PGSCAN_KHUGEPAGED);
+		pgsteal_atomic = memcg_atomic_read_events_cached(memcg, PGSTEAL_KSWAPD) +
+				 memcg_atomic_read_events_cached(memcg, PGSTEAL_DIRECT) +
+				 memcg_atomic_read_events_cached(memcg, PGSTEAL_PROACTIVE) +
+				 memcg_atomic_read_events_cached(memcg, PGSTEAL_KHUGEPAGED);
+
+		seq_buf_printf(s, "pgscan %lu\n", pgscan_atomic);
+		seq_buf_printf(s, "pgsteal %lu\n", pgsteal_atomic);
+	}
+
+	for (i = 0; i < ARRAY_SIZE(memcg_vm_event_stat); i++) {
+#ifdef CONFIG_MEMCG_V1
+		if (memcg_vm_event_stat[i] == PGPGIN ||
+		    memcg_vm_event_stat[i] == PGPGOUT)
+			continue;
+#endif
+		{
+			unsigned long count_atomic;
+
+			count_atomic = memcg_atomic_read_events_cached(memcg,
+				memcg_vm_event_stat[i]);
+
+			seq_buf_printf(s, "%s %lu\n",
+				       vm_event_name(memcg_vm_event_stat[i]),
+				       count_atomic);
+		}
+	}
+}
+#endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
+
+#ifdef CONFIG_MEMCG_RSTAT_COUNTER
 static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 {
 	int i;
@@ -1481,7 +1685,7 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 
 #ifdef CONFIG_HUGETLB_PAGE
 		if (unlikely(memory_stats[i].idx == NR_HUGETLB) &&
-			!memcg_accounts_hugetlb())
+		    !memcg_accounts_hugetlb())
 			continue;
 #endif
 		size = memcg_page_state_output(memcg, memory_stats[i].idx);
@@ -1517,6 +1721,19 @@ static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 			       memcg_events(memcg, memcg_vm_event_stat[i]));
 	}
 }
+#elif defined(CONFIG_MEMCG_ATOMIC_COUNTER)
+static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
+{
+	if (!memcg->atomic_local)
+		return;
+	memcg_format_atomic_stats(memcg, s);
+}
+
+#else
+static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
+{
+}
+#endif
 
 static void memory_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
 {
@@ -3672,6 +3889,9 @@ static void free_mem_cgroup_per_node_info(struct mem_cgroup_per_node *pn)
 
 	free_percpu(pn->lruvec_stats_percpu);
 	kfree(pn->lruvec_stats);
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER
+	memcg_atomic_exit_per_node(pn);
+#endif
 	kfree(pn);
 }
 
@@ -3694,6 +3914,11 @@ static bool alloc_mem_cgroup_per_node_info(struct mem_cgroup *memcg, int node)
 	if (!pn->lruvec_stats_percpu)
 		goto fail;
 
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER
+	if (memcg_atomic_init_per_node(pn, node))
+		goto fail;
+#endif
+
 	lruvec_init(&pn->lruvec);
 	pn->memcg = memcg;
 
@@ -3708,6 +3933,16 @@ static void __mem_cgroup_free(struct mem_cgroup *memcg)
 {
 	int node;
 
+	/*
+	 * This function is called from mem_cgroup_css_free(), which is
+	 * invoked by the cgroup framework AFTER an RCU grace period following
+	 * css_offline. This ensures that any concurrent RCU readers accessing
+	 * this memcg (e.g., in atomic counter recursive traversal) have
+	 * completed before we free the memory.
+	 *
+	 * See mem_cgroup_css_offline() for detailed RCU synchronization notes.
+	 */
+
 	obj_cgroup_put(memcg->orig_objcg);
 
 	for_each_node(node)
@@ -3715,6 +3950,9 @@ static void __mem_cgroup_free(struct mem_cgroup *memcg)
 	memcg1_free_events(memcg);
 	kfree(memcg->vmstats);
 	free_percpu(memcg->vmstats_percpu);
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER
+	memcg_atomic_exit(memcg);
+#endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
 	kfree(memcg);
 }
 
@@ -3753,6 +3991,13 @@ static struct mem_cgroup *mem_cgroup_alloc(struct mem_cgroup *parent)
 						 GFP_KERNEL_ACCOUNT);
 	if (!memcg->vmstats_percpu)
 		goto fail;
+
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER
+	/* Allocate per-cgroup atomic counter stats (experimental) */
+	error = memcg_atomic_init(memcg);
+	if (error)
+		goto fail;
+#endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
 
 	if (!memcg1_alloc_events(memcg))
 		goto fail;
@@ -3871,10 +4116,16 @@ static int mem_cgroup_css_online(struct cgroup_subsys_state *css)
 	if (alloc_shrinker_info(memcg))
 		goto offline_kmem;
 
+#ifdef CONFIG_MEMCG_RSTAT_COUNTER
 	if (unlikely(mem_cgroup_is_root(memcg)) && !mem_cgroup_disabled())
 		queue_delayed_work(system_unbound_wq, &stats_flush_dwork,
 				   FLUSH_TIME);
+#endif
 	lru_gen_online_memcg(memcg);
+
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER
+	memcg_atomic_online(memcg);
+#endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
 
 	/* Online state pins memcg ID, memcg ID pins CSS */
 	refcount_set(&memcg->id.ref, 1);
@@ -3918,6 +4169,10 @@ static void mem_cgroup_css_offline(struct cgroup_subsys_state *css)
 	lru_gen_offline_memcg(memcg);
 
 	drain_all_stock(memcg);
+
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER
+	memcg_atomic_offline(memcg);
+#endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
 
 	mem_cgroup_id_put(memcg);
 }
@@ -4508,6 +4763,7 @@ static int memory_events_local_show(struct seq_file *m, void *v)
 	return 0;
 }
 
+#ifdef CONFIG_MEMCG_RSTAT_COUNTER
 int memory_stat_show(struct seq_file *m, void *v)
 {
 	struct mem_cgroup *memcg = mem_cgroup_from_seq(m);
@@ -4522,6 +4778,37 @@ int memory_stat_show(struct seq_file *m, void *v)
 	kfree(buf);
 	return 0;
 }
+#endif /* CONFIG_MEMCG_RSTAT_COUNTER */
+
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER
+/*
+ * memory_stat_show_atomic - Display memory stats using atomic counters
+ *
+ * Dedicated interface for atomic counter backend, available at
+ * /sys/fs/cgroup/memory.stat.atomic. This allows users to explicitly
+ * query atomic stats independent of the default backend.
+ */
+static int memory_stat_show_atomic(struct seq_file *m, void *v)
+{
+	struct mem_cgroup *memcg = mem_cgroup_from_seq(m);
+	char *buf = kmalloc(SEQ_BUF_SIZE, GFP_KERNEL);
+	struct seq_buf s;
+
+	if (!buf)
+		return -ENOMEM;
+	seq_buf_init(&s, buf, SEQ_BUF_SIZE);
+
+	if (!memcg->atomic_local) {
+		seq_puts(m, buf);
+		kfree(buf);
+		return 0;
+	}
+	memcg_format_atomic_stats(memcg, &s);
+	seq_puts(m, buf);
+	kfree(buf);
+	return 0;
+}
+#endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
 
 #ifdef CONFIG_NUMA
 static inline unsigned long lruvec_page_state_output(struct lruvec *lruvec,
@@ -4531,6 +4818,16 @@ static inline unsigned long lruvec_page_state_output(struct lruvec *lruvec,
 		memcg_page_state_output_unit(item);
 }
 
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER
+static inline u64 lruvec_page_state_output_atomic(struct lruvec *lruvec,
+						   int item)
+{
+	return memcg_atomic_lruvec_page_state(lruvec, item) *
+		memcg_page_state_output_unit(item);
+}
+#endif
+
+#ifdef CONFIG_MEMCG_RSTAT_COUNTER
 static int memory_numa_stat_show(struct seq_file *m, void *v)
 {
 	int i;
@@ -4559,7 +4856,42 @@ static int memory_numa_stat_show(struct seq_file *m, void *v)
 
 	return 0;
 }
-#endif
+#endif /* CONFIG_MEMCG_RSTAT_COUNTER */
+
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER
+static int memory_numa_stat_show_atomic(struct seq_file *m, void *v)
+{
+	int i;
+	struct mem_cgroup *memcg = mem_cgroup_from_seq(m);
+
+	if (!memcg->atomic_local)
+		return 0;
+
+	css_atomic_flush(memcg, false);
+
+	for (i = 0; i < ARRAY_SIZE(memory_stats); i++) {
+		int nid;
+
+		if (memory_stats[i].idx >= NR_VM_NODE_STAT_ITEMS)
+			continue;
+
+		seq_printf(m, "%s", memory_stats[i].name);
+		for_each_node_state(nid, N_MEMORY) {
+			u64 size;
+			struct lruvec *lruvec;
+
+			lruvec = mem_cgroup_lruvec(memcg, NODE_DATA(nid));
+			size = lruvec_page_state_output_atomic(lruvec,
+							       memory_stats[i].idx);
+			seq_printf(m, " N%d=%llu", nid, size);
+		}
+		seq_putc(m, '\n');
+	}
+
+	return 0;
+}
+#endif /* CONFIG_MEMCG_ATOMIC_COUNTER */
+#endif /* CONFIG_NUMA */
 
 static int memory_oom_group_show(struct seq_file *m, void *v)
 {
@@ -4655,15 +4987,31 @@ static struct cftype memory_files[] = {
 		.file_offset = offsetof(struct mem_cgroup, events_local_file),
 		.seq_show = memory_events_local_show,
 	},
+#ifdef CONFIG_MEMCG_RSTAT_COUNTER
 	{
 		.name = "stat",
 		.seq_show = memory_stat_show,
 	},
+#endif
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER
+	{
+		.name = "stat.atomic",
+		.seq_show = memory_stat_show_atomic,
+	},
+#endif
 #ifdef CONFIG_NUMA
+#ifdef CONFIG_MEMCG_RSTAT_COUNTER
 	{
 		.name = "numa_stat",
 		.seq_show = memory_numa_stat_show,
 	},
+#endif
+#ifdef CONFIG_MEMCG_ATOMIC_COUNTER
+	{
+		.name = "numa_stat.atomic",
+		.seq_show = memory_numa_stat_show_atomic,
+	},
+#endif
 #endif
 	{
 		.name = "oom.group",
