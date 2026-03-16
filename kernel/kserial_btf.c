@@ -7,6 +7,7 @@
 #include <linux/btf.h>
 #include <linux/bpf.h>
 #include <linux/kserial.h>
+#include <linux/kallsyms.h>
 #include <linux/slab.h>
 #include <linux/rhashtable.h>
 #include <linux/errno.h>
@@ -170,6 +171,24 @@ u64 kserial_read_field(void *base, u32 offset, u32 size)
 	}
 	memcpy(&val, (char *)base + offset, size);
 	return val;
+}
+
+int kserial_write_field(void *base, u32 offset, u32 size, u64 val)
+{
+	if (size == 0 || size > sizeof(val))
+		return -EINVAL;
+	memcpy((char *)base + offset, &val, size);
+	return 0;
+}
+
+void *kserial_base_from_symbol(const char *name)
+{
+	unsigned long addr;
+
+	if (!name || !*name)
+		return NULL;
+	addr = kallsyms_lookup_name(name);
+	return addr ? (void *)addr : NULL;
 }
 
 int kserial_btf_resolve(const char *struct_name, const char *field_path,

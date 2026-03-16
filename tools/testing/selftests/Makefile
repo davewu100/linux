@@ -51,6 +51,7 @@ TARGETS += ir
 TARGETS += kcmp
 TARGETS += kexec
 TARGETS += kselftest_harness
+TARGETS += kserial
 TARGETS += kvm
 TARGETS += landlock
 TARGETS += lib
@@ -219,6 +220,11 @@ all:
 		ret=$$((ret * $$?));				\
 	done; exit $$ret;
 
+# Build only the kserial tests (no other TARGETS).
+kserial:
+	@mkdir -p $(BUILD)/kserial; \
+	$(MAKE) OUTPUT=$(BUILD)/kserial -C kserial $(if $(O),O=$(O),)
+
 run_tests: all
 	@for TARGET in $(TARGETS); do \
 		BUILD_TARGET=$$BUILD/$$TARGET;	\
@@ -323,4 +329,4 @@ clean:
 		$(MAKE) OUTPUT=$$BUILD_TARGET -C $$TARGET clean;\
 	done;
 
-.PHONY: all run_tests hotplug run_hotplug clean_hotplug run_pstore_crash install clean gen_tar
+.PHONY: all run_tests hotplug run_hotplug clean_hotplug run_pstore_crash install clean gen_tar kserial
