@@ -150,6 +150,7 @@ How to configure your hardware within your Linux system.
    edid
    gpio/index
    hw_random
+   kserial
    laptops/index
    lcd-panel-cgram
    media/index

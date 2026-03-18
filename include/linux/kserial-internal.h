@@ -1,0 +1,51 @@
+/* SPDX-License-Identifier: GPL-2.0 */
+#ifndef _LINUX_KSERIAL_INTERNAL_H
+#define _LINUX_KSERIAL_INTERNAL_H
+
+#include <linux/types.h>
+
+#define KS_FIELD_NAME_LEN 64
+
+/**
+ * kserial_btf_resolve - resolve struct field path to offset and size via BTF
+ * @struct_name: BTF struct name (e.g. "mem_cgroup")
+ * @field_path: dot-separated path, optional array index (e.g. "vmstats.state[17]")
+ * @out_offset: output byte offset of the field in the struct
+ * @out_size: output size in bytes
+ *
+ * Uses vmlinux BTF; result is cached. Return 0 on success, negative on error.
+ */
+int kserial_btf_resolve(const char *struct_name, const char *field_path,
+			u32 *out_offset, u32 *out_size);
+
+/**
+ * kserial_read_field - read one field from base + offset as u64
+ * @base: pointer to the struct (e.g. struct mem_cgroup *)
+ * @offset: byte offset from kserial_btf_resolve
+ * @size: size in bytes (1, 2, 4, or 8)
+ *
+ * Return: field value zero-extended to u64, or 0 if size is not 1/2/4/8.
+ */
+u64 kserial_read_field(void *base, u32 offset, u32 size);
+
+/**
+ * kserial_write_field - write one field at base + offset from u64
+ * @base: pointer to the struct
+ * @offset: byte offset from kserial_btf_resolve
+ * @size: size in bytes (1, 2, 4, or 8)
+ * @val: value to write (only low @size bytes are used)
+ *
+ * Return: 0 on success, -EINVAL if size is not 1/2/4/8.
+ */
+int kserial_write_field(void *base, u32 offset, u32 size, u64 val);
+
+/**
+ * kserial_base_from_symbol - get kernel pointer for a symbol name (kallsyms)
+ * @name: symbol name (e.g. "init_task", "current_task")
+ *
+ * Only works for symbols visible in /proc/kallsyms. Not exported to modules.
+ * Return: kernel pointer, or NULL if symbol not found.
+ */
+void *kserial_base_from_symbol(const char *name);
+
+#endif /* _LINUX_KSERIAL_INTERNAL_H */
