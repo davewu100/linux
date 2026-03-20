@@ -14,6 +14,8 @@
 
 #define pr_fmt(fmt) "zram: " fmt
 
+#include <linux/swap.h>
+#include <linux/swapops.h>
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/bio.h>
@@ -1502,11 +1504,8 @@ static int read_from_bdev(struct zram *zram, struct page *page, u32 index,
 			  unsigned long blk_idx, struct bio *parent)
 {
 	atomic64_inc(&zram->stats.bd_reads);
-	if (!parent) {
-		if (WARN_ON_ONCE(!IS_ENABLED(ZRAM_PARTIAL_IO)))
-			return -EIO;
+	if (!parent)
 		return read_from_bdev_sync(zram, page, index, blk_idx);
-	}
 	return read_from_bdev_async(zram, page, index, blk_idx, parent);
 }
 #else
@@ -2937,6 +2936,66 @@ static ssize_t reset_store(struct device *dev,
 	return len;
 }
 
+static void zram_swap_read_folio(struct swap_info_struct *sis,
+				 struct folio *folio,
+				 struct swap_iocb **plug)
+{
+	struct zram *zram = sis->bdev->bd_disk->private_data;
+	u32 index = swp_offset(folio->swap);
+	int i, ret = 0;
+
+	for (i = 0; i < folio_nr_pages(folio); i++) {
+		struct page *page = folio_page(folio, i);
+
+		ret = zram_read_page(zram, page, index + i, NULL);
+		if (ret)
+			break;
+		flush_dcache_page(page);
+
+		slot_lock(zram, index + i);
+		mark_slot_accessed(zram, index + i);
+		slot_unlock(zram, index + i);
+	}
+
+	if (!ret)
+		folio_mark_uptodate(folio);
+	else
+		atomic64_inc(&zram->stats.failed_reads);
+	folio_unlock(folio);
+}
+
+static void zram_swap_write_folio(struct swap_info_struct *sis,
+				  struct folio *folio,
+				  struct swap_iocb **plug)
+{
+	struct zram *zram = sis->bdev->bd_disk->private_data;
+	u32 index = swp_offset(folio->swap);
+	int i, ret = 0;
+
+	folio_start_writeback(folio);
+	folio_unlock(folio);
+
+	for (i = 0; i < folio_nr_pages(folio); i++) {
+		ret = zram_write_page(zram, folio_page(folio, i), index + i);
+		if (ret)
+			break;
+		slot_lock(zram, index + i);
+		mark_slot_accessed(zram, index + i);
+		slot_unlock(zram, index + i);
+	}
+	if (ret) {
+		atomic64_inc(&zram->stats.failed_writes);
+		folio_mark_dirty(folio);
+		folio_clear_reclaim(folio);
+	}
+	folio_end_writeback(folio);
+}
+
+static const struct swap_ops zram_swap_ops = {
+	.read_folio = zram_swap_read_folio,
+	.write_folio = zram_swap_write_folio,
+};
+
 static int zram_open(struct gendisk *disk, blk_mode_t mode)
 {
 	struct zram *zram = disk->private_data;
@@ -3224,6 +3283,7 @@ static int zram_remove_cb(int id, void *ptr, void *data)
 
 static void destroy_devices(void)
 {
+	swap_zram_ops_unregister();
 	class_unregister(&zram_control_class);
 	idr_for_each(&zram_index_idr, &zram_remove_cb, NULL);
 	zram_debugfs_destroy();
@@ -3260,6 +3320,7 @@ static int __init zram_init(void)
 		return -EBUSY;
 	}
 
+	swap_zram_ops_register(&zram_devops, &zram_swap_ops);
 	while (num_devices != 0) {
 		mutex_lock(&zram_index_mutex);
 		ret = zram_add();
