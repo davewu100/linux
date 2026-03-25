@@ -11,21 +11,9 @@
 TRACE_EVENT(shmem_undo_range_stats,
 
 	TP_PROTO(struct inode *inode, loff_t lstart, uoff_t lend, bool unfalloc,
-		 unsigned int loop1_batches, unsigned int loop1_entries,
-		 unsigned int loop1_swap_entries, unsigned int loop1_folios,
-		 unsigned int loop2_batches, unsigned int loop2_entries,
-		 unsigned int loop2_swap_entries, unsigned int loop2_folios,
-		 unsigned int loop2_full_restarts,
-		 unsigned int loop2_swap_retries,
-		 unsigned int loop2_mapping_retries,
-		 unsigned int loop2_thp_split_restarts,
-		 long nr_swaps_freed),
+		 const struct shmem_undo_range_trace_stats *stats),
 
-	TP_ARGS(inode, lstart, lend, unfalloc, loop1_batches, loop1_entries,
-		loop1_swap_entries, loop1_folios, loop2_batches, loop2_entries,
-		loop2_swap_entries, loop2_folios, loop2_full_restarts,
-		loop2_swap_retries, loop2_mapping_retries,
-		loop2_thp_split_restarts, nr_swaps_freed),
+	TP_ARGS(inode, lstart, lend, unfalloc, stats),
 
 	TP_STRUCT__entry(
 		__field(dev_t, s_dev)
@@ -54,19 +42,19 @@ TRACE_EVENT(shmem_undo_range_stats,
 		__entry->lstart = lstart;
 		__entry->lend = lend;
 		__entry->unfalloc = unfalloc;
-		__entry->loop1_batches = loop1_batches;
-		__entry->loop1_entries = loop1_entries;
-		__entry->loop1_swap_entries = loop1_swap_entries;
-		__entry->loop1_folios = loop1_folios;
-		__entry->loop2_batches = loop2_batches;
-		__entry->loop2_entries = loop2_entries;
-		__entry->loop2_swap_entries = loop2_swap_entries;
-		__entry->loop2_folios = loop2_folios;
-		__entry->loop2_full_restarts = loop2_full_restarts;
-		__entry->loop2_swap_retries = loop2_swap_retries;
-		__entry->loop2_mapping_retries = loop2_mapping_retries;
-		__entry->loop2_thp_split_restarts = loop2_thp_split_restarts;
-		__entry->nr_swaps_freed = nr_swaps_freed;
+		__entry->loop1_batches = stats->loop1_batches;
+		__entry->loop1_entries = stats->loop1_entries;
+		__entry->loop1_swap_entries = stats->loop1_swap_entries;
+		__entry->loop1_folios = stats->loop1_folios;
+		__entry->loop2_batches = stats->loop2_batches;
+		__entry->loop2_entries = stats->loop2_entries;
+		__entry->loop2_swap_entries = stats->loop2_swap_entries;
+		__entry->loop2_folios = stats->loop2_folios;
+		__entry->loop2_full_restarts = stats->loop2_full_restarts;
+		__entry->loop2_swap_retries = stats->loop2_swap_retries;
+		__entry->loop2_mapping_retries = stats->loop2_mapping_retries;
+		__entry->loop2_thp_split_restarts = stats->loop2_thp_split_restarts;
+		__entry->nr_swaps_freed = stats->nr_swaps_freed;
 	),
 
 	TP_printk("dev=%d:%d ino=%lu range=%lld-%lld unfalloc=%d "

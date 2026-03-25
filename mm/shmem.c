@@ -86,6 +86,22 @@ static struct vfsmount *shm_mnt __ro_after_init;
 
 #include "internal.h"
 
+struct shmem_undo_range_trace_stats {
+	unsigned int loop1_batches;
+	unsigned int loop1_entries;
+	unsigned int loop1_swap_entries;
+	unsigned int loop1_folios;
+	unsigned int loop2_batches;
+	unsigned int loop2_entries;
+	unsigned int loop2_swap_entries;
+	unsigned int loop2_folios;
+	unsigned int loop2_full_restarts;
+	unsigned int loop2_swap_retries;
+	unsigned int loop2_mapping_retries;
+	unsigned int loop2_thp_split_restarts;
+	long nr_swaps_freed;
+};
+
 #define CREATE_TRACE_POINTS
 #include <trace/events/shmem.h>
 #undef CREATE_TRACE_POINTS
@@ -1120,20 +1136,8 @@ static void shmem_undo_range(struct inode *inode, loff_t lstart, uoff_t lend,
 	pgoff_t indices[PAGEVEC_SIZE];
 	struct folio *folio;
 	bool same_folio;
-	long nr_swaps_freed = 0;
 	pgoff_t index;
-	unsigned int loop1_batches = 0;
-	unsigned int loop1_entries = 0;
-	unsigned int loop1_swap_entries = 0;
-	unsigned int loop1_folios = 0;
-	unsigned int loop2_batches = 0;
-	unsigned int loop2_entries = 0;
-	unsigned int loop2_swap_entries = 0;
-	unsigned int loop2_folios = 0;
-	unsigned int loop2_full_restarts = 0;
-	unsigned int loop2_swap_retries = 0;
-	unsigned int loop2_mapping_retries = 0;
-	unsigned int loop2_thp_split_restarts = 0;
+	struct shmem_undo_range_trace_stats stats = {};
 	int i;
 
 	if (lend == -1)
@@ -1146,20 +1150,22 @@ static void shmem_undo_range(struct inode *inode, loff_t lstart, uoff_t lend,
 	index = start;
 	while (index < end && find_lock_entries(mapping, &index, end - 1,
 			&fbatch, indices)) {
-		loop1_batches++;
+		stats.loop1_batches++;
 		for (i = 0; i < folio_batch_count(&fbatch); i++) {
 			folio = fbatch.folios[i];
-			loop1_entries++;
+			stats.loop1_entries++;
 
 			if (xa_is_value(folio)) {
-				loop1_swap_entries++;
+				stats.loop1_swap_entries++;
 				if (unfalloc)
 					continue;
-				nr_swaps_freed += shmem_free_swap(mapping, indices[i],
-								  end - 1, folio);
+				stats.nr_swaps_freed += shmem_free_swap(mapping,
+								       indices[i],
+								       end - 1,
+								       folio);
 				continue;
 			}
-			loop1_folios++;
+			stats.loop1_folios++;
 
 			if (!unfalloc || !folio_test_uptodate(folio))
 				truncate_inode_folio(mapping, folio);
@@ -1216,20 +1222,20 @@ whole_folios:
 			if (index == start || end != -1)
 				break;
 			/* But if truncating, restart to make sure all gone */
-			loop2_full_restarts++;
+			stats.loop2_full_restarts++;
 			index = start;
 			continue;
 		}
-		loop2_batches++;
+		stats.loop2_batches++;
 		for (i = 0; i < folio_batch_count(&fbatch); i++) {
 			folio = fbatch.folios[i];
-			loop2_entries++;
+			stats.loop2_entries++;
 
 			if (xa_is_value(folio)) {
 				int order;
 				long swaps_freed;
 
-				loop2_swap_entries++;
+				stats.loop2_swap_entries++;
 				if (unfalloc)
 					continue;
 				swaps_freed = shmem_free_swap(mapping, indices[i],
@@ -1250,21 +1256,21 @@ whole_folios:
 							continue;
 					}
 					/* Swap was replaced by page or extended, retry */
-					loop2_swap_retries++;
+					stats.loop2_swap_retries++;
 					index = base;
 					break;
 				}
-				nr_swaps_freed += swaps_freed;
+				stats.nr_swaps_freed += swaps_freed;
 				continue;
 			}
-			loop2_folios++;
+			stats.loop2_folios++;
 
 			folio_lock(folio);
 
 			if (!unfalloc || !folio_test_uptodate(folio)) {
 				if (folio_mapping(folio) != mapping) {
 					/* Page was replaced by swap: retry */
-					loop2_mapping_retries++;
+					stats.loop2_mapping_retries++;
 					folio_unlock(folio);
 					index = indices[i];
 					break;
@@ -1284,7 +1290,7 @@ whole_folios:
 					 * is.
 					 */
 					if (!folio_test_large(folio)) {
-						loop2_thp_split_restarts++;
+						stats.loop2_thp_split_restarts++;
 						folio_unlock(folio);
 						index = start;
 						break;
@@ -1297,17 +1303,9 @@ whole_folios:
 		folio_batch_release(&fbatch);
 	}
 
-	trace_shmem_undo_range_stats(inode, lstart, lend, unfalloc,
-				     loop1_batches, loop1_entries,
-				     loop1_swap_entries, loop1_folios,
-				     loop2_batches, loop2_entries,
-				     loop2_swap_entries, loop2_folios,
-				     loop2_full_restarts, loop2_swap_retries,
-				     loop2_mapping_retries,
-				     loop2_thp_split_restarts,
-				     nr_swaps_freed);
+	trace_shmem_undo_range_stats(inode, lstart, lend, unfalloc, &stats);
 
-	shmem_recalc_inode(inode, 0, -nr_swaps_freed);
+	shmem_recalc_inode(inode, 0, -stats.nr_swaps_freed);
 }
 
 void shmem_truncate_range(struct inode *inode, loff_t lstart, uoff_t lend)
