@@ -193,30 +193,36 @@ static int __page_handle_poison(struct page *page)
 	return ret;
 }
 
-static bool page_handle_poison(struct page *page, bool hugepage_or_freepage, bool release)
+static void page_mark_poisoned(struct page *page)
 {
-	if (hugepage_or_freepage) {
-		/*
-		 * Doing this check for free pages is also fine since
-		 * dissolve_free_hugetlb_folio() returns 0 for non-hugetlb folios as well.
-		 */
-		if (__page_handle_poison(page) <= 0)
-			/*
-			 * We could fail to take off the target page from buddy
-			 * for example due to racy page allocation, but that's
-			 * acceptable because soft-offlined page is not broken
-			 * and if someone really want to use it, they should
-			 * take it.
-			 */
-			return false;
-	}
-
 	SetPageHWPoison(page);
-	if (release)
-		put_page(page);
 	page_ref_inc(page);
 	num_poisoned_pages_inc(page_to_pfn(page));
+}
 
+static void page_handle_poison_release(struct page *page)
+{
+	page_mark_poisoned(page);
+	put_page(page);
+}
+
+static bool page_handle_poison_huge_or_free(struct page *page)
+{
+	/*
+	 * Doing this check for free pages is also fine since
+	 * dissolve_free_hugetlb_folio() returns 0 for non-hugetlb folios as well.
+	 */
+	if (__page_handle_poison(page) <= 0)
+		/*
+		 * We could fail to take off the target page from buddy
+		 * for example due to racy page allocation, but that's
+		 * acceptable because soft-offlined page is not broken
+		 * and if someone really want to use it, they should
+		 * take it.
+		 */
+		return false;
+
+	page_mark_poisoned(page);
 	return true;
 }
 
@@ -2840,7 +2846,7 @@ static int soft_offline_in_use_page(struct page *page)
 
 	if (ret) {
 		pr_info("%#lx: invalidated\n", pfn);
-		page_handle_poison(page, false, true);
+		page_handle_poison_release(page);
 		return 0;
 	}
 
@@ -2859,10 +2865,12 @@ static int soft_offline_in_use_page(struct page *page)
 		ret = migrate_pages(&pagelist, alloc_migration_target, NULL,
 			(unsigned long)&mtc, MIGRATE_SYNC, MR_MEMORY_FAILURE, NULL);
 		if (!ret) {
-			bool release = !huge;
-
-			if (!page_handle_poison(page, huge, release))
-				ret = -EBUSY;
+			if (huge) {
+				if (!page_handle_poison_huge_or_free(page))
+					ret = -EBUSY;
+			} else {
+				page_handle_poison_release(page);
+			}
 		} else {
 			if (!list_empty(&pagelist))
 				putback_movable_pages(&pagelist);
@@ -2954,7 +2962,7 @@ retry:
 	if (ret > 0) {
 		ret = soft_offline_in_use_page(page);
 	} else if (ret == 0) {
-		if (!page_handle_poison(page, true, false)) {
+		if (!page_handle_poison_huge_or_free(page)) {
 			if (try_again) {
 				try_again = false;
 				flags &= ~MF_COUNT_INCREASED;
