@@ -1121,12 +1121,18 @@ static struct folio *shmem_get_partial_folio(struct inode *inode, pgoff_t index)
 	return folio;
 }
 
+enum shmem_undo_mode {
+	SHMEM_UNDO_REGULAR,
+	SHMEM_UNDO_UNFALLOC,
+};
+
 /*
  * Remove range of pages and swap entries from page cache, and free them.
- * If !unfalloc, truncate or punch hole; if unfalloc, undo failed fallocate.
+ * SHMEM_UNDO_REGULAR is used for truncate or punch hole.
+ * SHMEM_UNDO_UNFALLOC undoes a failed fallocate.
  */
-static void shmem_undo_range(struct inode *inode, loff_t lstart, uoff_t lend,
-								 bool unfalloc)
+static void shmem_undo_range_common(struct inode *inode, loff_t lstart,
+				    uoff_t lend, enum shmem_undo_mode mode)
 {
 	struct address_space *mapping = inode->i_mapping;
 	struct shmem_inode_info *info = SHMEM_I(inode);
@@ -1143,7 +1149,8 @@ static void shmem_undo_range(struct inode *inode, loff_t lstart, uoff_t lend,
 	if (lend == -1)
 		end = -1;	/* unsigned, so actually very big */
 
-	if (info->fallocend > start && info->fallocend <= end && !unfalloc)
+	if (info->fallocend > start && info->fallocend <= end &&
+	    mode == SHMEM_UNDO_REGULAR)
 		info->fallocend = start;
 
 	folio_batch_init(&fbatch);
@@ -1157,7 +1164,7 @@ static void shmem_undo_range(struct inode *inode, loff_t lstart, uoff_t lend,
 
 			if (xa_is_value(folio)) {
 				stats.loop1_swap_entries++;
-				if (unfalloc)
+				if (mode == SHMEM_UNDO_UNFALLOC)
 					continue;
 				stats.nr_swaps_freed += shmem_free_swap(mapping,
 								       indices[i],
@@ -1167,7 +1174,8 @@ static void shmem_undo_range(struct inode *inode, loff_t lstart, uoff_t lend,
 			}
 			stats.loop1_folios++;
 
-			if (!unfalloc || !folio_test_uptodate(folio))
+			if (mode == SHMEM_UNDO_REGULAR ||
+			    !folio_test_uptodate(folio))
 				truncate_inode_folio(mapping, folio);
 			folio_unlock(folio);
 		}
@@ -1182,7 +1190,7 @@ static void shmem_undo_range(struct inode *inode, loff_t lstart, uoff_t lend,
 	 * folio when !uptodate indicates that it was added by this fallocate,
 	 * even when [lstart, lend] covers only a part of the folio.
 	 */
-	if (unfalloc)
+	if (mode == SHMEM_UNDO_UNFALLOC)
 		goto whole_folios;
 
 	same_folio = (lstart >> PAGE_SHIFT) == (lend >> PAGE_SHIFT);
@@ -1236,7 +1244,7 @@ whole_folios:
 				long swaps_freed;
 
 				stats.loop2_swap_entries++;
-				if (unfalloc)
+				if (mode == SHMEM_UNDO_UNFALLOC)
 					continue;
 				swaps_freed = shmem_free_swap(mapping, indices[i],
 							      end - 1, folio);
@@ -1267,7 +1275,8 @@ whole_folios:
 
 			folio_lock(folio);
 
-			if (!unfalloc || !folio_test_uptodate(folio)) {
+			if (mode == SHMEM_UNDO_REGULAR ||
+			    !folio_test_uptodate(folio)) {
 				if (folio_mapping(folio) != mapping) {
 					/* Page was replaced by swap: retry */
 					stats.loop2_mapping_retries++;
@@ -1303,14 +1312,27 @@ whole_folios:
 		folio_batch_release(&fbatch);
 	}
 
-	trace_shmem_undo_range_stats(inode, lstart, lend, unfalloc, &stats);
+	trace_shmem_undo_range_stats(inode, lstart, lend,
+				     mode == SHMEM_UNDO_UNFALLOC, &stats);
 
 	shmem_recalc_inode(inode, 0, -stats.nr_swaps_freed);
 }
 
+static void shmem_undo_range_regular(struct inode *inode, loff_t lstart,
+				     uoff_t lend)
+{
+	shmem_undo_range_common(inode, lstart, lend, SHMEM_UNDO_REGULAR);
+}
+
+static void shmem_undo_range_unfalloc(struct inode *inode, loff_t lstart,
+				      uoff_t lend)
+{
+	shmem_undo_range_common(inode, lstart, lend, SHMEM_UNDO_UNFALLOC);
+}
+
 void shmem_truncate_range(struct inode *inode, loff_t lstart, uoff_t lend)
 {
-	shmem_undo_range(inode, lstart, lend, false);
+	shmem_undo_range_regular(inode, lstart, lend);
 	inode_set_mtime_to_ts(inode, inode_set_ctime_current(inode));
 	inode_inc_iversion(inode);
 }
@@ -2729,7 +2751,7 @@ static int synchronous_wake_function(wait_queue_entry_t *wait,
  * prevent the hole-punch from ever completing: which in turn
  * locks writers out with its hold on i_rwsem.  So refrain from
  * faulting pages into the hole while it's being punched.  Although
- * shmem_undo_range() does remove the additions, it may be unable to
+ * shmem_undo_range_regular() removes the additions, it may be unable to
  * keep up, as each new page needs its own unmap_mapping_range() call,
  * and the i_mmap tree grows ever slower to scan if new vmas are added.
  *
@@ -3829,9 +3851,9 @@ static long shmem_fallocate(struct file *file, int mode, loff_t offset,
 			info->fallocend = undo_fallocend;
 			/* Remove the !uptodate folios we added */
 			if (index > start) {
-				shmem_undo_range(inode,
+				shmem_undo_range_unfalloc(inode,
 				    (loff_t)start << PAGE_SHIFT,
-				    ((loff_t)index << PAGE_SHIFT) - 1, true);
+				    ((loff_t)index << PAGE_SHIFT) - 1);
 			}
 			goto undone;
 		}
