@@ -33,6 +33,7 @@
 #include <linux/cpuhotplug.h>
 #include <linux/part_stat.h>
 #include <linux/kernel_read_file.h>
+#include <linux/swap.h>
 
 #include "zram_drv.h"
 
@@ -2800,13 +2801,14 @@ static void zram_submit_bio(struct bio *bio)
 	}
 }
 
-static void zram_slot_free_notify(struct block_device *bdev,
-				unsigned long index)
+static void zram_slot_free_notify(void *ctx, unsigned long index)
 {
-	struct zram *zram;
+	struct zram *zram = ctx;
 
-	zram = bdev->bd_disk->private_data;
-
+	/*
+	 * This callback runs on swap slot teardown. Keep the path short:
+	 * lock opportunistically, release what we can, and leave no tail work.
+	 */
 	atomic64_inc(&zram->stats.notify_free);
 	if (!slot_trylock(zram, index)) {
 		atomic64_inc(&zram->stats.miss_free);
@@ -2816,6 +2818,33 @@ static void zram_slot_free_notify(struct block_device *bdev,
 	slot_free(zram, index);
 	slot_unlock(zram, index);
 }
+
+static const struct swap_backend_ops zram_swap_backend_ops = {
+	.swap_slot_free_notify = zram_slot_free_notify,
+};
+
+static bool zram_swap_backend_attach(struct swap_info_struct *si,
+				     struct swap_backend *backend)
+{
+	struct zram *zram;
+
+	if (!si->bdev || !si->bdev->bd_disk ||
+	    si->bdev->bd_disk->fops != &zram_devops)
+		return false;
+
+	zram = si->bdev->bd_disk->private_data;
+
+	if (!zram || !init_done(zram))
+		return false;
+
+	backend->ops = &zram_swap_backend_ops;
+	backend->ctx = zram;
+	return true;
+}
+
+static struct swap_backend_driver zram_swap_backend_driver = {
+	.attach = zram_swap_backend_attach,
+};
 
 static void zram_comp_params_reset(struct zram *zram)
 {
@@ -2974,7 +3003,6 @@ static int zram_open(struct gendisk *disk, blk_mode_t mode)
 static const struct block_device_operations zram_devops = {
 	.open = zram_open,
 	.submit_bio = zram_submit_bio,
-	.swap_slot_free_notify = zram_slot_free_notify,
 	.owner = THIS_MODULE
 };
 
@@ -3257,6 +3285,7 @@ static void destroy_devices(void)
 static int __init zram_init(void)
 {
 	struct zram_table_entry zram_te;
+	bool backend_registered = false;
 	int ret;
 
 	BUILD_BUG_ON(__NR_ZRAM_PAGEFLAGS > sizeof(zram_te.attr.flags) * 8);
@@ -3282,6 +3311,15 @@ static int __init zram_init(void)
 		return -EBUSY;
 	}
 
+	INIT_LIST_HEAD(&zram_swap_backend_driver.list);
+	ret = register_swap_backend_driver(&zram_swap_backend_driver);
+	if (ret) {
+		pr_err("Unable to register zram swap backend\n");
+		destroy_devices();
+		return ret;
+	}
+	backend_registered = true;
+
 	while (num_devices != 0) {
 		mutex_lock(&zram_index_mutex);
 		ret = zram_add();
@@ -3294,12 +3332,15 @@ static int __init zram_init(void)
 	return 0;
 
 out_error:
+	if (backend_registered)
+		unregister_swap_backend_driver(&zram_swap_backend_driver);
 	destroy_devices();
 	return ret;
 }
 
 static void __exit zram_exit(void)
 {
+	unregister_swap_backend_driver(&zram_swap_backend_driver);
 	destroy_devices();
 }
 

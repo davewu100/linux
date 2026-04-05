@@ -17,10 +17,32 @@
 #include <asm/page.h>
 
 struct notifier_block;
+struct swap_info_struct;
 
 struct bio;
 
 struct pagevec;
+
+/*
+ * Swap backend callbacks are lifecycle events from swap core.
+ *
+ * swap_slot_free_notify() runs on swap free paths, so implementations should
+ * be non-blocking and avoid heavyweight work in this context.
+ */
+struct swap_backend_ops {
+	void (*swap_slot_free_notify)(void *ctx, unsigned long offset);
+};
+
+struct swap_backend {
+	const struct swap_backend_ops *ops;
+	void *ctx;
+};
+
+struct swap_backend_driver {
+	bool (*attach)(struct swap_info_struct *si, struct swap_backend *backend);
+	struct list_head list;
+	bool registered;
+};
 
 #define SWAP_FLAG_PREFER	0x8000	/* set if swap priority specified */
 #define SWAP_FLAG_PRIO_MASK	0x7fff
@@ -280,6 +302,7 @@ struct swap_info_struct {
 	spinlock_t global_cluster_lock;	/* Serialize usage of global cluster */
 	struct rb_root swap_extent_root;/* root of the swap extent rbtree */
 	struct block_device *bdev;	/* swap device or bdev of swap file */
+	struct swap_backend backend;	/* backend lifecycle hooks, if any */
 	struct file *swap_file;		/* seldom referenced */
 	struct completion comp;		/* seldom referenced */
 	spinlock_t lock;		/*
@@ -452,6 +475,8 @@ static inline long get_nr_swap_pages(void)
 
 extern void si_swapinfo(struct sysinfo *);
 extern int add_swap_count_continuation(swp_entry_t, gfp_t);
+int register_swap_backend_driver(struct swap_backend_driver *driver);
+void unregister_swap_backend_driver(struct swap_backend_driver *driver);
 int swap_type_of(dev_t device, sector_t offset);
 int find_first_swap(dev_t *device);
 extern unsigned int count_swap_pages(int, int);
@@ -520,6 +545,15 @@ static inline void free_swap_cache(struct folio *folio)
 static inline int add_swap_count_continuation(swp_entry_t swp, gfp_t gfp_mask)
 {
 	return 0;
+}
+
+static inline int register_swap_backend_driver(struct swap_backend_driver *driver)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline void unregister_swap_backend_driver(struct swap_backend_driver *driver)
+{
 }
 
 static inline int swap_dup_entry_direct(swp_entry_t ent)

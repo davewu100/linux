@@ -111,12 +111,49 @@ struct swap_info_struct *swap_info[MAX_SWAPFILES];
 static struct kmem_cache *swap_table_cachep;
 
 static DEFINE_MUTEX(swapon_mutex);
+static DEFINE_MUTEX(swap_backend_lock);
+static LIST_HEAD(swap_backend_drivers);
 
 static DECLARE_WAIT_QUEUE_HEAD(proc_poll_wait);
 /* Activity counter to indicate that a swapon or swapoff has occurred */
 static atomic_t proc_poll_event = ATOMIC_INIT(0);
 
 atomic_t nr_rotate_swap = ATOMIC_INIT(0);
+
+int register_swap_backend_driver(struct swap_backend_driver *driver)
+{
+	if (!driver || !driver->attach)
+		return -EINVAL;
+
+	mutex_lock(&swap_backend_lock);
+	if (driver->registered) {
+		mutex_unlock(&swap_backend_lock);
+		return -EBUSY;
+	}
+
+	list_add_tail(&driver->list, &swap_backend_drivers);
+	driver->registered = true;
+	mutex_unlock(&swap_backend_lock);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(register_swap_backend_driver);
+
+void unregister_swap_backend_driver(struct swap_backend_driver *driver)
+{
+	if (!driver)
+		return;
+
+	mutex_lock(&swap_backend_lock);
+	if (!driver->registered) {
+		mutex_unlock(&swap_backend_lock);
+		return;
+	}
+
+	list_del_init(&driver->list);
+	driver->registered = false;
+	mutex_unlock(&swap_backend_lock);
+}
+EXPORT_SYMBOL_GPL(unregister_swap_backend_driver);
 
 struct percpu_swap_cluster {
 	struct swap_info_struct *si[SWAP_NR_ORDERS];
@@ -1261,7 +1298,8 @@ static void swap_range_free(struct swap_info_struct *si, unsigned long offset,
 {
 	unsigned long begin = offset;
 	unsigned long end = offset + nr_entries - 1;
-	void (*swap_slot_free_notify)(struct block_device *, unsigned long);
+	void (*swap_slot_free_notify)(void *ctx, unsigned long offset);
+	void *free_ctx;
 	unsigned int i;
 
 	/*
@@ -1273,15 +1311,14 @@ static void swap_range_free(struct swap_info_struct *si, unsigned long offset,
 		zswap_invalidate(swp_entry(si->type, offset + i));
 	}
 
-	if (si->flags & SWP_BLKDEV)
-		swap_slot_free_notify =
-			si->bdev->bd_disk->fops->swap_slot_free_notify;
-	else
-		swap_slot_free_notify = NULL;
+	swap_slot_free_notify = si->backend.ops ?
+		si->backend.ops->swap_slot_free_notify : NULL;
+	free_ctx = si->backend.ctx;
+
 	while (offset <= end) {
 		arch_swap_invalidate_page(si->type, offset);
 		if (swap_slot_free_notify)
-			swap_slot_free_notify(si->bdev, offset);
+			swap_slot_free_notify(free_ctx, offset);
 		offset++;
 	}
 	__swap_cache_clear_shadow(swp_entry(si->type, begin), nr_entries);
@@ -2661,6 +2698,21 @@ static void setup_swap_info(struct swap_info_struct *si, int prio,
 	si->zeromap = zeromap;
 }
 
+static void setup_swap_backend(struct swap_info_struct *si)
+{
+	struct swap_backend_driver *driver;
+
+	si->backend.ops = NULL;
+	si->backend.ctx = NULL;
+
+	mutex_lock(&swap_backend_lock);
+	list_for_each_entry(driver, &swap_backend_drivers, list) {
+		if (driver->attach(si, &si->backend))
+			break;
+	}
+	mutex_unlock(&swap_backend_lock);
+}
+
 static void _enable_swap_info(struct swap_info_struct *si)
 {
 	atomic_long_add(si->pages, &nr_swap_pages);
@@ -2866,6 +2918,8 @@ SYSCALL_DEFINE1(swapoff, const char __user *, specialfile)
 	p->zeromap = NULL;
 	maxpages = p->max;
 	cluster_info = p->cluster_info;
+	p->backend.ops = NULL;
+	p->backend.ctx = NULL;
 	p->max = 0;
 	p->cluster_info = NULL;
 	spin_unlock(&p->lock);
@@ -3466,6 +3520,8 @@ SYSCALL_DEFINE2(swapon, const char __user *, specialfile, int, swap_flags)
 		atomic_inc(&nr_rotate_swap);
 		inced_nr_rotate_swap = true;
 	}
+
+	setup_swap_backend(si);
 
 	cluster_info = setup_clusters(si, swap_header, maxpages);
 	if (IS_ERR(cluster_info)) {
