@@ -6,8 +6,6 @@
 struct mempolicy;
 struct swap_iocb;
 
-extern int page_cluster;
-
 #ifdef CONFIG_THP_SWAP
 #define SWAPFILE_CLUSTER	HPAGE_PMD_NR
 #define swap_entry_order(order)	(order)
