@@ -23,6 +23,7 @@
 #include <linux/device.h>
 #include <linux/highmem.h>
 #include <linux/slab.h>
+#include <linux/swap.h>
 #include <linux/backing-dev.h>
 #include <linux/string.h>
 #include <linux/vmalloc.h>
@@ -2800,12 +2801,9 @@ static void zram_submit_bio(struct bio *bio)
 	}
 }
 
-static void zram_slot_free_notify(struct block_device *bdev,
-				unsigned long index)
+static void zram_slot_free_notify(struct swap_info_struct *si, pgoff_t index)
 {
-	struct zram *zram;
-
-	zram = bdev->bd_disk->private_data;
+	struct zram *zram = si->bdev->bd_disk->private_data;
 
 	atomic64_inc(&zram->stats.notify_free);
 	if (!slot_trylock(zram, index)) {
@@ -2815,6 +2813,14 @@ static void zram_slot_free_notify(struct block_device *bdev,
 
 	slot_free(zram, index);
 	slot_unlock(zram, index);
+}
+
+static int zram_swap_configure(struct swap_info_struct *si)
+{
+	/* Pairs with smp_rmb() in get_swap_device_info() via the
+	 * spin_unlock(&swap_lock) in enable_swap_info(). */
+	WRITE_ONCE(si->slot_free_notify, zram_slot_free_notify);
+	return 0;
 }
 
 static void zram_comp_params_reset(struct zram *zram)
@@ -2974,7 +2980,7 @@ static int zram_open(struct gendisk *disk, blk_mode_t mode)
 static const struct block_device_operations zram_devops = {
 	.open = zram_open,
 	.submit_bio = zram_submit_bio,
-	.swap_slot_free_notify = zram_slot_free_notify,
+	.swap_configure = zram_swap_configure,
 	.owner = THIS_MODULE
 };
 

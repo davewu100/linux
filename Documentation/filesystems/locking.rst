@@ -440,7 +440,7 @@ prototypes::
 				unsigned long *);
 	void (*unlock_native_capacity) (struct gendisk *);
 	int (*getgeo)(struct gendisk *, struct hd_geometry *);
-	void (*swap_slot_free_notify) (struct block_device *, unsigned long);
+	int (*swap_configure)(struct swap_info_struct *si);
 
 locking rules:
 
@@ -454,11 +454,12 @@ compat_ioctl:		no
 direct_access:		no
 unlock_native_capacity:	no
 getgeo:			no
-swap_slot_free_notify:	no	(see below)
+swap_configure:		no
 ======================= ===================
 
-swap_slot_free_notify is called with swap_lock and sometimes the page lock
-held.
+swap_configure is called at swapon time before the device is made active.
+The driver may set swap_info_struct::slot_free_notify to be notified
+when individual swap slots are freed (called with the cluster spinlock held).
 
 
 file_operations

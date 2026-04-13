@@ -1261,7 +1261,7 @@ static void swap_range_free(struct swap_info_struct *si, unsigned long offset,
 {
 	unsigned long begin = offset;
 	unsigned long end = offset + nr_entries - 1;
-	void (*swap_slot_free_notify)(struct block_device *, unsigned long);
+	void (*notify)(struct swap_info_struct *, pgoff_t);
 	unsigned int i;
 
 	/*
@@ -1273,15 +1273,12 @@ static void swap_range_free(struct swap_info_struct *si, unsigned long offset,
 		zswap_invalidate(swp_entry(si->type, offset + i));
 	}
 
-	if (si->flags & SWP_BLKDEV)
-		swap_slot_free_notify =
-			si->bdev->bd_disk->fops->swap_slot_free_notify;
-	else
-		swap_slot_free_notify = NULL;
+	notify = READ_ONCE(si->slot_free_notify);
+
 	while (offset <= end) {
 		arch_swap_invalidate_page(si->type, offset);
-		if (swap_slot_free_notify)
-			swap_slot_free_notify(si->bdev, offset);
+		if (notify)
+			notify(si, offset);
 		offset++;
 	}
 	__swap_cache_clear_shadow(swp_entry(si->type, begin), nr_entries);
@@ -2895,6 +2892,7 @@ SYSCALL_DEFINE1(swapoff, const char __user *, specialfile)
 	 */
 	spin_lock(&swap_lock);
 	p->flags = 0;
+	p->slot_free_notify = NULL;
 	spin_unlock(&swap_lock);
 
 	err = 0;
@@ -3505,6 +3503,12 @@ SYSCALL_DEFINE2(swapon, const char __user *, specialfile, int, swap_flags)
 		}
 	}
 
+	if ((si->flags & SWP_BLKDEV) && si->bdev->bd_disk->fops->swap_configure) {
+		error = si->bdev->bd_disk->fops->swap_configure(si);
+		if (error)
+			goto bad_swap_unlock_inode;
+	}
+
 	error = zswap_swapon(si->type, maxpages);
 	if (error)
 		goto bad_swap_unlock_inode;
@@ -3553,6 +3557,7 @@ bad_swap:
 	spin_lock(&swap_lock);
 	si->swap_file = NULL;
 	si->flags = 0;
+	si->slot_free_notify = NULL;
 	spin_unlock(&swap_lock);
 	vfree(swap_map);
 	kvfree(zeromap);
