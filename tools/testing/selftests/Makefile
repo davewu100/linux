@@ -54,6 +54,7 @@ TARGETS += ir
 TARGETS += kcmp
 TARGETS += kexec
 TARGETS += kselftest_harness
+TARGETS += kserial
 TARGETS += kvm
 TARGETS += landlock
 TARGETS += lib

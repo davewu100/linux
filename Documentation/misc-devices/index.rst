@@ -20,6 +20,7 @@ fit into other categories.
    ibmvmc
    ics932s401
    isl29003
+   kserial
    lis3lv02d
    max6875
    mrvl_cn10k_dpi

@@ -6448,6 +6448,22 @@ err_out:
 	return btf;
 }
 
+/**
+ * btf_get_vmlinux - return the vmlinux BTF, initialising it if necessary
+ *
+ * Returns the vmlinux BTF object, or NULL if BTF is not available (e.g.
+ * CONFIG_DEBUG_INFO_BTF is not set).  Safe to call from any context that
+ * can sleep; the underlying initialisation uses bpf_verifier_lock.
+ *
+ * Intended for kernel subsystems that need BTF type information but are not
+ * part of the BPF verifier (e.g. binary serialisation drivers).
+ */
+struct btf *btf_get_vmlinux(void)
+{
+	return bpf_get_btf_vmlinux();
+}
+EXPORT_SYMBOL_GPL(btf_get_vmlinux);
+
 /* If .BTF_ids section was created with distilled base BTF, both base and
  * split BTF ids will need to be mapped to actual base/split ids for
  * BTF now that it has been relocated.
