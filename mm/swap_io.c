@@ -588,6 +588,9 @@ static void swap_read_folio_bdev_async(struct swap_info_struct *sis,
 	submit_bio(bio);
 }
 
+static void swap_slot_free_notify(struct swap_info_struct *sis,
+				  unsigned long offset);
+
 static const struct swap_ops bdev_fs_swap_ops = {
 	.read_folio = swap_read_folio_fs,
 	.write_folio = swap_write_folio_fs,
@@ -596,12 +599,55 @@ static const struct swap_ops bdev_fs_swap_ops = {
 static const struct swap_ops bdev_sync_swap_ops = {
 	.read_folio = swap_read_folio_bdev_sync,
 	.write_folio = swap_write_folio_bdev_sync,
+	.slot_free_notify = swap_slot_free_notify,
 };
 
 static const struct swap_ops bdev_async_swap_ops = {
 	.read_folio = swap_read_folio_bdev_async,
 	.write_folio = swap_write_folio_bdev_async,
+	.slot_free_notify = swap_slot_free_notify,
 };
+
+static DEFINE_MUTEX(slot_free_notify_lock);
+static swap_slot_free_notify_fn slot_free_notify_fn;
+
+int swap_register_slot_free_notify(swap_slot_free_notify_fn fn)
+{
+	int ret = 0;
+
+	if (!fn)
+		return -EINVAL;
+
+	mutex_lock(&slot_free_notify_lock);
+	if (slot_free_notify_fn && slot_free_notify_fn != fn)
+		ret = -EBUSY;
+	else
+		slot_free_notify_fn = fn;
+	mutex_unlock(&slot_free_notify_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(swap_register_slot_free_notify);
+
+void swap_unregister_slot_free_notify(swap_slot_free_notify_fn fn)
+{
+	mutex_lock(&slot_free_notify_lock);
+	if (slot_free_notify_fn == fn)
+		slot_free_notify_fn = NULL;
+	mutex_unlock(&slot_free_notify_lock);
+}
+EXPORT_SYMBOL_GPL(swap_unregister_slot_free_notify);
+
+static void swap_slot_free_notify(struct swap_info_struct *sis,
+				  unsigned long offset)
+{
+	swap_slot_free_notify_fn fn;
+
+	fn = READ_ONCE(slot_free_notify_fn);
+	if (!fn)
+		return;
+
+	fn(sis, offset);
+}
 
 int init_swap_ops(struct swap_info_struct *sis)
 {

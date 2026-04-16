@@ -21,6 +21,13 @@ struct notifier_block;
 struct bio;
 
 struct pagevec;
+struct swap_cluster_info;
+struct swap_info_struct;
+struct swap_ops;
+typedef void (*swap_slot_free_notify_fn)(struct swap_info_struct *sis,
+					 unsigned long offset);
+int swap_register_slot_free_notify(swap_slot_free_notify_fn fn);
+void swap_unregister_slot_free_notify(swap_slot_free_notify_fn fn);
 
 #define SWAP_FLAG_PREFER	0x8000	/* set if swap priority specified */
 #define SWAP_FLAG_PRIO_MASK	0x7fff
@@ -255,7 +262,6 @@ struct swap_sequential_cluster {
 	unsigned int next[SWAP_NR_ORDERS]; /* Likely next allocation offset */
 };
 
-struct swap_ops;
 /*
  * The in-memory structure used to track swap areas.
  */
@@ -427,7 +433,6 @@ int add_swap_extent(struct swap_info_struct *sis, unsigned long start_page,
 		unsigned long nr_pages, sector_t start_block);
 int generic_swapfile_activate(struct swap_info_struct *, struct file *,
 		sector_t *);
-
 static inline unsigned long total_swapcache_pages(void)
 {
 	return global_node_page_state(NR_SWAPCACHE);
