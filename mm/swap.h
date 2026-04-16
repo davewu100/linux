@@ -220,6 +220,8 @@ struct swap_ops {
 	void (*write_folio)(struct swap_info_struct *sis,
 			struct folio *folio,
 			struct swap_iocb **plug);
+	void (*slot_free_notify)(struct swap_info_struct *sis,
+			unsigned long offset);
 };
 int init_swap_ops(struct swap_info_struct *sis);
 void swap_read_folio(struct folio *folio, struct swap_iocb **plug);
