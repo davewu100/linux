@@ -2,7 +2,7 @@
 #ifndef _MM_SWAP_H
 #define _MM_SWAP_H
 
-#include <linux/atomic.h> /* for atomic_long_t */
+#include <linux/swap.h>
 struct mempolicy;
 struct swap_iocb;
 
@@ -51,6 +51,71 @@ enum swap_cluster_flags {
 	CLUSTER_FLAG_FULL,
 	CLUSTER_FLAG_DISCARD,
 	CLUSTER_FLAG_MAX,
+};
+
+/*
+ * We keep using same cluster for rotational device so IO will be sequential.
+ * The purpose is to optimize SWAP throughput on these device.
+ */
+struct swap_sequential_cluster {
+	unsigned int next[SWAP_NR_ORDERS]; /* Likely next allocation offset */
+};
+
+struct swap_ops {
+	void (*read_folio)(struct swap_info_struct *sis,
+			struct folio *folio,
+			struct swap_iocb **plug);
+	void (*write_folio)(struct swap_info_struct *sis,
+			struct folio *folio,
+			struct swap_iocb **plug);
+};
+
+/*
+ * The in-memory structure used to track swap areas.
+ */
+struct swap_info_struct {
+	struct percpu_ref users;	/* indicate and keep swap device valid. */
+	unsigned long	flags;		/* SWP_USED etc: see above */
+	signed short	prio;		/* swap priority of this type */
+	struct plist_node list;		/* entry in swap_active_head */
+	signed char	type;		/* strange name for an index */
+	unsigned int	max;		/* extent of the swap_map */
+	unsigned char *swap_map;	/* vmalloc'ed array of usage counts */
+	unsigned long *zeromap;		/* kvmalloc'ed bitmap to track zero pages */
+	struct swap_cluster_info *cluster_info; /* cluster info. Only for SSD */
+	struct list_head free_clusters; /* free clusters list */
+	struct list_head full_clusters; /* full clusters list */
+	struct list_head nonfull_clusters[SWAP_NR_ORDERS];
+					/* list of cluster that contains at least one free slot */
+	struct list_head frag_clusters[SWAP_NR_ORDERS];
+					/* list of cluster that are fragmented or contented */
+	unsigned int pages;		/* total of usable pages of swap */
+	atomic_long_t inuse_pages;	/* number of those currently in use */
+	struct swap_sequential_cluster *global_cluster; /* Use one global cluster for rotating device */
+	spinlock_t global_cluster_lock;	/* Serialize usage of global cluster */
+	struct rb_root swap_extent_root;/* root of the swap extent rbtree */
+	struct block_device *bdev;	/* swap device or bdev of swap file */
+	struct file *swap_file;		/* seldom referenced */
+	struct completion comp;		/* seldom referenced */
+	spinlock_t lock;		/*
+					 * protect map scan related fields like
+					 * swap_map, inuse_pages and all cluster
+					 * lists. other fields are only changed
+					 * at swapon/swapoff, so are protected
+					 * by swap_lock. changing flags need
+					 * hold this lock and swap_lock. If
+					 * both locks need hold, hold swap_lock
+					 * first.
+					 */
+	spinlock_t cont_lock;		/*
+					 * protect swap count continuation page
+					 * list.
+					 */
+	struct work_struct discard_work; /* discard worker */
+	struct work_struct reclaim_work; /* reclaim worker */
+	struct list_head discard_clusters; /* discard clusters list */
+	struct plist_node avail_list;   /* entry in swap_avail_head */
+	const struct swap_ops *ops;
 };
 
 #ifdef CONFIG_SWAP
@@ -213,14 +278,6 @@ extern void swap_entries_free(struct swap_info_struct *si,
 /* linux/mm/swap_io.c */
 int sio_pool_init(void);
 struct swap_iocb;
-struct swap_ops {
-	void (*read_folio)(struct swap_info_struct *sis,
-			struct folio *folio,
-			struct swap_iocb **plug);
-	void (*write_folio)(struct swap_info_struct *sis,
-			struct folio *folio,
-			struct swap_iocb **plug);
-};
 int init_swap_ops(struct swap_info_struct *sis);
 void swap_read_folio(struct folio *folio, struct swap_iocb **plug);
 void __swap_read_unplug(struct swap_iocb *plug);
@@ -357,8 +414,17 @@ static inline int non_swapcache_batch(swp_entry_t entry, int max_nr)
 	return i;
 }
 
+static inline void put_swap_device(struct swap_info_struct *si)
+{
+	percpu_ref_put(&si->users);
+}
+
 #else /* CONFIG_SWAP */
 struct swap_iocb;
+
+static inline void put_swap_device(struct swap_info_struct *si)
+{
+}
 static inline struct swap_cluster_info *swap_cluster_lock(
 	struct swap_info_struct *si, pgoff_t offset, bool irq)
 {
