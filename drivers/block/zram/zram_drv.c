@@ -33,6 +33,8 @@
 #include <linux/cpuhotplug.h>
 #include <linux/part_stat.h>
 #include <linux/kernel_read_file.h>
+#include <linux/swap.h>
+#include <linux/swapops.h>
 
 #include "zram_drv.h"
 
@@ -2330,6 +2332,35 @@ static int zram_bvec_write(struct zram *zram, struct bio_vec *bvec,
 	return zram_write_page(zram, bvec->bv_page, index);
 }
 
+static int zram_read_swap_folio(struct zram *zram, struct folio *folio,
+				unsigned long index)
+{
+	int i;
+
+	for (i = 0; i < folio_nr_pages(folio); i++) {
+		int ret = zram_read_page(zram, folio_page(folio, i),
+					 index + i, NULL);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
+static int zram_write_swap_folio(struct zram *zram, struct folio *folio,
+				 unsigned long index)
+{
+	int i;
+
+	for (i = 0; i < folio_nr_pages(folio); i++) {
+		int ret = zram_write_page(zram, folio_page(folio, i), index + i);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
 #ifdef CONFIG_ZRAM_MULTI_COMP
 #define RECOMPRESS_IDLE		(1 << 0)
 #define RECOMPRESS_HUGE		(1 << 1)
@@ -2800,12 +2831,62 @@ static void zram_submit_bio(struct bio *bio)
 	}
 }
 
-static void zram_slot_free_notify(struct block_device *bdev,
+static void zram_swap_read(struct swap_info_struct *sis,
+			   struct folio *folio, struct swap_iocb **plug)
+{
+	struct zram *zram = sis->bdev->bd_disk->private_data;
+	unsigned long index = swp_offset(folio->swap);
+	int ret;
+
+	(void)plug;
+	count_mthp_stat(folio_order(folio), MTHP_STAT_SWPIN);
+	count_memcg_folio_events(folio, PSWPIN, folio_nr_pages(folio));
+	count_vm_events(PSWPIN, folio_nr_pages(folio));
+
+	ret = zram_read_swap_folio(zram, folio, index);
+	if (ret) {
+		pr_alert_ratelimited("Read-error on zram swap-device\n");
+		folio_unlock(folio);
+		return;
+	}
+
+	folio_mark_uptodate(folio);
+	folio_unlock(folio);
+}
+
+static void zram_swap_write(struct swap_info_struct *sis,
+			    struct folio *folio, struct swap_iocb **plug)
+{
+	struct zram *zram = sis->bdev->bd_disk->private_data;
+	unsigned long index = swp_offset(folio->swap);
+	int ret;
+
+	(void)plug;
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+	if (unlikely(folio_test_pmd_mappable(folio))) {
+		count_memcg_folio_events(folio, THP_SWPOUT, 1);
+		count_vm_event(THP_SWPOUT);
+	}
+#endif
+	count_mthp_stat(folio_order(folio), MTHP_STAT_SWPOUT);
+	count_memcg_folio_events(folio, PSWPOUT, folio_nr_pages(folio));
+	count_vm_events(PSWPOUT, folio_nr_pages(folio));
+	folio_start_writeback(folio);
+	folio_unlock(folio);
+
+	ret = zram_write_swap_folio(zram, folio, index);
+	if (ret) {
+		folio_mark_dirty(folio);
+		pr_alert_ratelimited("Write-error on zram swap-device\n");
+		folio_clear_reclaim(folio);
+	}
+	folio_end_writeback(folio);
+}
+
+static void zram_swap_slot_free(struct swap_info_struct *sis,
 				unsigned long index)
 {
-	struct zram *zram;
-
-	zram = bdev->bd_disk->private_data;
+	struct zram *zram = sis->bdev->bd_disk->private_data;
 
 	atomic64_inc(&zram->stats.notify_free);
 	if (!slot_trylock(zram, index)) {
@@ -2816,6 +2897,12 @@ static void zram_slot_free_notify(struct block_device *bdev,
 	slot_free(zram, index);
 	slot_unlock(zram, index);
 }
+
+static const struct swap_ops zram_swap_ops = {
+	.read_folio       = zram_swap_read,
+	.write_folio      = zram_swap_write,
+	.slot_free_notify = zram_swap_slot_free,
+};
 
 static void zram_comp_params_reset(struct zram *zram)
 {
@@ -2972,11 +3059,19 @@ static int zram_open(struct gendisk *disk, blk_mode_t mode)
 }
 
 static const struct block_device_operations zram_devops = {
-	.open = zram_open,
+	.open       = zram_open,
 	.submit_bio = zram_submit_bio,
-	.swap_slot_free_notify = zram_slot_free_notify,
-	.owner = THIS_MODULE
+	.owner      = THIS_MODULE,
 };
+
+const struct swap_ops *zram_get_swap_ops(struct block_device *bdev)
+{
+	if (!bdev || bdev->bd_disk->fops != &zram_devops)
+		return NULL;
+
+	return &zram_swap_ops;
+}
+EXPORT_SYMBOL_GPL(zram_get_swap_ops);
 
 static DEVICE_ATTR_RO(io_stat);
 static DEVICE_ATTR_RO(mm_stat);
@@ -3291,6 +3386,9 @@ static int __init zram_init(void)
 		num_devices--;
 	}
 
+	ret = swap_register_ops_lookup(zram_get_swap_ops);
+	if (ret)
+		goto out_error;
 	return 0;
 
 out_error:
@@ -3300,6 +3398,7 @@ out_error:
 
 static void __exit zram_exit(void)
 {
+	swap_unregister_ops_lookup(zram_get_swap_ops);
 	destroy_devices();
 }
 

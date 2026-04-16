@@ -603,8 +603,40 @@ static const struct swap_ops bdev_async_swap_ops = {
 	.write_folio = swap_write_folio_bdev_async,
 };
 
+static DEFINE_MUTEX(swap_ops_lookup_lock);
+static swap_ops_lookup_t swap_ops_lookup;
+
+int swap_register_ops_lookup(swap_ops_lookup_t lookup)
+{
+	int ret = 0;
+
+	if (!lookup)
+		return -EINVAL;
+
+	mutex_lock(&swap_ops_lookup_lock);
+	if (swap_ops_lookup && swap_ops_lookup != lookup)
+		ret = -EBUSY;
+	else
+		swap_ops_lookup = lookup;
+	mutex_unlock(&swap_ops_lookup_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(swap_register_ops_lookup);
+
+void swap_unregister_ops_lookup(swap_ops_lookup_t lookup)
+{
+	mutex_lock(&swap_ops_lookup_lock);
+	if (swap_ops_lookup == lookup)
+		swap_ops_lookup = NULL;
+	mutex_unlock(&swap_ops_lookup_lock);
+}
+EXPORT_SYMBOL_GPL(swap_unregister_ops_lookup);
+
 int init_swap_ops(struct swap_info_struct *sis)
 {
+	const struct swap_ops *ops;
+	swap_ops_lookup_t lookup;
+
 	/*
 	 * ->flags can be updated non-atomically, but that will
 	 * never affect SWP_FS_OPS, so the data_race is safe.
@@ -612,13 +644,22 @@ int init_swap_ops(struct swap_info_struct *sis)
 	if (data_race(sis->flags & SWP_FS_OPS))
 		sis->ops = &bdev_fs_swap_ops;
 	/*
-	 * ->flags can be updated non-atomically, but that will
-	 * never affect SWP_SYNCHRONOUS_IO, so the data_race is safe.
+	 * Keep zram on its own swap_ops implementation so slot-free
+	 * notifications stay in the same backend interface as I/O.
 	 */
-	else if (data_race(sis->flags & SWP_SYNCHRONOUS_IO))
-		sis->ops = &bdev_sync_swap_ops;
-	else
-		sis->ops = &bdev_async_swap_ops;
+	else if ((lookup = READ_ONCE(swap_ops_lookup)) &&
+		 (ops = lookup(sis->bdev)) != NULL)
+		sis->ops = ops;
+	else {
+		/*
+		 * ->flags can be updated non-atomically, but that will
+		 * never affect SWP_SYNCHRONOUS_IO, so the data_race is safe.
+		 */
+		if (data_race(sis->flags & SWP_SYNCHRONOUS_IO))
+			sis->ops = &bdev_sync_swap_ops;
+		else
+			sis->ops = &bdev_async_swap_ops;
+	}
 
 	if (!sis->ops || !sis->ops->read_folio || !sis->ops->write_folio)
 		return -EINVAL;
