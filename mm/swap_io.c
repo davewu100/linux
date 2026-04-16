@@ -588,23 +588,18 @@ static void swap_read_folio_bdev_async(struct swap_info_struct *sis,
 	submit_bio(bio);
 }
 
-static void swap_slot_free_notify_bdev(struct swap_info_struct *sis,
-				       unsigned long offset)
-{
-	sis->bdev->bd_disk->fops->swap_slot_free_notify(sis->bdev, offset);
-}
-
-static bool swap_bdev_has_slot_free_notify(struct swap_info_struct *sis)
+static void (*swap_slot_free_notify_bdev(struct swap_info_struct *sis))
+	(struct block_device *bdev, unsigned long offset)
 {
 	/*
 	 * ->flags can be updated non-atomically, but that will
 	 * never affect SWP_BLKDEV, so the data_race is safe.
 	 */
 	if (!data_race(sis->flags & SWP_BLKDEV))
-		return false;
+		return NULL;
 
 	/* Currently only implemented by zram. */
-	return !!sis->bdev->bd_disk->fops->swap_slot_free_notify;
+	return sis->bdev->bd_disk->fops->swap_slot_free_notify;
 }
 
 static const struct swap_ops bdev_fs_swap_ops = {
@@ -639,8 +634,7 @@ int init_swap_ops(struct swap_info_struct *sis)
 	else
 		sis->ops = bdev_async_swap_ops;
 
-	if (swap_bdev_has_slot_free_notify(sis))
-		sis->ops.slot_free_notify = swap_slot_free_notify_bdev;
+	sis->slot_free_notify = swap_slot_free_notify_bdev(sis);
 
 	if (!sis->ops.read_folio || !sis->ops.write_folio)
 		return -EINVAL;

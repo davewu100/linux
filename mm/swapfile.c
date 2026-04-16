@@ -1261,6 +1261,7 @@ static void swap_range_free(struct swap_info_struct *si, unsigned long offset,
 {
 	unsigned long begin = offset;
 	unsigned long end = offset + nr_entries - 1;
+	void (*slot_free_notify)(struct block_device *bdev, unsigned long offset);
 	unsigned int i;
 
 	/*
@@ -1272,10 +1273,11 @@ static void swap_range_free(struct swap_info_struct *si, unsigned long offset,
 		zswap_invalidate(swp_entry(si->type, offset + i));
 	}
 
+	slot_free_notify = READ_ONCE(si->slot_free_notify);
 	while (offset <= end) {
 		arch_swap_invalidate_page(si->type, offset);
-		if (si->ops.slot_free_notify)
-			si->ops.slot_free_notify(si, offset);
+		if (slot_free_notify)
+			slot_free_notify(si->bdev, offset);
 		offset++;
 	}
 	__swap_cache_clear_shadow(swp_entry(si->type, begin), nr_entries);
