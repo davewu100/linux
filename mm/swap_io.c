@@ -280,7 +280,7 @@ int swap_writeout(struct folio *folio, struct swap_iocb **swap_plug)
 		return AOP_WRITEPAGE_ACTIVATE;
 	}
 
-	sis->ops->write_folio(sis, folio, swap_plug);
+	sis->ops.write_folio(sis, folio, swap_plug);
 	return 0;
 out_unlock:
 	folio_unlock(folio);
@@ -588,6 +588,25 @@ static void swap_read_folio_bdev_async(struct swap_info_struct *sis,
 	submit_bio(bio);
 }
 
+static void swap_slot_free_notify_bdev(struct swap_info_struct *sis,
+				       unsigned long offset)
+{
+	sis->bdev->bd_disk->fops->swap_slot_free_notify(sis->bdev, offset);
+}
+
+static bool swap_bdev_has_slot_free_notify(struct swap_info_struct *sis)
+{
+	/*
+	 * ->flags can be updated non-atomically, but that will
+	 * never affect SWP_BLKDEV, so the data_race is safe.
+	 */
+	if (!data_race(sis->flags & SWP_BLKDEV))
+		return false;
+
+	/* Currently only implemented by zram. */
+	return !!sis->bdev->bd_disk->fops->swap_slot_free_notify;
+}
+
 static const struct swap_ops bdev_fs_swap_ops = {
 	.read_folio = swap_read_folio_fs,
 	.write_folio = swap_write_folio_fs,
@@ -610,17 +629,20 @@ int init_swap_ops(struct swap_info_struct *sis)
 	 * never affect SWP_FS_OPS, so the data_race is safe.
 	 */
 	if (data_race(sis->flags & SWP_FS_OPS))
-		sis->ops = &bdev_fs_swap_ops;
+		sis->ops = bdev_fs_swap_ops;
 	/*
 	 * ->flags can be updated non-atomically, but that will
 	 * never affect SWP_SYNCHRONOUS_IO, so the data_race is safe.
 	 */
 	else if (data_race(sis->flags & SWP_SYNCHRONOUS_IO))
-		sis->ops = &bdev_sync_swap_ops;
+		sis->ops = bdev_sync_swap_ops;
 	else
-		sis->ops = &bdev_async_swap_ops;
+		sis->ops = bdev_async_swap_ops;
 
-	if (!sis->ops || !sis->ops->read_folio || !sis->ops->write_folio)
+	if (swap_bdev_has_slot_free_notify(sis))
+		sis->ops.slot_free_notify = swap_slot_free_notify_bdev;
+
+	if (!sis->ops.read_folio || !sis->ops.write_folio)
 		return -EINVAL;
 
 	return 0;
@@ -660,7 +682,7 @@ void swap_read_folio(struct folio *folio, struct swap_iocb **plug)
 	/* We have to read from slower devices. Increase zswap protection. */
 	zswap_folio_swapin(folio);
 
-	sis->ops->read_folio(sis, folio, plug);
+	sis->ops.read_folio(sis, folio, plug);
 
 finish:
 	if (workingset) {

@@ -68,6 +68,8 @@ struct swap_ops {
 	void (*write_folio)(struct swap_info_struct *sis,
 			struct folio *folio,
 			struct swap_iocb **plug);
+	void (*slot_free_notify)(struct swap_info_struct *sis,
+			unsigned long offset);
 };
 
 /*
@@ -115,7 +117,7 @@ struct swap_info_struct {
 	struct work_struct reclaim_work; /* reclaim worker */
 	struct list_head discard_clusters; /* discard clusters list */
 	struct plist_node avail_list;   /* entry in swap_avail_head */
-	const struct swap_ops *ops;
+	struct swap_ops ops;
 };
 
 #ifdef CONFIG_SWAP
