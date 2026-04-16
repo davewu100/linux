@@ -617,14 +617,45 @@ static const struct swap_ops bdev_async_swap_ops = {
 	.write_folio = swap_write_folio_bdev_async,
 };
 
+/*
+ * zram has per-slot lifecycle handling (swap_slot_free_notify), so keep it
+ * on an explicit dispatch path instead of piggybacking on generic bdev ops.
+ */
+static const struct swap_ops zram_sync_swap_ops = {
+	.read_folio = swap_read_folio_bdev_sync,
+	.write_folio = swap_write_folio_bdev_sync,
+};
+
+static const struct swap_ops zram_async_swap_ops = {
+	.read_folio = swap_read_folio_bdev_async,
+	.write_folio = swap_write_folio_bdev_async,
+};
+
 int init_swap_ops(struct swap_info_struct *sis)
 {
+	void (*slot_free_notify)(struct block_device *bdev, unsigned long offset);
+
+	slot_free_notify = swap_slot_free_notify_bdev(sis);
+
 	/*
 	 * ->flags can be updated non-atomically, but that will
 	 * never affect SWP_FS_OPS, so the data_race is safe.
 	 */
-	if (data_race(sis->flags & SWP_FS_OPS))
+	if (data_race(sis->flags & SWP_FS_OPS)) {
 		sis->ops = bdev_fs_swap_ops;
+		sis->slot_free_notify = NULL;
+	} else if (slot_free_notify) {
+		/*
+		 * zram should use its own ops category and slot-free callback
+		 * together, instead of mixing generic bdev selection with an
+		 * extra capability patch.
+		 */
+		if (data_race(sis->flags & SWP_SYNCHRONOUS_IO))
+			sis->ops = zram_sync_swap_ops;
+		else
+			sis->ops = zram_async_swap_ops;
+		sis->slot_free_notify = slot_free_notify;
+	}
 	/*
 	 * ->flags can be updated non-atomically, but that will
 	 * never affect SWP_SYNCHRONOUS_IO, so the data_race is safe.
@@ -633,8 +664,8 @@ int init_swap_ops(struct swap_info_struct *sis)
 		sis->ops = bdev_sync_swap_ops;
 	else
 		sis->ops = bdev_async_swap_ops;
-
-	sis->slot_free_notify = swap_slot_free_notify_bdev(sis);
+	if (!slot_free_notify)
+		sis->slot_free_notify = NULL;
 
 	if (!sis->ops.read_folio || !sis->ops.write_folio)
 		return -EINVAL;
