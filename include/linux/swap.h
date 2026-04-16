@@ -13,6 +13,11 @@
 #include <linux/pagemap.h>
 #include <linux/atomic.h>
 #include <linux/page-flags.h>
+#include <linux/percpu-refcount.h>
+#include <linux/plist.h>
+#include <linux/completion.h>
+#include <linux/rbtree_types.h>
+#include <linux/workqueue.h>
 #include <uapi/linux/mempolicy.h>
 #include <asm/page.h>
 
@@ -21,6 +26,9 @@ struct notifier_block;
 struct bio;
 
 struct pagevec;
+struct swap_cluster_info;
+struct swap_sequential_cluster;
+struct swap_ops;
 
 #define SWAP_FLAG_PREFER	0x8000	/* set if swap priority specified */
 #define SWAP_FLAG_PRIO_MASK	0x7fff
@@ -248,15 +256,6 @@ enum {
 #endif
 
 /*
- * We keep using same cluster for rotational device so IO will be sequential.
- * The purpose is to optimize SWAP throughput on these device.
- */
-struct swap_sequential_cluster {
-	unsigned int next[SWAP_NR_ORDERS]; /* Likely next allocation offset */
-};
-
-struct swap_ops;
-/*
  * The in-memory structure used to track swap areas.
  */
 struct swap_info_struct {
@@ -427,7 +426,6 @@ int add_swap_extent(struct swap_info_struct *sis, unsigned long start_page,
 		unsigned long nr_pages, sector_t start_block);
 int generic_swapfile_activate(struct swap_info_struct *, struct file *,
 		sector_t *);
-
 static inline unsigned long total_swapcache_pages(void)
 {
 	return global_node_page_state(NR_SWAPCACHE);

@@ -588,6 +588,19 @@ static void swap_read_folio_bdev_async(struct swap_info_struct *sis,
 	submit_bio(bio);
 }
 
+static bool swap_bdev_has_slot_free_notify(struct swap_info_struct *sis)
+{
+	/*
+	 * ->flags can be updated non-atomically, but that will
+	 * never affect SWP_BLKDEV, so the data_race is safe.
+	 */
+	if (!data_race(sis->flags & SWP_BLKDEV))
+		return false;
+
+	/* Currently only implemented by zram. */
+	return !!sis->bdev->bd_disk->fops->swap_slot_free_notify;
+}
+
 static const struct swap_ops bdev_fs_swap_ops = {
 	.read_folio = swap_read_folio_fs,
 	.write_folio = swap_write_folio_fs,
@@ -603,6 +616,67 @@ static const struct swap_ops bdev_async_swap_ops = {
 	.write_folio = swap_write_folio_bdev_async,
 };
 
+#ifdef CONFIG_ZRAM
+static void zram_read_folio(struct swap_info_struct *sis,
+			    struct folio *folio,
+			    struct swap_iocb **plug)
+{
+	int ret;
+	(void)plug;
+
+	count_mthp_stat(folio_order(folio), MTHP_STAT_SWPIN);
+	count_memcg_folio_events(folio, PSWPIN, folio_nr_pages(folio));
+	count_vm_events(PSWPIN, folio_nr_pages(folio));
+
+	ret = zram_read_folio_bdev(sis->bdev, folio);
+	if (ret) {
+		pr_alert_ratelimited("Read-error on zram swap-device\n");
+		folio_unlock(folio);
+		return;
+	}
+
+	folio_mark_uptodate(folio);
+	folio_unlock(folio);
+}
+
+static void zram_write_folio(struct swap_info_struct *sis,
+			     struct folio *folio,
+			     struct swap_iocb **plug)
+{
+	int ret;
+	(void)plug;
+
+	count_swpout_vm_event(folio);
+	folio_start_writeback(folio);
+	folio_unlock(folio);
+
+	ret = zram_write_folio_bdev(sis->bdev, folio);
+	if (ret) {
+		/*
+		 * Mirror swap bio write failure handling so reclaim can retry.
+		 */
+		folio_mark_dirty(folio);
+		pr_alert_ratelimited("Write-error on zram swap-device\n");
+		folio_clear_reclaim(folio);
+	}
+	folio_end_writeback(folio);
+}
+
+static void zram_free_slot(struct swap_info_struct *sis, unsigned long offset)
+{
+	zram_free_slot_bdev(sis->bdev, offset);
+}
+
+/*
+ * zram has per-slot lifecycle handling (swap_slot_free_notify), so keep it
+ * on an explicit dispatch path instead of piggybacking on generic bdev ops.
+ */
+static const struct swap_ops zram_sync_swap_ops = {
+	.read_folio = zram_read_folio,
+	.write_folio = zram_write_folio,
+	.slot_free_notify = zram_free_slot,
+};
+#endif
 int init_swap_ops(struct swap_info_struct *sis)
 {
 	/*
@@ -611,6 +685,16 @@ int init_swap_ops(struct swap_info_struct *sis)
 	 */
 	if (data_race(sis->flags & SWP_FS_OPS))
 		sis->ops = &bdev_fs_swap_ops;
+#ifdef CONFIG_ZRAM
+	else if (swap_bdev_has_slot_free_notify(sis)) {
+		/*
+		 * zram should use its own ops category and slot-free callback
+		 * together, instead of mixing generic bdev selection with an
+		 * extra capability patch. zram uses synchronous swap IO.
+		 */
+		sis->ops = &zram_sync_swap_ops;
+	}
+#endif
 	/*
 	 * ->flags can be updated non-atomically, but that will
 	 * never affect SWP_SYNCHRONOUS_IO, so the data_race is safe.

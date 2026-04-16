@@ -33,6 +33,7 @@
 #include <linux/cpuhotplug.h>
 #include <linux/part_stat.h>
 #include <linux/kernel_read_file.h>
+#include <linux/swapops.h>
 
 #include "zram_drv.h"
 
@@ -2330,6 +2331,41 @@ static int zram_bvec_write(struct zram *zram, struct bio_vec *bvec,
 	return zram_write_page(zram, bvec->bv_page, index);
 }
 
+int zram_read_folio_bdev(struct block_device *bdev, struct folio *folio)
+{
+	struct zram *zram = bdev->bd_disk->private_data;
+	unsigned long index = swp_offset(folio->swap);
+	int i;
+
+	for (i = 0; i < folio_nr_pages(folio); i++) {
+		int ret = zram_read_page(zram, folio_page(folio, i),
+					 index + i, NULL);
+
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(zram_read_folio_bdev);
+
+int zram_write_folio_bdev(struct block_device *bdev, struct folio *folio)
+{
+	struct zram *zram = bdev->bd_disk->private_data;
+	unsigned long index = swp_offset(folio->swap);
+	int i;
+
+	for (i = 0; i < folio_nr_pages(folio); i++) {
+		int ret = zram_write_page(zram, folio_page(folio, i), index + i);
+
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(zram_write_folio_bdev);
+
 #ifdef CONFIG_ZRAM_MULTI_COMP
 #define RECOMPRESS_IDLE		(1 << 0)
 #define RECOMPRESS_HUGE		(1 << 1)
@@ -2800,8 +2836,7 @@ static void zram_submit_bio(struct bio *bio)
 	}
 }
 
-static void zram_slot_free_notify(struct block_device *bdev,
-				unsigned long index)
+void zram_free_slot_bdev(struct block_device *bdev, unsigned long index)
 {
 	struct zram *zram;
 
@@ -2816,6 +2851,7 @@ static void zram_slot_free_notify(struct block_device *bdev,
 	slot_free(zram, index);
 	slot_unlock(zram, index);
 }
+EXPORT_SYMBOL_GPL(zram_free_slot_bdev);
 
 static void zram_comp_params_reset(struct zram *zram)
 {
@@ -2974,7 +3010,7 @@ static int zram_open(struct gendisk *disk, blk_mode_t mode)
 static const struct block_device_operations zram_devops = {
 	.open = zram_open,
 	.submit_bio = zram_submit_bio,
-	.swap_slot_free_notify = zram_slot_free_notify,
+	.swap_slot_free_notify = zram_free_slot_bdev,
 	.owner = THIS_MODULE
 };
 

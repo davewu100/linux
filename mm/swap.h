@@ -2,7 +2,7 @@
 #ifndef _MM_SWAP_H
 #define _MM_SWAP_H
 
-#include <linux/atomic.h> /* for atomic_long_t */
+#include <linux/swap.h>
 struct mempolicy;
 struct swap_iocb;
 
@@ -51,6 +51,25 @@ enum swap_cluster_flags {
 	CLUSTER_FLAG_FULL,
 	CLUSTER_FLAG_DISCARD,
 	CLUSTER_FLAG_MAX,
+};
+
+/*
+ * We keep using same cluster for rotational device so IO will be sequential.
+ * The purpose is to optimize SWAP throughput on these device.
+ */
+struct swap_sequential_cluster {
+	unsigned int next[SWAP_NR_ORDERS]; /* Likely next allocation offset */
+};
+
+struct swap_ops {
+	void (*read_folio)(struct swap_info_struct *sis,
+			struct folio *folio,
+			struct swap_iocb **plug);
+	void (*write_folio)(struct swap_info_struct *sis,
+			struct folio *folio,
+			struct swap_iocb **plug);
+	void (*slot_free_notify)(struct swap_info_struct *sis,
+			unsigned long offset);
 };
 
 #ifdef CONFIG_SWAP
@@ -213,14 +232,11 @@ extern void swap_entries_free(struct swap_info_struct *si,
 /* linux/mm/swap_io.c */
 int sio_pool_init(void);
 struct swap_iocb;
-struct swap_ops {
-	void (*read_folio)(struct swap_info_struct *sis,
-			struct folio *folio,
-			struct swap_iocb **plug);
-	void (*write_folio)(struct swap_info_struct *sis,
-			struct folio *folio,
-			struct swap_iocb **plug);
-};
+#ifdef CONFIG_ZRAM
+int zram_read_folio_bdev(struct block_device *bdev, struct folio *folio);
+int zram_write_folio_bdev(struct block_device *bdev, struct folio *folio);
+void zram_free_slot_bdev(struct block_device *bdev, unsigned long index);
+#endif
 int init_swap_ops(struct swap_info_struct *sis);
 void swap_read_folio(struct folio *folio, struct swap_iocb **plug);
 void __swap_read_unplug(struct swap_iocb *plug);
