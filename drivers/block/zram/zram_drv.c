@@ -3060,8 +3060,17 @@ static int zram_open(struct gendisk *disk, blk_mode_t mode)
 static const struct block_device_operations zram_devops = {
 	.open       = zram_open,
 	.submit_bio = zram_submit_bio,
-	.swap_ops   = &zram_swap_ops,
 	.owner      = THIS_MODULE,
+};
+
+static bool zram_match(struct block_device *bdev)
+{
+	return bdev->bd_disk->fops == &zram_devops;
+}
+
+static struct swap_backend zram_swap_backend = {
+	.match = zram_match,
+	.ops   = &zram_swap_ops,
 };
 
 static DEVICE_ATTR_RO(io_stat);
@@ -3347,6 +3356,8 @@ static int __init zram_init(void)
 
 	BUILD_BUG_ON(__NR_ZRAM_PAGEFLAGS > sizeof(zram_te.attr.flags) * 8);
 
+	swap_backend_register(&zram_swap_backend);
+
 	ret = cpuhp_setup_state_multi(CPUHP_ZCOMP_PREPARE, "block/zram:prepare",
 				      zcomp_cpu_up_prepare, zcomp_cpu_dead);
 	if (ret < 0)
@@ -3386,6 +3397,7 @@ out_error:
 
 static void __exit zram_exit(void)
 {
+	swap_backend_unregister(&zram_swap_backend);
 	destroy_devices();
 }
 

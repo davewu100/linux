@@ -602,16 +602,54 @@ static const struct swap_ops bdev_async_swap_ops = {
 	.read_folio = swap_read_folio_bdev_async,
 	.write_folio = swap_write_folio_bdev_async,
 };
+
+static LIST_HEAD(swap_backends);
+static DEFINE_MUTEX(swap_backends_lock);
+
+void swap_backend_register(struct swap_backend *backend)
+{
+	mutex_lock(&swap_backends_lock);
+	list_add(&backend->list, &swap_backends);
+	mutex_unlock(&swap_backends_lock);
+}
+EXPORT_SYMBOL_GPL(swap_backend_register);
+
+void swap_backend_unregister(struct swap_backend *backend)
+{
+	mutex_lock(&swap_backends_lock);
+	list_del(&backend->list);
+	mutex_unlock(&swap_backends_lock);
+}
+EXPORT_SYMBOL_GPL(swap_backend_unregister);
+
+static const struct swap_ops *swap_find_backend_ops(struct block_device *bdev)
+{
+	struct swap_backend *b;
+	const struct swap_ops *ops = NULL;
+
+	mutex_lock(&swap_backends_lock);
+	list_for_each_entry(b, &swap_backends, list) {
+		if (b->match(bdev)) {
+			ops = b->ops;
+			break;
+		}
+	}
+	mutex_unlock(&swap_backends_lock);
+	return ops;
+}
+
 int init_swap_ops(struct swap_info_struct *sis)
 {
+	const struct swap_ops *ops;
+
 	/*
 	 * ->flags can be updated non-atomically, but that will
 	 * never affect SWP_FS_OPS, so the data_race is safe.
 	 */
 	if (data_race(sis->flags & SWP_FS_OPS))
 		sis->ops = &bdev_fs_swap_ops;
-	else if (sis->bdev->bd_disk->fops->swap_ops)
-		sis->ops = sis->bdev->bd_disk->fops->swap_ops;
+	else if ((ops = swap_find_backend_ops(sis->bdev)) != NULL)
+		sis->ops = ops;
 	/*
 	 * ->flags can be updated non-atomically, but that will
 	 * never affect SWP_SYNCHRONOUS_IO, so the data_race is safe.
