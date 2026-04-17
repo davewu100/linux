@@ -606,9 +606,20 @@ static const struct swap_ops bdev_fs_swap_ops = {
 	.write_folio = swap_write_folio_fs,
 };
 
+static void bdev_slot_free_notify(struct swap_info_struct *sis,
+				  unsigned long offset)
+{
+	void (*notify)(struct block_device *, unsigned long);
+
+	notify = sis->bdev->bd_disk->fops->swap_slot_free_notify;
+	if (notify)
+		notify(sis->bdev, offset);
+}
+
 static const struct swap_ops bdev_sync_swap_ops = {
 	.read_folio = swap_read_folio_bdev_sync,
 	.write_folio = swap_write_folio_bdev_sync,
+	.slot_free_notify = bdev_slot_free_notify,
 };
 
 static const struct swap_ops bdev_async_swap_ops = {
