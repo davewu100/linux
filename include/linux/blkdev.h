@@ -1645,6 +1645,8 @@ enum blk_unique_id {
 	BLK_UID_NAA	= 3,
 };
 
+struct swap_ops;
+
 struct block_device_operations {
 	void (*submit_bio)(struct bio *bio);
 	int (*poll_bio)(struct bio *bio, struct io_comp_batch *iob,
@@ -1663,6 +1665,8 @@ struct block_device_operations {
 	void (*free_disk)(struct gendisk *disk);
 	/* this callback is with swap_lock and sometimes page table lock held */
 	void (*swap_slot_free_notify) (struct block_device *, unsigned long);
+	/* custom swap dispatch table; NULL = use generic bdev path */
+	const struct swap_ops *swap_ops;
 	int (*report_zones)(struct gendisk *, sector_t sector,
 			    unsigned int nr_zones,
 			    struct blk_report_zones_args *args);

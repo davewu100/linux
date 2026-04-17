@@ -28,7 +28,19 @@ struct bio;
 struct pagevec;
 struct swap_cluster_info;
 struct swap_sequential_cluster;
-struct swap_ops;
+struct swap_info_struct;
+struct swap_iocb;
+
+struct swap_ops {
+	void (*read_folio)(struct swap_info_struct *sis,
+			struct folio *folio,
+			struct swap_iocb **plug);
+	void (*write_folio)(struct swap_info_struct *sis,
+			struct folio *folio,
+			struct swap_iocb **plug);
+	void (*slot_free_notify)(struct swap_info_struct *sis,
+			unsigned long offset);
+};
 
 #define SWAP_FLAG_PREFER	0x8000	/* set if swap priority specified */
 #define SWAP_FLAG_PRIO_MASK	0x7fff

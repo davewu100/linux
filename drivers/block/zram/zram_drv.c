@@ -33,6 +33,7 @@
 #include <linux/cpuhotplug.h>
 #include <linux/part_stat.h>
 #include <linux/kernel_read_file.h>
+#include <linux/swap.h>
 #include <linux/swapops.h>
 
 #include "zram_drv.h"
@@ -2331,7 +2332,7 @@ static int zram_bvec_write(struct zram *zram, struct bio_vec *bvec,
 	return zram_write_page(zram, bvec->bv_page, index);
 }
 
-int zram_read_folio_bdev(struct block_device *bdev, struct folio *folio)
+static int zram_read_folio_bdev(struct block_device *bdev, struct folio *folio)
 {
 	struct zram *zram = bdev->bd_disk->private_data;
 	unsigned long index = swp_offset(folio->swap);
@@ -2347,9 +2348,8 @@ int zram_read_folio_bdev(struct block_device *bdev, struct folio *folio)
 
 	return 0;
 }
-EXPORT_SYMBOL_GPL(zram_read_folio_bdev);
 
-int zram_write_folio_bdev(struct block_device *bdev, struct folio *folio)
+static int zram_write_folio_bdev(struct block_device *bdev, struct folio *folio)
 {
 	struct zram *zram = bdev->bd_disk->private_data;
 	unsigned long index = swp_offset(folio->swap);
@@ -2364,7 +2364,6 @@ int zram_write_folio_bdev(struct block_device *bdev, struct folio *folio)
 
 	return 0;
 }
-EXPORT_SYMBOL_GPL(zram_write_folio_bdev);
 
 #ifdef CONFIG_ZRAM_MULTI_COMP
 #define RECOMPRESS_IDLE		(1 << 0)
@@ -2836,7 +2835,7 @@ static void zram_submit_bio(struct bio *bio)
 	}
 }
 
-void zram_free_slot_bdev(struct block_device *bdev, unsigned long index)
+static void zram_free_slot_bdev(struct block_device *bdev, unsigned long index)
 {
 	struct zram *zram;
 
@@ -2851,7 +2850,58 @@ void zram_free_slot_bdev(struct block_device *bdev, unsigned long index)
 	slot_free(zram, index);
 	slot_unlock(zram, index);
 }
-EXPORT_SYMBOL_GPL(zram_free_slot_bdev);
+
+static void zram_swap_read(struct swap_info_struct *sis,
+			   struct folio *folio, struct swap_iocb **plug)
+{
+	int ret;
+	(void)plug;
+
+	count_mthp_stat(folio_order(folio), MTHP_STAT_SWPIN);
+	count_memcg_folio_events(folio, PSWPIN, folio_nr_pages(folio));
+	count_vm_events(PSWPIN, folio_nr_pages(folio));
+
+	ret = zram_read_folio_bdev(sis->bdev, folio);
+	if (ret) {
+		pr_alert_ratelimited("Read-error on zram swap-device\n");
+		folio_unlock(folio);
+		return;
+	}
+
+	folio_mark_uptodate(folio);
+	folio_unlock(folio);
+}
+
+static void zram_swap_write(struct swap_info_struct *sis,
+			    struct folio *folio, struct swap_iocb **plug)
+{
+	int ret;
+	(void)plug;
+
+	count_swpout_vm_event(folio);
+	folio_start_writeback(folio);
+	folio_unlock(folio);
+
+	ret = zram_write_folio_bdev(sis->bdev, folio);
+	if (ret) {
+		folio_mark_dirty(folio);
+		pr_alert_ratelimited("Write-error on zram swap-device\n");
+		folio_clear_reclaim(folio);
+	}
+	folio_end_writeback(folio);
+}
+
+static void zram_swap_slot_free(struct swap_info_struct *sis,
+				unsigned long offset)
+{
+	zram_free_slot_bdev(sis->bdev, offset);
+}
+
+static const struct swap_ops zram_swap_ops = {
+	.read_folio       = zram_swap_read,
+	.write_folio      = zram_swap_write,
+	.slot_free_notify = zram_swap_slot_free,
+};
 
 static void zram_comp_params_reset(struct zram *zram)
 {
@@ -3008,10 +3058,10 @@ static int zram_open(struct gendisk *disk, blk_mode_t mode)
 }
 
 static const struct block_device_operations zram_devops = {
-	.open = zram_open,
+	.open       = zram_open,
 	.submit_bio = zram_submit_bio,
-	.swap_slot_free_notify = zram_free_slot_bdev,
-	.owner = THIS_MODULE
+	.swap_ops   = &zram_swap_ops,
+	.owner      = THIS_MODULE,
 };
 
 static DEVICE_ATTR_RO(io_stat);

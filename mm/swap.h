@@ -61,17 +61,6 @@ struct swap_sequential_cluster {
 	unsigned int next[SWAP_NR_ORDERS]; /* Likely next allocation offset */
 };
 
-struct swap_ops {
-	void (*read_folio)(struct swap_info_struct *sis,
-			struct folio *folio,
-			struct swap_iocb **plug);
-	void (*write_folio)(struct swap_info_struct *sis,
-			struct folio *folio,
-			struct swap_iocb **plug);
-	void (*slot_free_notify)(struct swap_info_struct *sis,
-			unsigned long offset);
-};
-
 #ifdef CONFIG_SWAP
 #include <linux/swapops.h> /* for swp_offset */
 #include <linux/blk_types.h> /* for bio_end_io_t */
@@ -232,11 +221,6 @@ extern void swap_entries_free(struct swap_info_struct *si,
 /* linux/mm/swap_io.c */
 int sio_pool_init(void);
 struct swap_iocb;
-#ifdef CONFIG_ZRAM
-int zram_read_folio_bdev(struct block_device *bdev, struct folio *folio);
-int zram_write_folio_bdev(struct block_device *bdev, struct folio *folio);
-void zram_free_slot_bdev(struct block_device *bdev, unsigned long index);
-#endif
 int init_swap_ops(struct swap_info_struct *sis);
 void swap_read_folio(struct folio *folio, struct swap_iocb **plug);
 void __swap_read_unplug(struct swap_iocb *plug);
