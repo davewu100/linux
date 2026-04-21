@@ -3129,14 +3129,13 @@ static const struct block_device_operations zram_devops = {
 	.owner      = THIS_MODULE,
 };
 
-const struct swap_ops *zram_get_swap_ops(struct block_device *bdev)
+static const struct swap_ops *zram_get_swap_ops(struct block_device *bdev)
 {
 	if (!bdev || bdev->bd_disk->fops != &zram_devops)
 		return NULL;
 
 	return &zram_swap_ops;
 }
-EXPORT_SYMBOL_GPL(zram_get_swap_ops);
 
 static DEVICE_ATTR_RO(io_stat);
 static DEVICE_ATTR_RO(mm_stat);
