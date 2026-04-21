@@ -2831,11 +2831,54 @@ static void zram_submit_bio(struct bio *bio)
 	}
 }
 
+struct zram_swap_read_ctx {
+	struct folio *folio;
+};
+
+static void zram_swap_read_endio(struct bio *bio)
+{
+	struct zram_swap_read_ctx *ctx = bio->bi_private;
+	struct folio *folio = ctx->folio;
+
+	if (bio->bi_status)
+		pr_alert_ratelimited("Read-error on zram swap-device\n");
+	else
+		folio_mark_uptodate(folio);
+
+	folio_unlock(folio);
+	bio_put(bio);
+	kfree(ctx);
+}
+
+static struct bio *zram_alloc_swap_read_parent(struct swap_info_struct *sis,
+					       struct folio *folio)
+{
+	struct zram_swap_read_ctx *ctx;
+	struct bio *bio;
+
+	ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
+	if (!ctx)
+		return NULL;
+
+	bio = bio_alloc(sis->bdev, 0, REQ_OP_READ, GFP_KERNEL);
+	if (!bio) {
+		kfree(ctx);
+		return NULL;
+	}
+
+	ctx->folio = folio;
+	bio->bi_private = ctx;
+	bio->bi_end_io = zram_swap_read_endio;
+	return bio;
+}
+
 static void zram_swap_read(struct swap_info_struct *sis,
 			   struct folio *folio, struct swap_iocb **plug)
 {
 	struct zram *zram = sis->bdev->bd_disk->private_data;
 	unsigned long index = swp_offset(folio->swap);
+	struct bio *parent;
+	int i;
 	int ret;
 
 	(void)plug;
@@ -2843,15 +2886,37 @@ static void zram_swap_read(struct swap_info_struct *sis,
 	count_memcg_folio_events(folio, PSWPIN, folio_nr_pages(folio));
 	count_vm_events(PSWPIN, folio_nr_pages(folio));
 
-	ret = zram_read_swap_folio(zram, folio, index);
-	if (ret) {
-		pr_alert_ratelimited("Read-error on zram swap-device\n");
+	parent = zram_alloc_swap_read_parent(sis, folio);
+	if (!parent) {
+		ret = zram_read_swap_folio(zram, folio, index);
+		if (ret) {
+			pr_alert_ratelimited("Read-error on zram swap-device\n");
+			folio_unlock(folio);
+			return;
+		}
+
+		folio_mark_uptodate(folio);
 		folio_unlock(folio);
 		return;
 	}
 
-	folio_mark_uptodate(folio);
-	folio_unlock(folio);
+	for (i = 0; i < folio_nr_pages(folio); i++) {
+		ret = zram_read_page(zram, folio_page(folio, i), index + i, parent);
+		if (ret) {
+			parent->bi_status = BLK_STS_IOERR;
+			break;
+		}
+
+		slot_lock(zram, index + i);
+		mark_slot_accessed(zram, index + i);
+		slot_unlock(zram, index + i);
+	}
+
+	/*
+	 * Drop the parent's initial reference. If async children were queued,
+	 * their endio path will complete the remaining references.
+	 */
+	bio_endio(parent);
 }
 
 static void zram_swap_write(struct swap_info_struct *sis,
