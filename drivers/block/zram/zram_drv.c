@@ -1376,6 +1376,13 @@ static int decompress_bdev_page(struct zram *zram, struct page *page, u32 index)
 	return ret;
 }
 
+static void zram_complete_async_read(struct zram_rb_req *req)
+{
+	bio_endio(req->parent);
+	bio_put(req->bio);
+	kfree(req);
+}
+
 static void zram_deferred_decompress(struct work_struct *w)
 {
 	struct zram_rb_req *req = container_of(w, struct zram_rb_req, work);
@@ -1387,11 +1394,7 @@ static void zram_deferred_decompress(struct work_struct *w)
 	ret = decompress_bdev_page(zram, page, index);
 	if (ret)
 		req->parent->bi_status = BLK_STS_IOERR;
-
-	/* Decrement parent's ->remaining */
-	bio_endio(req->parent);
-	bio_put(req->bio);
-	kfree(req);
+	zram_complete_async_read(req);
 }
 
 static void zram_async_read_endio(struct bio *bio)
@@ -1401,9 +1404,7 @@ static void zram_async_read_endio(struct bio *bio)
 
 	if (bio->bi_status) {
 		req->parent->bi_status = bio->bi_status;
-		bio_endio(req->parent);
-		bio_put(bio);
-		kfree(req);
+		zram_complete_async_read(req);
 		return;
 	}
 
@@ -1417,9 +1418,7 @@ static void zram_async_read_endio(struct bio *bio)
 	 */
 	if (zram->compressed_wb == false) {
 		/* No decompression needed, complete the parent IO */
-		bio_endio(req->parent);
-		bio_put(bio);
-		kfree(req);
+		zram_complete_async_read(req);
 		return;
 	}
 
