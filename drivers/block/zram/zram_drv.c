@@ -33,6 +33,7 @@
 #include <linux/cpuhotplug.h>
 #include <linux/part_stat.h>
 #include <linux/kernel_read_file.h>
+#include <linux/swap.h>
 
 #include "zram_drv.h"
 
@@ -2817,6 +2818,17 @@ static void zram_slot_free_notify(struct block_device *bdev,
 	slot_unlock(zram, index);
 }
 
+static bool zram_swap_slot_free_match(struct block_device *bdev)
+{
+	return bdev->bd_disk->fops == &zram_devops;
+}
+
+static struct swap_slot_free_notifier zram_swap_slot_free_notifier = {
+	.list = LIST_HEAD_INIT(zram_swap_slot_free_notifier.list),
+	.match = zram_swap_slot_free_match,
+	.notify = zram_slot_free_notify,
+};
+
 static void zram_comp_params_reset(struct zram *zram)
 {
 	u32 prio;
@@ -2974,7 +2986,6 @@ static int zram_open(struct gendisk *disk, blk_mode_t mode)
 static const struct block_device_operations zram_devops = {
 	.open = zram_open,
 	.submit_bio = zram_submit_bio,
-	.swap_slot_free_notify = zram_slot_free_notify,
 	.owner = THIS_MODULE
 };
 
@@ -3291,6 +3302,7 @@ static int __init zram_init(void)
 		num_devices--;
 	}
 
+	swap_slot_free_notifier_register(&zram_swap_slot_free_notifier);
 	return 0;
 
 out_error:
@@ -3300,6 +3312,7 @@ out_error:
 
 static void __exit zram_exit(void)
 {
+	swap_slot_free_notifier_unregister(&zram_swap_slot_free_notifier);
 	destroy_devices();
 }
 
