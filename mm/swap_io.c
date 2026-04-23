@@ -603,14 +603,45 @@ static const struct swap_ops bdev_async_swap_ops = {
 	.write_folio = swap_write_folio_bdev_async,
 };
 
+static LIST_HEAD(swap_slot_free_notifiers);
+static DEFINE_MUTEX(swap_slot_free_notifiers_lock);
+
+void swap_slot_free_notifier_register(struct swap_slot_free_notifier *notifier)
+{
+	mutex_lock(&swap_slot_free_notifiers_lock);
+	WARN_ON(!list_empty(&notifier->list));
+	list_add(&notifier->list, &swap_slot_free_notifiers);
+	mutex_unlock(&swap_slot_free_notifiers_lock);
+}
+EXPORT_SYMBOL_GPL(swap_slot_free_notifier_register);
+
+void swap_slot_free_notifier_unregister(struct swap_slot_free_notifier *notifier)
+{
+	mutex_lock(&swap_slot_free_notifiers_lock);
+	list_del_init(&notifier->list);
+	mutex_unlock(&swap_slot_free_notifiers_lock);
+}
+EXPORT_SYMBOL_GPL(swap_slot_free_notifier_unregister);
+
 void swap_slot_free_notify(struct swap_info_struct *sis, unsigned long offset)
 {
-	void (*notify)(struct block_device *bdev, unsigned long offset);
+	struct swap_slot_free_notifier *notifier;
+	void (*notify)(struct block_device *bdev, unsigned long offset) = NULL;
 
 	if (!(sis->flags & SWP_BLKDEV))
 		return;
+	if (!sis->bdev)
+		return;
 
-	notify = sis->bdev->bd_disk->fops->swap_slot_free_notify;
+	mutex_lock(&swap_slot_free_notifiers_lock);
+	list_for_each_entry(notifier, &swap_slot_free_notifiers, list) {
+		if (notifier->match(sis->bdev)) {
+			notify = notifier->notify;
+			break;
+		}
+	}
+	mutex_unlock(&swap_slot_free_notifiers_lock);
+
 	if (notify)
 		notify(sis->bdev, offset);
 }

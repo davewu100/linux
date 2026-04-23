@@ -19,8 +19,15 @@
 struct notifier_block;
 
 struct bio;
+struct block_device;
 
 struct pagevec;
+
+struct swap_slot_free_notifier {
+	struct list_head list;
+	bool (*match)(struct block_device *bdev);
+	void (*notify)(struct block_device *bdev, unsigned long offset);
+};
 
 #define SWAP_FLAG_PREFER	0x8000	/* set if swap priority specified */
 #define SWAP_FLAG_PRIO_MASK	0x7fff
@@ -427,6 +434,8 @@ int add_swap_extent(struct swap_info_struct *sis, unsigned long start_page,
 		unsigned long nr_pages, sector_t start_block);
 int generic_swapfile_activate(struct swap_info_struct *, struct file *,
 		sector_t *);
+void swap_slot_free_notifier_register(struct swap_slot_free_notifier *notifier);
+void swap_slot_free_notifier_unregister(struct swap_slot_free_notifier *notifier);
 
 static inline unsigned long total_swapcache_pages(void)
 {
@@ -558,6 +567,14 @@ static inline int add_swap_extent(struct swap_info_struct *sis,
 				  unsigned long nr_pages, sector_t start_block)
 {
 	return -EINVAL;
+}
+
+static inline void swap_slot_free_notifier_register(struct swap_slot_free_notifier *notifier)
+{
+}
+
+static inline void swap_slot_free_notifier_unregister(struct swap_slot_free_notifier *notifier)
+{
 }
 #endif /* CONFIG_SWAP */
 #ifdef CONFIG_MEMCG
