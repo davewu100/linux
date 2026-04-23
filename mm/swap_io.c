@@ -608,30 +608,30 @@ static const struct swap_ops bdev_async_swap_ops = {
 };
 
 static DEFINE_MUTEX(slot_free_notify_lock);
-static swap_slot_free_notify_fn slot_free_notify_fn;
+static swap_slot_free_notify_lookup_t slot_free_notify_lookup;
 
-int swap_register_slot_free_notify(swap_slot_free_notify_fn fn)
+int swap_register_slot_free_notify(swap_slot_free_notify_lookup_t lookup)
 {
 	int ret = 0;
 
-	if (!fn)
+	if (!lookup)
 		return -EINVAL;
 
 	mutex_lock(&slot_free_notify_lock);
-	if (slot_free_notify_fn && slot_free_notify_fn != fn)
+	if (slot_free_notify_lookup && slot_free_notify_lookup != lookup)
 		ret = -EBUSY;
 	else
-		slot_free_notify_fn = fn;
+		slot_free_notify_lookup = lookup;
 	mutex_unlock(&slot_free_notify_lock);
 	return ret;
 }
 EXPORT_SYMBOL_GPL(swap_register_slot_free_notify);
 
-void swap_unregister_slot_free_notify(swap_slot_free_notify_fn fn)
+void swap_unregister_slot_free_notify(swap_slot_free_notify_lookup_t lookup)
 {
 	mutex_lock(&slot_free_notify_lock);
-	if (slot_free_notify_fn == fn)
-		slot_free_notify_fn = NULL;
+	if (slot_free_notify_lookup == lookup)
+		slot_free_notify_lookup = NULL;
 	mutex_unlock(&slot_free_notify_lock);
 }
 EXPORT_SYMBOL_GPL(swap_unregister_slot_free_notify);
@@ -641,7 +641,7 @@ static void swap_slot_free_notify(struct swap_info_struct *sis,
 {
 	swap_slot_free_notify_fn fn;
 
-	fn = READ_ONCE(slot_free_notify_fn);
+	fn = READ_ONCE(sis->slot_free_notify_fn);
 	if (!fn)
 		return;
 
@@ -650,6 +650,8 @@ static void swap_slot_free_notify(struct swap_info_struct *sis,
 
 int init_swap_ops(struct swap_info_struct *sis)
 {
+	swap_slot_free_notify_lookup_t lookup;
+
 	/*
 	 * ->flags can be updated non-atomically, but that will
 	 * never affect SWP_FS_OPS, so the data_race is safe.
@@ -667,6 +669,13 @@ int init_swap_ops(struct swap_info_struct *sis)
 
 	if (!sis->ops || !sis->ops->read_folio || !sis->ops->write_folio)
 		return -EINVAL;
+
+	/*
+	 * Resolve slot-free callback once at swapon time to keep the hot
+	 * free-slot path free of per-entry backend lookups.
+	 */
+	lookup = READ_ONCE(slot_free_notify_lookup);
+	WRITE_ONCE(sis->slot_free_notify_fn, lookup ? lookup(sis->bdev) : NULL);
 
 	return 0;
 }

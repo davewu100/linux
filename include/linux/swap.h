@@ -26,8 +26,9 @@ struct swap_info_struct;
 struct swap_ops;
 typedef void (*swap_slot_free_notify_fn)(struct swap_info_struct *sis,
 					 unsigned long offset);
-int swap_register_slot_free_notify(swap_slot_free_notify_fn fn);
-void swap_unregister_slot_free_notify(swap_slot_free_notify_fn fn);
+typedef swap_slot_free_notify_fn (*swap_slot_free_notify_lookup_t)(struct block_device *bdev);
+int swap_register_slot_free_notify(swap_slot_free_notify_lookup_t lookup);
+void swap_unregister_slot_free_notify(swap_slot_free_notify_lookup_t lookup);
 
 #define SWAP_FLAG_PREFER	0x8000	/* set if swap priority specified */
 #define SWAP_FLAG_PRIO_MASK	0x7fff
@@ -307,6 +308,7 @@ struct swap_info_struct {
 	struct work_struct reclaim_work; /* reclaim worker */
 	struct list_head discard_clusters; /* discard clusters list */
 	struct plist_node avail_list;   /* entry in swap_avail_head */
+	swap_slot_free_notify_fn slot_free_notify_fn;
 	const struct swap_ops *ops;
 };
 

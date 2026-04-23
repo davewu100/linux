@@ -2816,9 +2816,13 @@ static void zram_slot_free_notify(struct swap_info_struct *sis,
 	slot_unlock(zram, index);
 }
 
-static const struct swap_ops zram_swap_ops = {
-	.slot_free_notify = zram_slot_free_notify,
-};
+static swap_slot_free_notify_fn zram_slot_free_notify_lookup(struct block_device *bdev)
+{
+	if (!bdev || bdev->bd_disk->fops != &zram_devops)
+		return NULL;
+
+	return zram_slot_free_notify;
+}
 
 static void zram_comp_params_reset(struct zram *zram)
 {
@@ -3293,7 +3297,7 @@ static int __init zram_init(void)
 		num_devices--;
 	}
 
-	ret = swap_register_slot_free_notify(zram_swap_ops.slot_free_notify);
+	ret = swap_register_slot_free_notify(zram_slot_free_notify_lookup);
 	if (ret)
 		goto out_error;
 
@@ -3306,7 +3310,7 @@ out_error:
 
 static void __exit zram_exit(void)
 {
-	swap_unregister_slot_free_notify(zram_swap_ops.slot_free_notify);
+	swap_unregister_slot_free_notify(zram_slot_free_notify_lookup);
 	destroy_devices();
 }
 
