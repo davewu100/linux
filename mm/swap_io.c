@@ -623,31 +623,41 @@ void swap_slot_free_notifier_unregister(struct swap_slot_free_notifier *notifier
 }
 EXPORT_SYMBOL_GPL(swap_slot_free_notifier_unregister);
 
-void swap_slot_free_notify(struct swap_info_struct *sis, unsigned long offset)
+static swap_slot_free_notify_fn swap_slot_free_notify_resolve(struct block_device *bdev)
 {
 	struct swap_slot_free_notifier *notifier;
-	void (*notify)(struct block_device *bdev, unsigned long offset) = NULL;
+	swap_slot_free_notify_fn notify = NULL;
 
-	if (!(sis->flags & SWP_BLKDEV))
-		return;
-	if (!sis->bdev)
-		return;
+	if (!bdev)
+		return NULL;
 
 	mutex_lock(&swap_slot_free_notifiers_lock);
 	list_for_each_entry(notifier, &swap_slot_free_notifiers, list) {
-		if (notifier->match(sis->bdev)) {
+		if (notifier->match(bdev)) {
 			notify = notifier->notify;
 			break;
 		}
 	}
 	mutex_unlock(&swap_slot_free_notifiers_lock);
+	return notify;
+}
 
+void swap_slot_free_notify(struct swap_info_struct *sis, unsigned long offset)
+{
+	swap_slot_free_notify_fn notify;
+
+	if (!(sis->flags & SWP_BLKDEV))
+		return;
+
+	notify = READ_ONCE(sis->slot_free_notify);
 	if (notify)
 		notify(sis->bdev, offset);
 }
 
 int init_swap_ops(struct swap_info_struct *sis)
 {
+	WRITE_ONCE(sis->slot_free_notify, NULL);
+
 	/*
 	 * ->flags can be updated non-atomically, but that will
 	 * never affect SWP_FS_OPS, so the data_race is safe.
@@ -665,6 +675,10 @@ int init_swap_ops(struct swap_info_struct *sis)
 
 	if (!sis->ops || !sis->ops->read_folio || !sis->ops->write_folio)
 		return -EINVAL;
+
+	if (sis->flags & SWP_BLKDEV)
+		WRITE_ONCE(sis->slot_free_notify,
+			   swap_slot_free_notify_resolve(sis->bdev));
 
 	return 0;
 }

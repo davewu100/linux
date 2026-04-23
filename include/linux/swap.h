@@ -22,11 +22,13 @@ struct bio;
 struct block_device;
 
 struct pagevec;
+typedef void (*swap_slot_free_notify_fn)(struct block_device *bdev,
+					 unsigned long offset);
 
 struct swap_slot_free_notifier {
 	struct list_head list;
 	bool (*match)(struct block_device *bdev);
-	void (*notify)(struct block_device *bdev, unsigned long offset);
+	swap_slot_free_notify_fn notify;
 };
 
 #define SWAP_FLAG_PREFER	0x8000	/* set if swap priority specified */
@@ -308,6 +310,7 @@ struct swap_info_struct {
 	struct work_struct reclaim_work; /* reclaim worker */
 	struct list_head discard_clusters; /* discard clusters list */
 	struct plist_node avail_list;   /* entry in swap_avail_head */
+	swap_slot_free_notify_fn slot_free_notify;
 	const struct swap_ops *ops;
 };
 
