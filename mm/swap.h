@@ -222,6 +222,7 @@ struct swap_ops {
 			struct swap_iocb **plug);
 };
 int init_swap_ops(struct swap_info_struct *sis);
+void swap_slot_free_notify(struct swap_info_struct *sis, unsigned long offset);
 void swap_read_folio(struct folio *folio, struct swap_iocb **plug);
 void __swap_read_unplug(struct swap_iocb *plug);
 static inline void swap_read_unplug(struct swap_iocb *plug)
