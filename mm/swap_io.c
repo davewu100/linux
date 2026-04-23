@@ -652,6 +652,8 @@ int init_swap_ops(struct swap_info_struct *sis)
 {
 	swap_slot_free_notify_lookup_t lookup;
 
+	WRITE_ONCE(sis->slot_free_notify_fn, NULL);
+
 	/*
 	 * ->flags can be updated non-atomically, but that will
 	 * never affect SWP_FS_OPS, so the data_race is safe.
@@ -671,11 +673,15 @@ int init_swap_ops(struct swap_info_struct *sis)
 		return -EINVAL;
 
 	/*
-	 * Resolve slot-free callback once at swapon time to keep the hot
-	 * free-slot path free of per-entry backend lookups.
+	 * Resolve slot-free callback once at swapon time so free-slot paths
+	 * avoid repeated backend checks and non-synchronous swap devices keep
+	 * a NULL callback.
 	 */
-	lookup = READ_ONCE(slot_free_notify_lookup);
-	WRITE_ONCE(sis->slot_free_notify_fn, lookup ? lookup(sis->bdev) : NULL);
+	if (sis->ops == &bdev_sync_swap_ops) {
+		lookup = READ_ONCE(slot_free_notify_lookup);
+		WRITE_ONCE(sis->slot_free_notify_fn,
+			   lookup ? lookup(sis->bdev) : NULL);
+	}
 
 	return 0;
 }
