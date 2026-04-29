@@ -440,7 +440,6 @@ prototypes::
 				unsigned long *);
 	void (*unlock_native_capacity) (struct gendisk *);
 	int (*getgeo)(struct gendisk *, struct hd_geometry *);
-	void (*swap_slot_free_notify) (struct block_device *, unsigned long);
 
 locking rules:
 
@@ -454,11 +453,24 @@ compat_ioctl:		no
 direct_access:		no
 unlock_native_capacity:	no
 getgeo:			no
-swap_slot_free_notify:	no	(see below)
 ======================= ===================
 
-swap_slot_free_notify is called with swap_lock and sometimes the page lock
-held.
+Swap slot-free notification for block-device swap is implemented via
+``struct swap_ops`` / ``swap_backend`` (see ``include/linux/swap.h``), not
+``struct block_device_operations``::
+
+	void (*slot_free_notify)(struct swap_info_struct *sis, unsigned long offset);
+
+locking rules:
+
+======================= =====================================
+ops			cluster lock held
+======================= =====================================
+slot_free_notify:	yes (sometimes + folio lock and/or page-table lock)
+======================= =====================================
+
+``slot_free_notify`` is called with ``ci->lock`` held; folio lock and/or
+page-table lock may also be held depending on caller context.
 
 
 file_operations

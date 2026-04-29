@@ -33,6 +33,8 @@
 #include <linux/cpuhotplug.h>
 #include <linux/part_stat.h>
 #include <linux/kernel_read_file.h>
+#include <linux/swap.h>
+#include <linux/swapops.h>
 
 #include "zram_drv.h"
 
@@ -2330,6 +2332,38 @@ static int zram_bvec_write(struct zram *zram, struct bio_vec *bvec,
 	return zram_write_page(zram, bvec->bv_page, index);
 }
 
+static int zram_write_swap_folio(struct zram *zram, struct folio *folio,
+				 unsigned long index)
+{
+	int i;
+
+	/*
+	 * Write each page directly into zspool without bio/sector I/O.
+	 * ZRAM_WB (eviction from zspool to a backing device) is a separate
+	 * zram-internal mechanism driven by zram_writeback_slots(); it
+	 * continues to use bio and is unaffected by this path.
+	 */
+	for (i = 0; i < folio_nr_pages(folio); i++) {
+		int ret;
+
+		ret = zram_write_page(zram, folio_page(folio, i), index + i);
+		if (ret) {
+			/* Roll back compressed objects for pages already written. */
+			while (i--) {
+				slot_lock(zram, index + i);
+				slot_free(zram, index + i);
+				slot_unlock(zram, index + i);
+			}
+			return ret;
+		}
+		slot_lock(zram, index + i);
+		mark_slot_accessed(zram, index + i);
+		slot_unlock(zram, index + i);
+	}
+
+	return 0;
+}
+
 #ifdef CONFIG_ZRAM_MULTI_COMP
 #define RECOMPRESS_IDLE		(1 << 0)
 #define RECOMPRESS_HUGE		(1 << 1)
@@ -2800,12 +2834,31 @@ static void zram_submit_bio(struct bio *bio)
 	}
 }
 
-static void zram_slot_free_notify(struct block_device *bdev,
+static void zram_write_folio(struct swap_info_struct *sis,
+			    struct folio *folio, struct swap_iocb **plug)
+{
+	struct zram *zram = sis->bdev->bd_disk->private_data;
+	unsigned long index = swp_offset(folio->swap);
+	int ret;
+
+	/* zram is synchronous in-memory I/O — no plug batching needed */
+	(void)plug;
+	folio_start_writeback(folio);
+	folio_unlock(folio);
+
+	ret = zram_write_swap_folio(zram, folio, index);
+	if (ret) {
+		folio_mark_dirty(folio);
+		pr_alert_ratelimited("Write-error on zram swap-device\n");
+		folio_clear_reclaim(folio);
+	}
+	folio_end_writeback(folio);
+}
+
+static void zram_slot_free_notify(struct swap_info_struct *sis,
 				unsigned long index)
 {
-	struct zram *zram;
-
-	zram = bdev->bd_disk->private_data;
+	struct zram *zram = sis->bdev->bd_disk->private_data;
 
 	atomic64_inc(&zram->stats.notify_free);
 	if (!slot_trylock(zram, index)) {
@@ -2816,6 +2869,12 @@ static void zram_slot_free_notify(struct block_device *bdev,
 	slot_free(zram, index);
 	slot_unlock(zram, index);
 }
+
+static const struct swap_ops zram_swap_ops = {
+	.read_folio       = swap_read_folio_bdev,
+	.write_folio      = zram_write_folio,
+	.slot_free_notify = zram_slot_free_notify,
+};
 
 static void zram_comp_params_reset(struct zram *zram)
 {
@@ -2972,10 +3031,25 @@ static int zram_open(struct gendisk *disk, blk_mode_t mode)
 }
 
 static const struct block_device_operations zram_devops = {
-	.open = zram_open,
+	.open       = zram_open,
 	.submit_bio = zram_submit_bio,
-	.swap_slot_free_notify = zram_slot_free_notify,
-	.owner = THIS_MODULE
+	.owner      = THIS_MODULE,
+};
+
+static bool zram_match(struct swap_info_struct *sis)
+{
+	struct block_device *bdev = sis->bdev;
+
+	if (!bdev)
+		return false;
+
+	return bdev->bd_disk->fops == &zram_devops;
+}
+
+static struct swap_backend zram_swap_backend = {
+	.list  = LIST_HEAD_INIT(zram_swap_backend.list),
+	.match = zram_match,
+	.ops   = &zram_swap_ops,
 };
 
 static DEVICE_ATTR_RO(io_stat);
@@ -3282,6 +3356,7 @@ static int __init zram_init(void)
 		return -EBUSY;
 	}
 
+	swap_backend_register(&zram_swap_backend);
 	while (num_devices != 0) {
 		mutex_lock(&zram_index_mutex);
 		ret = zram_add();
@@ -3294,12 +3369,14 @@ static int __init zram_init(void)
 	return 0;
 
 out_error:
+	swap_backend_unregister(&zram_swap_backend);
 	destroy_devices();
 	return ret;
 }
 
 static void __exit zram_exit(void)
 {
+	swap_backend_unregister(&zram_swap_backend);
 	destroy_devices();
 }
 

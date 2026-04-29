@@ -280,25 +280,13 @@ int swap_writeout(struct folio *folio, struct swap_iocb **swap_plug)
 		return AOP_WRITEPAGE_ACTIVATE;
 	}
 
-	sis->ops->write_folio(sis, folio, swap_plug);
+	swap_write_folio(sis, folio, swap_plug);
 	return 0;
 out_unlock:
 	folio_unlock(folio);
 	return ret;
 }
 
-static inline void count_swpout_vm_event(struct folio *folio)
-{
-#ifdef CONFIG_TRANSPARENT_HUGEPAGE
-	if (unlikely(folio_test_pmd_mappable(folio))) {
-		count_memcg_folio_events(folio, THP_SWPOUT, 1);
-		count_vm_event(THP_SWPOUT);
-	}
-#endif
-	count_mthp_stat(folio_order(folio), MTHP_STAT_SWPOUT);
-	count_memcg_folio_events(folio, PSWPOUT, folio_nr_pages(folio));
-	count_vm_events(PSWPOUT, folio_nr_pages(folio));
-}
 
 #if defined(CONFIG_MEMCG) && defined(CONFIG_BLK_CGROUP)
 static void bio_associate_blkg_from_page(struct bio *bio, struct folio *folio)
@@ -378,7 +366,6 @@ static void swap_write_folio_fs(struct swap_info_struct *sis,
 	struct file *swap_file = sis->swap_file;
 	loff_t pos = swap_dev_pos(folio->swap);
 
-	count_swpout_vm_event(folio);
 	folio_start_writeback(folio);
 	folio_unlock(folio);
 	if (sio) {
@@ -419,7 +406,6 @@ static void swap_write_folio_bdev_sync(struct swap_info_struct *sis,
 	bio_add_folio_nofail(&bio, folio, folio_size(folio), 0);
 
 	bio_associate_blkg_from_page(&bio, folio);
-	count_swpout_vm_event(folio);
 
 	folio_start_writeback(folio);
 	folio_unlock(folio);
@@ -440,10 +426,17 @@ static void swap_write_folio_bdev_async(struct swap_info_struct *sis,
 	bio_add_folio_nofail(bio, folio, folio_size(folio), 0);
 
 	bio_associate_blkg_from_page(bio, folio);
-	count_swpout_vm_event(folio);
 	folio_start_writeback(folio);
 	folio_unlock(folio);
 	submit_bio(bio);
+}
+
+void swap_write_folio(struct swap_info_struct *sis, struct folio *folio,
+		      struct swap_iocb **plug)
+{
+	VM_BUG_ON_FOLIO(!folio_test_swapcache(folio), folio);
+	count_swpout_vm_event(folio);
+	sis->ops->write_folio(sis, folio, plug);
 }
 
 void swap_write_unplug(struct swap_iocb *sio)
@@ -588,6 +581,21 @@ static void swap_read_folio_bdev_async(struct swap_info_struct *sis,
 	submit_bio(bio);
 }
 
+void swap_read_folio_bdev(struct swap_info_struct *sis, struct folio *folio,
+			  struct swap_iocb **plug)
+{
+	/*
+	 * ->flags can be updated non-atomically (scan_swap_map_slots),
+	 * but that will never affect SWP_SYNCHRONOUS_IO, so the
+	 * data_race is safe.
+	 */
+	if (data_race(sis->flags & SWP_SYNCHRONOUS_IO))
+		swap_read_folio_bdev_sync(sis, folio, plug);
+	else
+		swap_read_folio_bdev_async(sis, folio, plug);
+}
+EXPORT_SYMBOL_GPL(swap_read_folio_bdev);
+
 static const struct swap_ops bdev_fs_swap_ops = {
 	.read_folio = swap_read_folio_fs,
 	.write_folio = swap_write_folio_fs,
@@ -603,27 +611,86 @@ static const struct swap_ops bdev_async_swap_ops = {
 	.write_folio = swap_write_folio_bdev_async,
 };
 
-int init_swap_ops(struct swap_info_struct *sis)
+static LIST_HEAD(swap_backends);
+static DEFINE_MUTEX(swap_backends_lock);
+
+void swap_backend_register(struct swap_backend *backend)
 {
+	if (WARN_ON(!backend->match || !backend->ops))
+		return;
+	if (WARN_ON(!backend->ops->read_folio || !backend->ops->write_folio))
+		return;
+	mutex_lock(&swap_backends_lock);
+	if (WARN_ON(!list_empty(&backend->list))) {
+		mutex_unlock(&swap_backends_lock);
+		return;
+	}
+	list_add(&backend->list, &swap_backends);
+	mutex_unlock(&swap_backends_lock);
+}
+EXPORT_SYMBOL_GPL(swap_backend_register);
+
+/*
+ * Removes the backend from the matching list for future swapon calls.
+ * The caller must ensure that no swap_info_struct still has sis->ops
+ * pointing into this backend's swap_ops before the module is unloaded.
+ * In practice this is guaranteed because an active swap device holds an
+ * open reference on the block device, preventing module removal.
+ */
+void swap_backend_unregister(struct swap_backend *backend)
+{
+	mutex_lock(&swap_backends_lock);
+	list_del_init(&backend->list);
+	mutex_unlock(&swap_backends_lock);
+}
+EXPORT_SYMBOL_GPL(swap_backend_unregister);
+
+static const struct swap_ops *swap_find_backend_ops(struct swap_info_struct *sis)
+{
+	struct swap_backend *b;
+	const struct swap_ops *backend_ops = NULL;
+
+	if (!sis)
+		return NULL;
+
+	mutex_lock(&swap_backends_lock);
+	list_for_each_entry(b, &swap_backends, list) {
+		if (b->match(sis)) {
+			backend_ops = b->ops;
+			break;
+		}
+	}
+	mutex_unlock(&swap_backends_lock);
+	return backend_ops;
+}
+
+void init_swap_ops(struct swap_info_struct *sis)
+{
+	const struct swap_ops *ops;
+
 	/*
 	 * ->flags can be updated non-atomically, but that will
 	 * never affect SWP_FS_OPS, so the data_race is safe.
 	 */
-	if (data_race(sis->flags & SWP_FS_OPS))
+	if (data_race(sis->flags & SWP_FS_OPS)) {
 		sis->ops = &bdev_fs_swap_ops;
+		return;
+	}
+
+	ops = swap_find_backend_ops(sis);
+	if (ops) {
+		sis->ops = ops;
+		return;
+	}
+
 	/*
 	 * ->flags can be updated non-atomically, but that will
 	 * never affect SWP_SYNCHRONOUS_IO, so the data_race is safe.
 	 */
-	else if (data_race(sis->flags & SWP_SYNCHRONOUS_IO))
+	if (data_race(sis->flags & SWP_SYNCHRONOUS_IO))
 		sis->ops = &bdev_sync_swap_ops;
 	else
 		sis->ops = &bdev_async_swap_ops;
-
-	if (!sis->ops || !sis->ops->read_folio || !sis->ops->write_folio)
-		return -1;
-
-	return 0;
 }
 
 void swap_read_folio(struct folio *folio, struct swap_iocb **plug)
