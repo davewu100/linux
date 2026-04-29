@@ -1061,7 +1061,7 @@ static int zswap_writeback_entry(struct zswap_entry *entry,
 	folio_set_reclaim(folio);
 
 	/* start writeback */
-	si->ops->write_folio(si, folio, NULL);
+	swap_write_folio(si, folio, NULL);
 
 out:
 	if (ret && ret != -EEXIST) {

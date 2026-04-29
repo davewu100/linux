@@ -280,25 +280,13 @@ int swap_writeout(struct folio *folio, struct swap_iocb **swap_plug)
 		return AOP_WRITEPAGE_ACTIVATE;
 	}
 
-	sis->ops->write_folio(sis, folio, swap_plug);
+	swap_write_folio(sis, folio, swap_plug);
 	return 0;
 out_unlock:
 	folio_unlock(folio);
 	return ret;
 }
 
-static inline void count_swpout_vm_event(struct folio *folio)
-{
-#ifdef CONFIG_TRANSPARENT_HUGEPAGE
-	if (unlikely(folio_test_pmd_mappable(folio))) {
-		count_memcg_folio_events(folio, THP_SWPOUT, 1);
-		count_vm_event(THP_SWPOUT);
-	}
-#endif
-	count_mthp_stat(folio_order(folio), MTHP_STAT_SWPOUT);
-	count_memcg_folio_events(folio, PSWPOUT, folio_nr_pages(folio));
-	count_vm_events(PSWPOUT, folio_nr_pages(folio));
-}
 
 #if defined(CONFIG_MEMCG) && defined(CONFIG_BLK_CGROUP)
 static void bio_associate_blkg_from_page(struct bio *bio, struct folio *folio)
@@ -444,6 +432,17 @@ static void swap_write_folio_bdev_async(struct swap_info_struct *sis,
 	folio_start_writeback(folio);
 	folio_unlock(folio);
 	submit_bio(bio);
+}
+
+void swap_write_folio(struct swap_info_struct *sis, struct folio *folio,
+		      struct swap_iocb **plug)
+{
+	if (sis->ops->write_folio)
+		sis->ops->write_folio(sis, folio, plug);
+	else if (sis->flags & SWP_SYNCHRONOUS_IO)
+		swap_write_folio_bdev_sync(sis, folio, plug);
+	else
+		swap_write_folio_bdev_async(sis, folio, plug);
 }
 
 void swap_write_unplug(struct swap_iocb *sio)
@@ -603,14 +602,19 @@ static const struct swap_ops bdev_async_swap_ops = {
 	.write_folio = swap_write_folio_bdev_async,
 };
 
-int init_swap_ops(struct swap_info_struct *sis)
+void init_swap_ops(struct swap_info_struct *sis)
 {
 	/*
 	 * ->flags can be updated non-atomically, but that will
 	 * never affect SWP_FS_OPS, so the data_race is safe.
 	 */
-	if (data_race(sis->flags & SWP_FS_OPS))
+	if (data_race(sis->flags & SWP_FS_OPS)) {
 		sis->ops = &bdev_fs_swap_ops;
+		return;
+	}
+
+	if (sis->bdev && sis->bdev->bd_disk->swap_ops)
+		sis->ops = sis->bdev->bd_disk->swap_ops;
 	/*
 	 * ->flags can be updated non-atomically, but that will
 	 * never affect SWP_SYNCHRONOUS_IO, so the data_race is safe.
@@ -619,11 +623,6 @@ int init_swap_ops(struct swap_info_struct *sis)
 		sis->ops = &bdev_sync_swap_ops;
 	else
 		sis->ops = &bdev_async_swap_ops;
-
-	if (!sis->ops || !sis->ops->read_folio || !sis->ops->write_folio)
-		return -1;
-
-	return 0;
 }
 
 void swap_read_folio(struct folio *folio, struct swap_iocb **plug)
@@ -660,7 +659,12 @@ void swap_read_folio(struct folio *folio, struct swap_iocb **plug)
 	/* We have to read from slower devices. Increase zswap protection. */
 	zswap_folio_swapin(folio);
 
-	sis->ops->read_folio(sis, folio, plug);
+	if (sis->ops->read_folio)
+		sis->ops->read_folio(sis, folio, plug);
+	else if (synchronous)
+		swap_read_folio_bdev_sync(sis, folio, plug);
+	else
+		swap_read_folio_bdev_async(sis, folio, plug);
 
 finish:
 	if (workingset) {

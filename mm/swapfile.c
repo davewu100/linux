@@ -1259,9 +1259,10 @@ static void swap_range_alloc(struct swap_info_struct *si,
 static void swap_range_free(struct swap_info_struct *si, unsigned long offset,
 			    unsigned int nr_entries)
 {
+	void (*notify)(struct swap_info_struct *, unsigned long) =
+		si->ops->slot_free_notify;
 	unsigned long begin = offset;
 	unsigned long end = offset + nr_entries - 1;
-	void (*swap_slot_free_notify)(struct block_device *, unsigned long);
 	unsigned int i;
 
 	/*
@@ -1273,15 +1274,10 @@ static void swap_range_free(struct swap_info_struct *si, unsigned long offset,
 		zswap_invalidate(swp_entry(si->type, offset + i));
 	}
 
-	if (si->flags & SWP_BLKDEV)
-		swap_slot_free_notify =
-			si->bdev->bd_disk->fops->swap_slot_free_notify;
-	else
-		swap_slot_free_notify = NULL;
 	while (offset <= end) {
 		arch_swap_invalidate_page(si->type, offset);
-		if (swap_slot_free_notify)
-			swap_slot_free_notify(si->bdev, offset);
+		if (notify)
+			notify(si, offset);
 		offset++;
 	}
 	__swap_cache_clear_shadow(swp_entry(si->type, begin), nr_entries);
@@ -3413,10 +3409,7 @@ SYSCALL_DEFINE2(swapon, const char __user *, specialfile, int, swap_flags)
 		goto bad_swap_unlock_inode;
 	}
 
-	if (init_swap_ops(si)) {
-		error = -EINVAL;
-		goto bad_swap_unlock_inode;
-	}
+	init_swap_ops(si);
 
 	si->max = maxpages;
 	si->pages = maxpages - 1;

@@ -28,6 +28,7 @@
 #include <linux/lockdep.h>
 
 struct module;
+struct swap_ops;
 struct request_queue;
 struct elevator_queue;
 struct blk_trace;
@@ -159,6 +160,7 @@ struct gendisk {
 	struct block_device *part0;
 
 	const struct block_device_operations *fops;
+	const struct swap_ops *swap_ops;
 	struct request_queue *queue;
 	void *private_data;
 
@@ -1661,8 +1663,6 @@ struct block_device_operations {
 	int (*getgeo)(struct gendisk *, struct hd_geometry *);
 	int (*set_read_only)(struct block_device *bdev, bool ro);
 	void (*free_disk)(struct gendisk *disk);
-	/* this callback is with swap_lock and sometimes page table lock held */
-	void (*swap_slot_free_notify) (struct block_device *, unsigned long);
 	int (*report_zones)(struct gendisk *, sector_t sector,
 			    unsigned int nr_zones,
 			    struct blk_report_zones_args *args);
