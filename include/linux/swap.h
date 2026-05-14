@@ -21,6 +21,24 @@ struct notifier_block;
 struct bio;
 
 struct pagevec;
+struct block_device_operations;
+struct swap_info_struct;
+struct swap_iocb;
+
+struct swap_ops {
+	void (*read_folio)(struct swap_info_struct *sis,
+			struct folio *folio,
+			struct swap_iocb **plug);
+	void (*write_folio)(struct swap_info_struct *sis,
+			struct folio *folio,
+			struct swap_iocb **plug);
+};
+
+void swap_zram_ops_register(const struct block_device_operations *fops,
+			    const struct swap_ops *ops);
+void swap_zram_ops_unregister(void);
+void swap_read_folio_bdev(struct swap_info_struct *sis, struct folio *folio,
+			  struct swap_iocb **plug);
 
 #define SWAP_FLAG_PREFER	0x8000	/* set if swap priority specified */
 #define SWAP_FLAG_PRIO_MASK	0x7fff
@@ -255,7 +273,6 @@ struct swap_sequential_cluster {
 	unsigned int next[SWAP_NR_ORDERS]; /* Likely next allocation offset */
 };
 
-struct swap_ops;
 /*
  * The in-memory structure used to track swap areas.
  */

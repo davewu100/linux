@@ -33,6 +33,10 @@
 #include <linux/cpuhotplug.h>
 #include <linux/part_stat.h>
 #include <linux/kernel_read_file.h>
+#ifdef CONFIG_SWAP
+#include <linux/swap.h>
+#include <linux/swapops.h>
+#endif
 
 #include "zram_drv.h"
 
@@ -2817,6 +2821,68 @@ static void zram_slot_free_notify(struct block_device *bdev,
 	slot_unlock(zram, index);
 }
 
+#ifdef CONFIG_SWAP
+static void zram_swap_read_folio(struct swap_info_struct *sis,
+				 struct folio *folio, struct swap_iocb **plug)
+{
+	/*
+	 * Keep the parent-bio path for ZRAM_WB slots. The backing-device read
+	 * is chained under zram_submit_bio() and must not be collapsed here.
+	 */
+	swap_read_folio_bdev(sis, folio, plug);
+}
+
+static void zram_swap_write_folio(struct swap_info_struct *sis,
+				  struct folio *folio, struct swap_iocb **plug)
+{
+	struct zram *zram = sis->bdev->bd_disk->private_data;
+	unsigned long index = swp_offset(folio->swap);
+	unsigned long start_time;
+	int i;
+	int ret = 0;
+
+	folio_start_writeback(folio);
+	folio_unlock(folio);
+	/*
+	 * The swap_ops path already owns a folio, so write to zram directly
+	 * instead of fabricating a bio. Keep the diskstats accounting that the
+	 * bio path used to provide.
+	 */
+	start_time = bdev_start_io_acct(sis->bdev, REQ_OP_WRITE, jiffies);
+
+	for (i = 0; i < folio_nr_pages(folio); i++) {
+		ret = zram_write_page(zram, folio_page(folio, i), index + i);
+		if (ret)
+			break;
+
+		slot_lock(zram, index + i);
+		mark_slot_accessed(zram, index + i);
+		slot_unlock(zram, index + i);
+	}
+
+	if (ret) {
+		while (i > 0) {
+			i--;
+			slot_lock(zram, index + i);
+			slot_free(zram, index + i);
+			slot_unlock(zram, index + i);
+		}
+		atomic64_inc(&zram->stats.failed_writes);
+		folio_mark_dirty(folio);
+		pr_alert_ratelimited("Write-error on zram swap-device\n");
+		folio_clear_reclaim(folio);
+	}
+	bdev_end_io_acct(sis->bdev, REQ_OP_WRITE,
+			 folio_size(folio) >> SECTOR_SHIFT, start_time);
+	folio_end_writeback(folio);
+}
+
+static const struct swap_ops zram_swap_ops = {
+	.read_folio = zram_swap_read_folio,
+	.write_folio = zram_swap_write_folio,
+};
+#endif
+
 static void zram_comp_params_reset(struct zram *zram)
 {
 	u32 prio;
@@ -3282,6 +3348,10 @@ static int __init zram_init(void)
 		return -EBUSY;
 	}
 
+#ifdef CONFIG_SWAP
+	swap_zram_ops_register(&zram_devops, &zram_swap_ops);
+#endif
+
 	while (num_devices != 0) {
 		mutex_lock(&zram_index_mutex);
 		ret = zram_add();
@@ -3294,12 +3364,18 @@ static int __init zram_init(void)
 	return 0;
 
 out_error:
+#ifdef CONFIG_SWAP
+	swap_zram_ops_unregister();
+#endif
 	destroy_devices();
 	return ret;
 }
 
 static void __exit zram_exit(void)
 {
+#ifdef CONFIG_SWAP
+	swap_zram_ops_unregister();
+#endif
 	destroy_devices();
 }
 

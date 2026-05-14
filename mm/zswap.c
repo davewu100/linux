@@ -1060,7 +1060,11 @@ static int zswap_writeback_entry(struct zswap_entry *entry,
 	/* move it to the tail of the inactive list after end_writeback */
 	folio_set_reclaim(folio);
 
-	/* start writeback */
+	/*
+	 * zswap writeback bypasses swap_writeout(), so account the device
+	 * write here.
+	 */
+	count_swpout_vm_event(folio);
 	si->ops->write_folio(si, folio, NULL);
 
 out:
