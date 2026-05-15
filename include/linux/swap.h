@@ -32,6 +32,9 @@ struct swap_ops {
 	void (*write_folio)(struct swap_info_struct *sis,
 			struct folio *folio,
 			struct swap_iocb **plug);
+	/* this callback is with swap_lock and sometimes page table lock held */
+	void (*slot_free_notify)(struct swap_info_struct *sis,
+				 unsigned long offset);
 };
 
 void swap_zram_ops_register(const struct block_device_operations *fops,
