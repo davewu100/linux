@@ -22,6 +22,8 @@
 #include <linux/uio.h>
 #include <linux/sched/task.h>
 #include <linux/delayacct.h>
+#include <linux/export.h>
+#include <linux/mutex.h>
 #include <linux/zswap.h>
 #include "swap.h"
 
@@ -280,6 +282,7 @@ int swap_writeout(struct folio *folio, struct swap_iocb **swap_plug)
 		return AOP_WRITEPAGE_ACTIVATE;
 	}
 
+	count_swpout_vm_event(folio);
 	sis->ops->write_folio(sis, folio, swap_plug);
 	return 0;
 out_unlock:
@@ -287,7 +290,7 @@ out_unlock:
 	return ret;
 }
 
-static inline void count_swpout_vm_event(struct folio *folio)
+void count_swpout_vm_event(struct folio *folio)
 {
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
 	if (unlikely(folio_test_pmd_mappable(folio))) {
@@ -378,7 +381,6 @@ static void swap_write_folio_fs(struct swap_info_struct *sis,
 	struct file *swap_file = sis->swap_file;
 	loff_t pos = swap_dev_pos(folio->swap);
 
-	count_swpout_vm_event(folio);
 	folio_start_writeback(folio);
 	folio_unlock(folio);
 	if (sio) {
@@ -419,7 +421,6 @@ static void swap_write_folio_bdev_sync(struct swap_info_struct *sis,
 	bio_add_folio_nofail(&bio, folio, folio_size(folio), 0);
 
 	bio_associate_blkg_from_page(&bio, folio);
-	count_swpout_vm_event(folio);
 
 	folio_start_writeback(folio);
 	folio_unlock(folio);
@@ -440,7 +441,6 @@ static void swap_write_folio_bdev_async(struct swap_info_struct *sis,
 	bio_add_folio_nofail(bio, folio, folio_size(folio), 0);
 
 	bio_associate_blkg_from_page(bio, folio);
-	count_swpout_vm_event(folio);
 	folio_start_writeback(folio);
 	folio_unlock(folio);
 	submit_bio(bio);
@@ -588,6 +588,20 @@ static void swap_read_folio_bdev_async(struct swap_info_struct *sis,
 	submit_bio(bio);
 }
 
+void swap_read_folio_bdev(struct swap_info_struct *sis, struct folio *folio,
+			  struct swap_iocb **plug)
+{
+	/*
+	 * ->flags can be updated non-atomically, but that will never affect
+	 * SWP_SYNCHRONOUS_IO, so the data_race is safe.
+	 */
+	if (data_race(sis->flags & SWP_SYNCHRONOUS_IO))
+		swap_read_folio_bdev_sync(sis, folio, plug);
+	else
+		swap_read_folio_bdev_async(sis, folio, plug);
+}
+EXPORT_SYMBOL_GPL(swap_read_folio_bdev);
+
 static const struct swap_ops bdev_fs_swap_ops = {
 	.read_folio = swap_read_folio_fs,
 	.write_folio = swap_write_folio_fs,
@@ -603,23 +617,61 @@ static const struct swap_ops bdev_async_swap_ops = {
 	.write_folio = swap_write_folio_bdev_async,
 };
 
+static DEFINE_MUTEX(swap_zram_ops_lock);
+static const void *swap_zram_fops;
+static const struct swap_ops *swap_zram_ops;
+
+void swap_zram_ops_register(const void *fops, const struct swap_ops *ops)
+{
+	if (WARN_ON_ONCE(!fops || !ops || !ops->read_folio ||
+			 !ops->write_folio))
+		return;
+
+	mutex_lock(&swap_zram_ops_lock);
+	if (WARN_ON_ONCE(swap_zram_fops || swap_zram_ops)) {
+		mutex_unlock(&swap_zram_ops_lock);
+		return;
+	}
+	swap_zram_fops = fops;
+	swap_zram_ops = ops;
+	mutex_unlock(&swap_zram_ops_lock);
+}
+EXPORT_SYMBOL_GPL(swap_zram_ops_register);
+
+void swap_zram_ops_unregister(void)
+{
+	mutex_lock(&swap_zram_ops_lock);
+	swap_zram_fops = NULL;
+	swap_zram_ops = NULL;
+	mutex_unlock(&swap_zram_ops_lock);
+}
+EXPORT_SYMBOL_GPL(swap_zram_ops_unregister);
+
 int init_swap_ops(struct swap_info_struct *sis)
 {
-	/*
-	 * ->flags can be updated non-atomically, but that will
-	 * never affect SWP_FS_OPS, so the data_race is safe.
-	 */
-	if (data_race(sis->flags & SWP_FS_OPS))
+	/* data_race() is safe: ->flags updates never affect SWP_FS_OPS. */
+	if (data_race(sis->flags & SWP_FS_OPS)) {
 		sis->ops = &bdev_fs_swap_ops;
-	/*
-	 * ->flags can be updated non-atomically, but that will
-	 * never affect SWP_SYNCHRONOUS_IO, so the data_race is safe.
-	 */
-	else if (data_race(sis->flags & SWP_SYNCHRONOUS_IO))
+		goto out;
+	}
+
+	if (sis->bdev) {
+		mutex_lock(&swap_zram_ops_lock);
+		if (swap_zram_fops && sis->bdev->bd_disk->fops == swap_zram_fops) {
+			sis->ops = swap_zram_ops;
+			mutex_unlock(&swap_zram_ops_lock);
+			goto out;
+		}
+		mutex_unlock(&swap_zram_ops_lock);
+	}
+
+	/* data_race() is safe: ->flags updates never affect synchronous IO. */
+	if (data_race(sis->flags & SWP_SYNCHRONOUS_IO))
 		sis->ops = &bdev_sync_swap_ops;
 	else
 		sis->ops = &bdev_async_swap_ops;
 
+out:
 	if (!sis->ops || !sis->ops->read_folio || !sis->ops->write_folio)
 		return -1;
 

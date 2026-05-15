@@ -213,15 +213,8 @@ extern void swap_entries_free(struct swap_info_struct *si,
 /* linux/mm/swap_io.c */
 int sio_pool_init(void);
 struct swap_iocb;
-struct swap_ops {
-	void (*read_folio)(struct swap_info_struct *sis,
-			struct folio *folio,
-			struct swap_iocb **plug);
-	void (*write_folio)(struct swap_info_struct *sis,
-			struct folio *folio,
-			struct swap_iocb **plug);
-};
 int init_swap_ops(struct swap_info_struct *sis);
+void count_swpout_vm_event(struct folio *folio);
 void swap_read_folio(struct folio *folio, struct swap_iocb **plug);
 void __swap_read_unplug(struct swap_iocb *plug);
 static inline void swap_read_unplug(struct swap_iocb *plug)
