@@ -14,6 +14,8 @@
 
 #define pr_fmt(fmt) "zram: " fmt
 
+#include <linux/swap.h>
+#include <linux/swapops.h>
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/bio.h>
@@ -33,6 +35,8 @@
 #include <linux/cpuhotplug.h>
 #include <linux/part_stat.h>
 #include <linux/kernel_read_file.h>
+#include <linux/vmstat.h>
+#include <linux/huge_mm.h>
 
 #include "zram_drv.h"
 
@@ -2937,6 +2941,96 @@ static ssize_t reset_store(struct device *dev,
 	return len;
 }
 
+static void zram_swap_read_folio(struct swap_info_struct *sis,
+				 struct folio *folio,
+				 struct swap_iocb **plug)
+{
+	struct zram *zram = sis->bdev->bd_disk->private_data;
+	u32 index = swp_offset(folio->swap);
+	int i, ret = 0;
+
+	for (i = 0; i < folio_nr_pages(folio); i++) {
+		struct page *page = folio_page(folio, i);
+
+		slot_lock(zram, index + i);
+		if (IS_ENABLED(CONFIG_ZRAM_WRITEBACK) &&
+		    unlikely(test_slot_flag(zram, index + i, ZRAM_WB))) {
+			slot_unlock(zram, index + i);
+			/*
+			 * ZRAM_WB reads need the old parent bio chain, which
+			 * direct swap_ops lacks.  If a later page in the folio
+			 * is ZRAM_WB, the fallback may reread pages already
+			 * copied from zspool. Avoid a pre-scan and keep the
+			 * common resident-zspool path to one locked pass.
+			 */
+			swap_read_folio_bdev(sis, folio, plug);
+			return;
+		}
+		ret = read_from_zspool(zram, page, index + i);
+		if (!ret)
+			mark_slot_accessed(zram, index + i);
+		slot_unlock(zram, index + i);
+		if (ret)
+			break;
+		flush_dcache_page(page);
+	}
+	count_mthp_stat(folio_order(folio), MTHP_STAT_SWPIN);
+	count_memcg_folio_events(folio, PSWPIN, folio_nr_pages(folio));
+	count_vm_events(PSWPIN, folio_nr_pages(folio));
+
+	if (!ret) {
+		folio_mark_uptodate(folio);
+	} else {
+		atomic64_inc(&zram->stats.failed_reads);
+		if (WARN_ON(ret < 0))
+			pr_err("Decompression failed! err=%d, page=%u\n",
+			       ret, index + i);
+	}
+	folio_unlock(folio);
+}
+
+static void zram_swap_write_folio(struct swap_info_struct *sis,
+				  struct folio *folio,
+				  struct swap_iocb **plug)
+{
+	struct zram *zram = sis->bdev->bd_disk->private_data;
+	u32 index = swp_offset(folio->swap);
+	int i, ret = 0;
+
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+	if (unlikely(folio_test_pmd_mappable(folio))) {
+		count_memcg_folio_events(folio, THP_SWPOUT, 1);
+		count_vm_event(THP_SWPOUT);
+	}
+#endif
+	count_mthp_stat(folio_order(folio), MTHP_STAT_SWPOUT);
+	count_memcg_folio_events(folio, PSWPOUT, folio_nr_pages(folio));
+	count_vm_events(PSWPOUT, folio_nr_pages(folio));
+
+	folio_start_writeback(folio);
+	folio_unlock(folio);
+
+	for (i = 0; i < folio_nr_pages(folio); i++) {
+		ret = zram_write_page(zram, folio_page(folio, i), index + i);
+		if (ret)
+			break;
+		slot_lock(zram, index + i);
+		mark_slot_accessed(zram, index + i);
+		slot_unlock(zram, index + i);
+	}
+	if (ret) {
+		atomic64_inc(&zram->stats.failed_writes);
+		folio_mark_dirty(folio);
+		folio_clear_reclaim(folio);
+	}
+	folio_end_writeback(folio);
+}
+
+static const struct swap_ops zram_swap_ops = {
+	.read_folio = zram_swap_read_folio,
+	.write_folio = zram_swap_write_folio,
+};
+
 static int zram_open(struct gendisk *disk, blk_mode_t mode)
 {
 	struct zram *zram = disk->private_data;
@@ -3224,6 +3318,7 @@ static int zram_remove_cb(int id, void *ptr, void *data)
 
 static void destroy_devices(void)
 {
+	swap_zram_ops_unregister();
 	class_unregister(&zram_control_class);
 	idr_for_each(&zram_index_idr, &zram_remove_cb, NULL);
 	zram_debugfs_destroy();
@@ -3260,6 +3355,7 @@ static int __init zram_init(void)
 		return -EBUSY;
 	}
 
+	swap_zram_ops_register(&zram_devops, &zram_swap_ops);
 	while (num_devices != 0) {
 		mutex_lock(&zram_index_mutex);
 		ret = zram_add();
