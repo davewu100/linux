@@ -217,15 +217,6 @@ extern void __swap_cluster_free_entries(struct swap_info_struct *si,
 /* linux/mm/page_io.c */
 int sio_pool_init(void);
 struct swap_iocb;
-struct swap_ops {
-	void (*read_folio)(struct swap_info_struct *sis,
-			struct folio *folio,
-			struct swap_iocb **plug);
-	void (*write_folio)(struct swap_info_struct *sis,
-			struct folio *folio,
-			struct swap_iocb **plug);
-	void (*unplug)(struct swap_iocb *sio);
-};
 int init_swap_ops(struct swap_info_struct *sis);
 void swap_read_folio(struct folio *folio, struct swap_iocb **plug);
 void __swap_read_unplug(struct swap_iocb *plug);

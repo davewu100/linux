@@ -24,6 +24,8 @@
 #include <linux/uio.h>
 #include <linux/sched/task.h>
 #include <linux/delayacct.h>
+#include <linux/export.h>
+#include <linux/mutex.h>
 #include <linux/zswap.h>
 #include "swap.h"
 
@@ -620,8 +622,49 @@ static const struct swap_ops bdev_async_swap_ops = {
 	.write_folio = swap_bdev_async_write_folio,
 };
 
+static DEFINE_MUTEX(swap_zram_ops_lock);
+static const void *swap_zram_fops;
+static const struct swap_ops *swap_zram_ops;
+
+void swap_zram_ops_register(const void *fops, const struct swap_ops *ops)
+{
+	if (WARN_ON_ONCE(!fops || !ops || !ops->read_folio ||
+			 !ops->write_folio))
+		return;
+
+	mutex_lock(&swap_zram_ops_lock);
+	if (WARN_ON_ONCE(swap_zram_fops || swap_zram_ops)) {
+		mutex_unlock(&swap_zram_ops_lock);
+		return;
+	}
+	swap_zram_fops = fops;
+	swap_zram_ops = ops;
+	mutex_unlock(&swap_zram_ops_lock);
+}
+EXPORT_SYMBOL_GPL(swap_zram_ops_register);
+
+void swap_zram_ops_unregister(void)
+{
+	mutex_lock(&swap_zram_ops_lock);
+	swap_zram_fops = NULL;
+	swap_zram_ops = NULL;
+	mutex_unlock(&swap_zram_ops_lock);
+}
+EXPORT_SYMBOL_GPL(swap_zram_ops_unregister);
+
 int init_swap_ops(struct swap_info_struct *sis)
 {
+	if (sis->bdev) {
+		mutex_lock(&swap_zram_ops_lock);
+		if (swap_zram_fops &&
+		    sis->bdev->bd_disk->fops == swap_zram_fops) {
+			sis->ops = swap_zram_ops;
+			mutex_unlock(&swap_zram_ops_lock);
+			goto validate;
+		}
+		mutex_unlock(&swap_zram_ops_lock);
+	}
+
 	/*
 	 * ->flags can be updated non-atomically, but that will
 	 * never affect SWP_FS_OPS, so the data_race is safe.
@@ -637,6 +680,7 @@ int init_swap_ops(struct swap_info_struct *sis)
 	else
 		sis->ops = &bdev_async_swap_ops;
 
+validate:
 	if (!sis->ops || !sis->ops->read_folio || !sis->ops->write_folio)
 		return -EINVAL;
 

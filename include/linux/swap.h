@@ -19,8 +19,25 @@
 struct notifier_block;
 
 struct bio;
+struct folio;
+struct swap_info_struct;
+struct swap_iocb;
 
-struct swap_ops;
+struct swap_ops {
+	void (*read_folio)(struct swap_info_struct *sis,
+			   struct folio *folio,
+			   struct swap_iocb **plug);
+	void (*write_folio)(struct swap_info_struct *sis,
+			    struct folio *folio,
+			    struct swap_iocb **plug);
+	void (*unplug)(struct swap_iocb *sio);
+	/* This callback is with swap_lock and sometimes page table lock held. */
+	void (*slot_free_notify)(struct swap_info_struct *sis,
+				 unsigned long offset);
+};
+
+void swap_zram_ops_register(const void *fops, const struct swap_ops *ops);
+void swap_zram_ops_unregister(void);
 
 #define SWAP_FLAG_PREFER	0x8000	/* set if swap priority specified */
 #define SWAP_FLAG_PRIO_MASK	0x7fff
