@@ -2785,12 +2785,12 @@ static void zram_submit_bio(struct bio *bio)
 	}
 }
 
-static void zram_slot_free_notify(struct block_device *bdev,
-				unsigned long index)
+static void zram_swap_slot_free_notify(struct swap_info_struct *sis,
+				       unsigned long index)
 {
 	struct zram *zram;
 
-	zram = bdev->bd_disk->private_data;
+	zram = sis->bdev->bd_disk->private_data;
 
 	atomic64_inc(&zram->stats.notify_free);
 	if (!slot_trylock(zram, index)) {
@@ -3011,6 +3011,7 @@ static void zram_swap_write_folio(struct swap_info_struct *sis,
 static const struct swap_ops zram_swap_ops = {
 	.read_folio = zram_swap_read_folio,
 	.write_folio = zram_swap_write_folio,
+	.slot_free_notify = zram_swap_slot_free_notify,
 };
 
 static int zram_open(struct gendisk *disk, blk_mode_t mode)
@@ -3028,7 +3029,6 @@ static int zram_open(struct gendisk *disk, blk_mode_t mode)
 static const struct block_device_operations zram_devops = {
 	.open = zram_open,
 	.submit_bio = zram_submit_bio,
-	.swap_slot_free_notify = zram_slot_free_notify,
 	.owner = THIS_MODULE
 };
 
