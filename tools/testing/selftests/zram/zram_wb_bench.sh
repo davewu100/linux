@@ -54,6 +54,8 @@ cleanup_zram()
 	losetup -j "$BACKING_IMG" | cut -d: -f1 | while read -r dev; do
 		[ -n "$dev" ] && losetup -d "$dev" || true
 	done
+
+	rm -f "$BACKING_IMG"
 }
 
 show_stats()
