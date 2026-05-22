@@ -2,9 +2,20 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 #
 # Test zram writeback swap-in from a backing device.
+#
+# This test uses swapon -p 32767 so the test zram device wins over any
+# existing system swap while the test is running. Cleanup swaps it off again.
+
+set -uo pipefail
 
 TCID="zram03"
 ERR_CODE=0
+
+dev_makeswap=-1
+dev_start=0
+dev_end=-1
+module_load=-1
+sys_control=-1
 
 . ./zram_lib.sh
 
@@ -30,12 +41,12 @@ skip()
 
 cleanup()
 {
-	if [ $dev_makeswap -ge 0 ]; then
+	if [ "$dev_makeswap" -ge 0 ]; then
 		swapoff /dev/zram$dev_makeswap 2>/dev/null || true
 		dev_makeswap=-1
 	fi
 
-	if [ $dev_end -ge $dev_start ]; then
+	if [ "$dev_end" -ge "$dev_start" ]; then
 		echo 1 > /sys/block/zram${dev_start}/reset 2>/dev/null || true
 	fi
 
@@ -52,11 +63,11 @@ cleanup()
 			true
 	fi
 
-	if [ $sys_control -eq 1 ]; then
+	if [ "$sys_control" -eq 1 ]; then
 		echo $dev_start > /sys/class/zram-control/hot_remove 2>/dev/null || true
 	fi
 
-	if [ $module_load -eq 1 ]; then
+	if [ "$module_load" -eq 1 ]; then
 		rmmod zram > /dev/null 2>&1 || true
 	fi
 }
