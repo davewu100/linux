@@ -1463,16 +1463,23 @@ static int read_from_bdev_async(struct zram *zram, struct page *page,
 	return 0;
 }
 
-static void zram_sync_read(struct work_struct *w)
+static int submit_bdev_read_wait(struct zram *zram, struct page *page,
+				 unsigned long blk_idx)
 {
-	struct zram_rb_req *req = container_of(w, struct zram_rb_req, work);
 	struct bio_vec bv;
 	struct bio bio;
 
-	bio_init(&bio, req->zram->bdev, &bv, 1, REQ_OP_READ);
-	bio.bi_iter.bi_sector = req->blk_idx * (PAGE_SIZE >> 9);
-	__bio_add_page(&bio, req->page, PAGE_SIZE, 0);
-	req->error = submit_bio_wait(&bio);
+	bio_init(&bio, zram->bdev, &bv, 1, REQ_OP_READ);
+	bio.bi_iter.bi_sector = blk_idx * (PAGE_SIZE >> 9);
+	__bio_add_page(&bio, page, PAGE_SIZE, 0);
+	return submit_bio_wait(&bio);
+}
+
+static void zram_sync_read(struct work_struct *w)
+{
+	struct zram_rb_req *req = container_of(w, struct zram_rb_req, work);
+
+	req->error = submit_bdev_read_wait(req->zram, req->page, req->blk_idx);
 }
 
 /*
@@ -1500,6 +1507,22 @@ static int read_from_bdev_sync(struct zram *zram, struct page *page, u32 index,
 	return decompress_bdev_page(zram, page, index);
 }
 
+/*
+ * Swap_ops read path is not called from zram_submit_bio(), so it does not
+ * need the worker hop that protects the old no-parent partial-I/O path from
+ * nested bio submission.
+ */
+static int read_from_bdev_direct(struct zram *zram, struct page *page,
+				 u32 index, unsigned long blk_idx)
+{
+	int ret = submit_bdev_read_wait(zram, page, blk_idx);
+
+	if (ret || !zram->compressed_wb)
+		return ret;
+
+	return decompress_bdev_page(zram, page, index);
+}
+
 static int read_from_bdev(struct zram *zram, struct page *page, u32 index,
 			  unsigned long blk_idx, struct bio *parent)
 {
@@ -1512,6 +1535,12 @@ static int read_from_bdev(struct zram *zram, struct page *page, u32 index,
 static inline void reset_bdev(struct zram *zram) {};
 static int read_from_bdev(struct zram *zram, struct page *page, u32 index,
 			  unsigned long blk_idx, struct bio *parent)
+{
+	return -EIO;
+}
+
+static int read_from_bdev_direct(struct zram *zram, struct page *page,
+				 u32 index, unsigned long blk_idx)
 {
 	return -EIO;
 }
@@ -2936,6 +2965,32 @@ static ssize_t reset_store(struct device *dev,
 	return len;
 }
 
+/*
+ * Like zram_read_page(), but ZRAM_WB reads can submit the backing-device I/O
+ * directly because swap_ops callers are outside zram_submit_bio().
+ */
+static int zram_swap_read_page(struct zram *zram, struct page *page, u32 index)
+{
+	int ret;
+
+	slot_lock(zram, index);
+	if (!test_slot_flag(zram, index, ZRAM_WB)) {
+		ret = read_from_zspool(zram, page, index);
+		slot_unlock(zram, index);
+	} else {
+		unsigned long blk_idx = get_slot_handle(zram, index);
+
+		slot_unlock(zram, index);
+		atomic64_inc(&zram->stats.bd_reads);
+		ret = read_from_bdev_direct(zram, page, index, blk_idx);
+	}
+
+	if (WARN_ON(ret < 0))
+		pr_err("Decompression failed! err=%d, page=%u\n", ret, index);
+
+	return ret;
+}
+
 static void zram_swap_read_folio(struct swap_info_struct *sis,
 				 struct folio *folio,
 				 struct swap_iocb **plug)
@@ -2947,7 +3002,7 @@ static void zram_swap_read_folio(struct swap_info_struct *sis,
 	for (i = 0; i < folio_nr_pages(folio); i++) {
 		struct page *page = folio_page(folio, i);
 
-		ret = zram_read_page(zram, page, index + i, NULL);
+		ret = zram_swap_read_page(zram, page, index + i);
 		if (ret)
 			break;
 		flush_dcache_page(page);
