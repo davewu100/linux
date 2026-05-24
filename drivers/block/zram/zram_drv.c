@@ -36,7 +36,6 @@
 #include <linux/part_stat.h>
 #include <linux/kernel_read_file.h>
 #include <linux/vmstat.h>
-#include <linux/huge_mm.h>
 
 #include "zram_drv.h"
 
@@ -2974,8 +2973,6 @@ static void zram_swap_read_folio(struct swap_info_struct *sis,
 			break;
 		flush_dcache_page(page);
 	}
-	count_mthp_stat(folio_order(folio), MTHP_STAT_SWPIN);
-	count_memcg_folio_events(folio, PSWPIN, folio_nr_pages(folio));
 	count_vm_events(PSWPIN, folio_nr_pages(folio));
 
 	if (!ret) {
@@ -2997,16 +2994,7 @@ static void zram_swap_write_folio(struct swap_info_struct *sis,
 	u32 index = swp_offset(folio->swap);
 	int i, ret = 0;
 
-#ifdef CONFIG_TRANSPARENT_HUGEPAGE
-	if (unlikely(folio_test_pmd_mappable(folio))) {
-		count_memcg_folio_events(folio, THP_SWPOUT, 1);
-		count_vm_event(THP_SWPOUT);
-	}
-#endif
-	count_mthp_stat(folio_order(folio), MTHP_STAT_SWPOUT);
-	count_memcg_folio_events(folio, PSWPOUT, folio_nr_pages(folio));
 	count_vm_events(PSWPOUT, folio_nr_pages(folio));
-
 	folio_start_writeback(folio);
 	folio_unlock(folio);
 
