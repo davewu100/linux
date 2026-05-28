@@ -24,6 +24,8 @@
 #include <linux/uio.h>
 #include <linux/sched/task.h>
 #include <linux/delayacct.h>
+#include <linux/export.h>
+#include <linux/mutex.h>
 #include <linux/zswap.h>
 #include "swap.h"
 #include "swap_table.h"
@@ -277,6 +279,7 @@ struct swap_iocb {
 	int			nr_bvecs;
 	int			len;
 };
+
 static mempool_t *sio_pool;
 
 int sio_pool_init(void)
@@ -623,6 +626,93 @@ const struct swap_ops swap_bdev_ops = {
 	.submit_read		= swap_bdev_submit_read,
 	.can_merge		= swap_bdev_can_merge,
 };
+
+static DEFINE_MUTEX(swap_block_ops_lock);
+static const struct block_device_operations *swap_block_fops;
+static const struct swap_ops *swap_block_ops;
+
+/**
+ * swap_register_block_ops - install swap callbacks for a block driver
+ * @fops: block_device_operations identifying the driver. Used as a
+ *        match key in setup_swap_extents(): a S_ISBLK swap area is
+ *        routed to @ops when its bdev's gendisk fops equals @fops.
+ * @ops:  swap_ops vtable selected for matching swap areas. Must populate
+ *        ->submit_read, ->submit_write and ->can_merge.
+ *
+ * Lets a block driver (zram and similar) replace the default
+ * swap_bdev_ops with its own submit_read / submit_write / can_merge
+ * implementation.
+ *
+ * Returns 0 on success, -EINVAL when @fops or @ops are bad (a required
+ * callback is missing), or -EBUSY when another block driver has already
+ * registered. Only one registration is allowed at a time.
+ *
+ * Context: process context, may sleep.
+ */
+int swap_register_block_ops(const struct block_device_operations *fops,
+			    const struct swap_ops *ops)
+{
+	int ret;
+
+	if (WARN_ON_ONCE(!fops || !ops || !ops->submit_read ||
+			 !ops->submit_write || !ops->can_merge))
+		return -EINVAL;
+
+	mutex_lock(&swap_block_ops_lock);
+	if (swap_block_fops || swap_block_ops) {
+		ret = -EBUSY;
+		goto out;
+	}
+	swap_block_fops = fops;
+	swap_block_ops = ops;
+	ret = 0;
+out:
+	mutex_unlock(&swap_block_ops_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(swap_register_block_ops);
+
+/**
+ * swap_unregister_block_ops - undo swap_register_block_ops()
+ * @fops: same block_device_operations passed to swap_register_block_ops().
+ *
+ * Clears the registered fops/ops slot so future swapon calls fall back
+ * to swap_bdev_ops. The @fops match acts as a soft owner check so a
+ * driver cannot accidentally tear down another driver's registration.
+ * A mismatch is treated as a bug and triggers WARN_ON_ONCE. Swap areas
+ * that already captured the registered ops keep their sis->ops pointer.
+ * The caller must ensure the module owning the ops outlives any such
+ * swap area. For block drivers this is guaranteed by the bdev open
+ * reference held across swapon.
+ *
+ * Context: process context, may sleep.
+ */
+void swap_unregister_block_ops(const struct block_device_operations *fops)
+{
+	mutex_lock(&swap_block_ops_lock);
+	if (WARN_ON_ONCE(swap_block_fops != fops)) {
+		mutex_unlock(&swap_block_ops_lock);
+		return;
+	}
+	swap_block_fops = NULL;
+	swap_block_ops = NULL;
+	mutex_unlock(&swap_block_ops_lock);
+}
+EXPORT_SYMBOL_GPL(swap_unregister_block_ops);
+
+const struct swap_ops *lookup_swap_block_ops(struct swap_info_struct *sis)
+{
+	const struct swap_ops *ops = NULL;
+
+	if (!sis->bdev)
+		return NULL;
+
+	mutex_lock(&swap_block_ops_lock);
+	if (swap_block_fops && sis->bdev->bd_disk->fops == swap_block_fops)
+		ops = swap_block_ops;
+	mutex_unlock(&swap_block_ops_lock);
+	return ops;
+}
 
 static void swap_fs_submit(struct swap_io_ctx *ctx, int rw)
 {

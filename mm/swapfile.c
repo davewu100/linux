@@ -2849,6 +2849,10 @@ static int setup_swap_extents(struct swap_info_struct *sis,
 	sis->ops = &swap_bdev_ops;
 
 	if (S_ISBLK(inode->i_mode)) {
+		const struct swap_ops *block_ops = lookup_swap_block_ops(sis);
+
+		if (block_ops)
+			sis->ops = block_ops;
 		ret = add_swap_extent(sis, 0, sis->max, 0);
 		*span = sis->pages;
 		return ret;
