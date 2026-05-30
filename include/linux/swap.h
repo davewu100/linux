@@ -38,6 +38,10 @@ struct swap_io_ctx {
  *             already holds @prev_folio of @prev_folio_size bytes.
  * @submit_write: flush the accumulated write ctx to the backend.
  * @submit_read: flush the accumulated read ctx to the backend.
+ * @slot_free_notify: optional callback invoked when a swap slot
+ *                    becomes free. Called with the swap cluster lock
+ *                    held (and possibly the page-table lock too), so
+ *                    it must not sleep or block.
  */
 struct swap_ops {
 	unsigned int		flags;
@@ -46,6 +50,8 @@ struct swap_ops {
 					     size_t prev_folio_size);
 	void			(*submit_write)(struct swap_io_ctx *ctx);
 	void			(*submit_read)(struct swap_io_ctx *ctx);
+	void			(*slot_free_notify)(struct swap_info_struct *sis,
+						    unsigned long offset);
 };
 
 int swap_register_block_ops(const struct block_device_operations *fops,

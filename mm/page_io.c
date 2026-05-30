@@ -725,7 +725,9 @@ static const struct swap_ops *swap_block_ops;
  *        match key in setup_swap_extents(): a S_ISBLK swap area is
  *        routed to @ops when its bdev's gendisk fops equals @fops.
  * @ops:  swap_ops vtable selected for matching swap areas. Must populate
- *        ->submit_read, ->submit_write and ->can_merge.
+ *        ->submit_read, ->submit_write and ->can_merge. ->slot_free_notify
+ *        is optional and left NULL when the driver does not need per-slot
+ *        free notifications.
  *
  * Lets a block driver (zram and similar) replace the default
  * swap_bdev_ops with its own submit_read / submit_write / can_merge
