@@ -81,7 +81,7 @@ static void slot_lock_init(struct zram *zram, u32 index)
  * 4) Use TRY lock variant when in atomic context
  *    - must check return value and handle locking failers
  */
-static __must_check bool slot_trylock(struct zram *zram, u32 index)
+static __must_check __maybe_unused bool slot_trylock(struct zram *zram, u32 index)
 {
 	unsigned long *lock = &zram->table[index].__lock;
 
@@ -2795,12 +2795,11 @@ static void zram_submit_bio(struct bio *bio)
 	}
 }
 
-static void zram_slot_free_notify(struct block_device *bdev,
-				unsigned long index)
+#if IS_ENABLED(CONFIG_SWAP)
+static void zram_swap_slot_free_notify(struct swap_info_struct *sis,
+				       unsigned long index)
 {
-	struct zram *zram;
-
-	zram = bdev->bd_disk->private_data;
+	struct zram *zram = sis->bdev->bd_disk->private_data;
 
 	atomic64_inc(&zram->stats.notify_free);
 	if (!slot_trylock(zram, index)) {
@@ -2811,6 +2810,7 @@ static void zram_slot_free_notify(struct block_device *bdev,
 	slot_free(zram, index);
 	slot_unlock(zram, index);
 }
+#endif /* CONFIG_SWAP */
 
 static void zram_comp_params_reset(struct zram *zram)
 {
@@ -3046,9 +3046,10 @@ static void zram_swap_submit_write(struct swap_io_ctx *ctx)
 }
 
 static const struct swap_ops zram_swap_ops = {
-	.can_merge	= swap_bdev_can_merge,
-	.submit_read	= zram_swap_submit_read,
-	.submit_write	= zram_swap_submit_write,
+	.can_merge		= swap_bdev_can_merge,
+	.submit_read		= zram_swap_submit_read,
+	.submit_write		= zram_swap_submit_write,
+	.slot_free_notify	= zram_swap_slot_free_notify,
 };
 
 static bool zram_swap_ops_registered;
@@ -3057,7 +3058,6 @@ static bool zram_swap_ops_registered;
 static const struct block_device_operations zram_devops = {
 	.open = zram_open,
 	.submit_bio = zram_submit_bio,
-	.swap_slot_free_notify = zram_slot_free_notify,
 	.owner = THIS_MODULE
 };
 
