@@ -11,7 +11,7 @@ BACKING_IMG="${BACKING_IMG:-/var/tmp/zram-backing.img}"
 BACKING_SIZE="${BACKING_SIZE:-16G}"
 COMP="${COMP:-lzo-rle}"
 BENCH_BIN="${BENCH_BIN:-./zram_wb_bench}"
-BENCH_FLAGS="${BENCH_FLAGS:---random --drop-caches}"
+BENCH_FLAGS="${BENCH_FLAGS:---cold --seed 42 --stride 64 --drop-caches}"
 loopdev=""
 
 require_root()
@@ -171,7 +171,11 @@ run_bench()
 			shift
 			;;
 		--sequential)
-			BENCH_FLAGS=""
+			BENCH_FLAGS="--drop-caches"
+			shift
+			;;
+		--legacy)
+			BENCH_FLAGS="--random --drop-caches"
 			shift
 			;;
 		*)
@@ -224,11 +228,11 @@ cleanup)
 *)
 	echo "Usage:"
 	echo "  sudo $0 setup"
-	echo "  sudo $0 bench [GB] [--no-reset-between] [--sequential]"
+	echo "  sudo $0 bench [GB] [--no-reset-between] [--sequential] [--legacy]"
 	echo "  sudo $0 cleanup"
 	echo ""
 	echo "bench resets zram by default before each run and between zspool/WB."
-	echo "Default bench uses --random --drop-caches for cold swap-in."
+	echo "Default bench uses --cold (--stride 64 --seed 42 --drop-caches)."
 	exit 1
 	;;
 esac
