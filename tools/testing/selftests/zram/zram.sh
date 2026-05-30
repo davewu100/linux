@@ -11,6 +11,8 @@ echo "--------------------"
 ./zram01.sh
 echo ""
 ./zram02.sh
+echo ""
+./zram03.sh
 }
 
 check_prereqs
