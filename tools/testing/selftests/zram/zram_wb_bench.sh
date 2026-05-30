@@ -87,6 +87,10 @@ reset_zram()
 {
 	swapoff "$ZRAM_DEV" 2>/dev/null || true
 	echo 1 > "$ZRAM_SYS/reset"
+	resolve_loopdev
+	if [ -f "$BACKING_IMG" ]; then
+		truncate -s "$BACKING_SIZE" "$BACKING_IMG"
+	fi
 	configure_zram_swap
 }
 
@@ -154,12 +158,16 @@ run_bench_once()
 run_bench()
 {
 	local gb=3
-	local reset_between=0
+	local reset_between=1
 
 	while [ $# -gt 0 ]; do
 		case "$1" in
 		--reset-between)
 			reset_between=1
+			shift
+			;;
+		--no-reset-between)
+			reset_between=0
 			shift
 			;;
 		--sequential)
@@ -175,10 +183,19 @@ run_bench()
 
 	require_root
 	ensure_zram_dev
+	resolve_loopdev
+	[ -n "$loopdev" ] || {
+		echo "No backing loop device; run setup first" >&2
+		exit 1
+	}
 	[ -x "$BENCH_BIN" ] || {
 		echo "Missing benchmark binary: $BENCH_BIN" >&2
 		exit 1
 	}
+
+	echo "== reset zram before benchmark =="
+	reset_zram
+	show_stats
 
 	echo "bench flags:${BENCH_FLAGS:+ $BENCH_FLAGS}"
 
@@ -207,9 +224,10 @@ cleanup)
 *)
 	echo "Usage:"
 	echo "  sudo $0 setup"
-	echo "  sudo $0 bench [GB] [--reset-between] [--sequential]"
+	echo "  sudo $0 bench [GB] [--no-reset-between] [--sequential]"
 	echo "  sudo $0 cleanup"
 	echo ""
+	echo "bench resets zram by default before each run and between zspool/WB."
 	echo "Default bench uses --random --drop-caches for cold swap-in."
 	exit 1
 	;;
