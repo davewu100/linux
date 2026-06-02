@@ -220,7 +220,12 @@ static inline bool is_partial_io(struct bio_vec *bvec)
 {
 	if (PAGE_SIZE == 4096)
 		return false;
-	return bvec->bv_len != PAGE_SIZE;
+	if (bvec->bv_len != PAGE_SIZE) {
+		pr_debug_ratelimited("partial IO: len=%u PAGE_SIZE=%lu\n",
+				     bvec->bv_len, PAGE_SIZE);
+		return true;
+	}
+	return false;
 }
 
 #if defined CONFIG_ZRAM_WRITEBACK || defined CONFIG_ZRAM_MULTI_COMP
@@ -1507,6 +1512,8 @@ static int read_from_bdev(struct zram *zram, struct page *page, u32 index,
 		/* Sub-page I/O only exists on non-4K PAGE_SIZE builds. */
 		if (WARN_ON_ONCE(PAGE_SIZE == 4096))
 			return -EIO;
+		pr_debug_ratelimited("sync bdev read: index=%u blk_idx=%lu\n",
+				     index, blk_idx);
 		return read_from_bdev_sync(zram, page, index, blk_idx);
 	}
 	return read_from_bdev_async(zram, page, index, blk_idx, parent);
