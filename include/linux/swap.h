@@ -19,6 +19,39 @@
 struct notifier_block;
 
 struct bio;
+struct folio;
+struct swap_iocb;
+struct swap_info_struct;
+struct block_device_operations;
+
+struct swap_io_ctx {
+	struct swap_iocb	*sio;
+	struct swap_info_struct	*sis;
+};
+
+#define SWAP_OPS_F_NOFS		BIT(0)
+
+struct swap_ops {
+	unsigned int		flags;
+	bool			(*can_merge)(struct folio *folio,
+					     struct folio *prev_folio,
+					     size_t prev_folio_size, int rw);
+	void			(*submit_write)(struct swap_io_ctx *ctx);
+	void			(*submit_read)(struct swap_io_ctx *ctx);
+	void			(*slot_free_notify)(struct swap_info_struct *sis,
+						    unsigned long offset);
+};
+
+int swap_register_block_ops(const struct block_device_operations *fops,
+			    const struct swap_ops *ops);
+void swap_unregister_block_ops(const struct block_device_operations *fops);
+int swap_iocb_nr_folios(struct swap_iocb *sio);
+struct folio *swap_iocb_folio(struct swap_iocb *sio, int idx);
+void swap_read_end(struct swap_iocb *sio, bool failed);
+void swap_write_end(struct swap_iocb *sio, bool failed);
+void swap_bdev_submit_read(struct swap_io_ctx *ctx);
+bool swap_bdev_can_merge(struct folio *folio, struct folio *prev_folio,
+			 size_t prev_folio_size, int rw);
 
 #define SWAP_FLAG_PREFER	0x8000	/* set if swap priority specified */
 #define SWAP_FLAG_PRIO_MASK	0x7fff
