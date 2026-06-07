@@ -34,6 +34,8 @@
 #include <linux/part_stat.h>
 #include <linux/kernel_read_file.h>
 #include <linux/rcupdate.h>
+#include <linux/swap.h>
+#include <linux/swapops.h>
 
 #include "zram_drv.h"
 
@@ -79,7 +81,7 @@ static void slot_lock_init(struct zram *zram, u32 index)
  * 4) Use TRY lock variant when in atomic context
  *    - must check return value and handle locking failers
  */
-static __must_check bool slot_trylock(struct zram *zram, u32 index)
+static __must_check __maybe_unused bool slot_trylock(struct zram *zram, u32 index)
 {
 	unsigned long *lock = &zram->table[index].__lock;
 
@@ -2793,12 +2795,11 @@ static void zram_submit_bio(struct bio *bio)
 	}
 }
 
-static void zram_slot_free_notify(struct block_device *bdev,
-				unsigned long index)
+#if IS_ENABLED(CONFIG_SWAP)
+static void zram_swap_slot_free_notify(struct swap_info_struct *sis,
+				       unsigned long index)
 {
-	struct zram *zram;
-
-	zram = bdev->bd_disk->private_data;
+	struct zram *zram = sis->bdev->bd_disk->private_data;
 
 	atomic64_inc(&zram->stats.notify_free);
 	if (!slot_trylock(zram, index)) {
@@ -2809,6 +2810,7 @@ static void zram_slot_free_notify(struct block_device *bdev,
 	slot_free(zram, index);
 	slot_unlock(zram, index);
 }
+#endif /* CONFIG_SWAP */
 
 static void zram_comp_params_reset(struct zram *zram)
 {
@@ -2958,12 +2960,128 @@ static int zram_open(struct gendisk *disk, blk_mode_t mode)
 	return 0;
 }
 
+#if IS_ENABLED(CONFIG_SWAP)
+static void zram_swap_submit_read(struct swap_io_ctx *ctx)
+{
+	struct zram *zram = ctx->sis->bdev->bd_disk->private_data;
+	struct swap_iocb *sio = ctx->sio;
+	int nr = swap_iocb_nr_folios(sio);
+	bool failed = false;
+	int i, j, ret = 0;
+	u32 idx = 0;
+
+	for (i = 0; i < nr; i++) {
+		struct folio *folio = swap_iocb_folio(sio, i);
+		u32 base = swp_offset(folio->swap);
+
+		for (j = 0; j < folio_nr_pages(folio); j++) {
+			struct page *page = folio_page(folio, j);
+
+			idx = base + j;
+			slot_lock(zram, idx);
+			if (IS_ENABLED(CONFIG_ZRAM_WRITEBACK) &&
+			    unlikely(test_slot_flag(zram, idx, ZRAM_WB))) {
+				slot_unlock(zram, idx);
+				/*
+				 * Any ZRAM_WB slot in the batch needs the
+				 * existing bio path. Fall back to bdev for
+				 * the whole ctx. Pages already decoded from
+				 * zspool will be re-read by the bio path,
+				 * which is harmless because zspool content
+				 * is identical.
+				 */
+				swap_bdev_submit_read(ctx);
+				return;
+			}
+			ret = read_from_zspool(zram, page, idx);
+			if (!ret)
+				mark_slot_accessed(zram, idx);
+			slot_unlock(zram, idx);
+			if (ret)
+				break;
+			flush_dcache_page(page);
+		}
+		if (ret) {
+			failed = true;
+			atomic64_inc(&zram->stats.failed_reads);
+			pr_alert_ratelimited("Read-error on swap-device %s at index %u: err=%d\n",
+					     zram->disk->disk_name, idx, ret);
+			break;
+		}
+	}
+	swap_read_end(sio, failed);
+}
+
+static void zram_swap_submit_write(struct swap_io_ctx *ctx)
+{
+	struct zram *zram = ctx->sis->bdev->bd_disk->private_data;
+	struct swap_iocb *sio = ctx->sio;
+	int nr = swap_iocb_nr_folios(sio);
+	bool failed = false;
+	int i, j, ret = 0;
+	u32 idx = 0;
+
+	for (i = 0; i < nr; i++) {
+		struct folio *folio = swap_iocb_folio(sio, i);
+		u32 base = swp_offset(folio->swap);
+
+		for (j = 0; j < folio_nr_pages(folio); j++) {
+			idx = base + j;
+			ret = zram_write_page(zram, folio_page(folio, j), idx);
+			if (ret)
+				break;
+			slot_lock(zram, idx);
+			mark_slot_accessed(zram, idx);
+			slot_unlock(zram, idx);
+		}
+		if (ret) {
+			failed = true;
+			atomic64_inc(&zram->stats.failed_writes);
+			pr_alert_ratelimited("Write-error on swap-device %s at index %u: err=%d\n",
+					     zram->disk->disk_name, idx, ret);
+			break;
+		}
+	}
+	swap_write_end(sio, failed);
+}
+
+static const struct swap_ops zram_swap_ops = {
+	.can_merge		= swap_bdev_can_merge,
+	.submit_read		= zram_swap_submit_read,
+	.submit_write		= zram_swap_submit_write,
+	.slot_free_notify	= zram_swap_slot_free_notify,
+};
+
+static bool zram_swap_ops_registered;
+#endif /* CONFIG_SWAP */
+
 static const struct block_device_operations zram_devops = {
 	.open = zram_open,
 	.submit_bio = zram_submit_bio,
-	.swap_slot_free_notify = zram_slot_free_notify,
 	.owner = THIS_MODULE
 };
+
+#if IS_ENABLED(CONFIG_SWAP)
+static int zram_register_swap_ops(void)
+{
+	int ret = swap_register_block_ops(&zram_devops, &zram_swap_ops);
+
+	if (!ret)
+		zram_swap_ops_registered = true;
+	return ret;
+}
+
+static void zram_unregister_swap_ops(void)
+{
+	if (zram_swap_ops_registered) {
+		swap_unregister_block_ops(&zram_devops);
+		zram_swap_ops_registered = false;
+	}
+}
+#else
+static inline int zram_register_swap_ops(void) { return 0; }
+static inline void zram_unregister_swap_ops(void) { }
+#endif /* CONFIG_SWAP */
 
 static DEVICE_ATTR_RO(io_stat);
 static DEVICE_ATTR_RO(mm_stat);
@@ -3233,6 +3351,7 @@ static int zram_remove_cb(int id, void *ptr, void *data)
 
 static void destroy_devices(void)
 {
+	zram_unregister_swap_ops();
 	class_unregister(&zram_control_class);
 	idr_for_each(&zram_index_idr, &zram_remove_cb, NULL);
 	zram_debugfs_destroy();
@@ -3267,6 +3386,12 @@ static int __init zram_init(void)
 		class_unregister(&zram_control_class);
 		cpuhp_remove_multi_state(CPUHP_ZCOMP_PREPARE);
 		return -EBUSY;
+	}
+
+	ret = zram_register_swap_ops();
+	if (ret) {
+		pr_err("zram: failed to register swap ops (%d)\n", ret);
+		goto out_error;
 	}
 
 	while (num_devices != 0) {

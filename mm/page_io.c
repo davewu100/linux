@@ -482,7 +482,7 @@ finish:
 	delayacct_swapin_end();
 }
 
-static void swap_write_end(struct swap_iocb *sio, bool failed)
+void swap_write_end(struct swap_iocb *sio, bool failed)
 {
 	int p;
 
@@ -497,6 +497,7 @@ static void swap_write_end(struct swap_iocb *sio, bool failed)
 	}
 	mempool_free(sio, sio_pool);
 }
+EXPORT_SYMBOL_GPL(swap_write_end);
 
 static void swap_fs_write_complete(struct kiocb *iocb, long ret)
 {
@@ -532,7 +533,7 @@ static void end_swap_bio_write(struct bio *bio)
 	swap_write_end(sio, failed);
 }
 
-static void swap_read_end(struct swap_iocb *sio, bool failed)
+void swap_read_end(struct swap_iocb *sio, bool failed)
 {
 	int p;
 
@@ -553,6 +554,19 @@ static void swap_read_end(struct swap_iocb *sio, bool failed)
 
 	mempool_free(sio, sio_pool);
 }
+EXPORT_SYMBOL_GPL(swap_read_end);
+
+int swap_iocb_nr_folios(struct swap_iocb *sio)
+{
+	return sio->nr_bvecs;
+}
+EXPORT_SYMBOL_GPL(swap_iocb_nr_folios);
+
+struct folio *swap_iocb_folio(struct swap_iocb *sio, int idx)
+{
+	return page_folio(sio->bvecs[idx].bv_page);
+}
+EXPORT_SYMBOL_GPL(swap_iocb_folio);
 
 static void swap_fs_read_complete(struct kiocb *iocb, long ret)
 {
@@ -597,7 +611,7 @@ static void swap_bdev_submit_write(struct swap_io_ctx *ctx)
 	}
 }
 
-static void swap_bdev_submit_read(struct swap_io_ctx *ctx)
+void swap_bdev_submit_read(struct swap_io_ctx *ctx)
 {
 	struct swap_iocb *sio = ctx->sio;
 	struct bio *bio = &sio->bio;
@@ -622,8 +636,9 @@ static void swap_bdev_submit_read(struct swap_io_ctx *ctx)
 		submit_bio(bio);
 	}
 }
+EXPORT_SYMBOL_GPL(swap_bdev_submit_read);
 
-static bool swap_bdev_can_merge(struct folio *folio, struct folio *prev_folio,
+bool swap_bdev_can_merge(struct folio *folio, struct folio *prev_folio,
 		size_t prev_folio_size, int rw)
 {
 	if (swap_folio_sector(folio) !=
@@ -633,12 +648,67 @@ static bool swap_bdev_can_merge(struct folio *folio, struct folio *prev_folio,
 		return false;
 	return true;
 }
+EXPORT_SYMBOL_GPL(swap_bdev_can_merge);
 
 const struct swap_ops swap_bdev_ops = {
 	.submit_write		= swap_bdev_submit_write,
 	.submit_read		= swap_bdev_submit_read,
 	.can_merge		= swap_bdev_can_merge,
 };
+
+static DEFINE_MUTEX(swap_block_ops_lock);
+static const struct block_device_operations *swap_block_fops;
+static const struct swap_ops *swap_block_ops;
+
+int swap_register_block_ops(const struct block_device_operations *fops,
+			    const struct swap_ops *ops)
+{
+	int ret;
+
+	if (WARN_ON_ONCE(!fops || !ops || !ops->submit_read ||
+			 !ops->submit_write || !ops->can_merge))
+		return -EINVAL;
+
+	mutex_lock(&swap_block_ops_lock);
+	if (swap_block_fops || swap_block_ops) {
+		ret = -EBUSY;
+		goto out;
+	}
+	swap_block_fops = fops;
+	swap_block_ops = ops;
+	ret = 0;
+out:
+	mutex_unlock(&swap_block_ops_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(swap_register_block_ops);
+
+void swap_unregister_block_ops(const struct block_device_operations *fops)
+{
+	mutex_lock(&swap_block_ops_lock);
+	if (WARN_ON_ONCE(swap_block_fops != fops)) {
+		mutex_unlock(&swap_block_ops_lock);
+		return;
+	}
+	swap_block_fops = NULL;
+	swap_block_ops = NULL;
+	mutex_unlock(&swap_block_ops_lock);
+}
+EXPORT_SYMBOL_GPL(swap_unregister_block_ops);
+
+const struct swap_ops *lookup_swap_block_ops(struct swap_info_struct *sis)
+{
+	const struct swap_ops *ops = NULL;
+
+	if (!sis->bdev)
+		return NULL;
+
+	mutex_lock(&swap_block_ops_lock);
+	if (swap_block_fops && sis->bdev->bd_disk->fops == swap_block_fops)
+		ops = swap_block_ops;
+	mutex_unlock(&swap_block_ops_lock);
+	return ops;
+}
 
 static void swap_fs_submit(struct swap_io_ctx *ctx, int rw)
 {
