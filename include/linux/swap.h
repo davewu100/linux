@@ -49,6 +49,11 @@ struct swap_ops {
 int swap_register_block_ops(const struct block_device_operations *fops,
 			    const struct swap_ops *ops);
 void swap_unregister_block_ops(const struct block_device_operations *fops);
+int swap_iocb_nr_folios(struct swap_iocb *sio);
+struct folio *swap_iocb_folio(struct swap_iocb *sio, int idx);
+void swap_read_end(struct swap_iocb *sio, bool failed);
+void swap_write_end(struct swap_iocb *sio, bool failed);
+void swap_bdev_submit_read(struct swap_io_ctx *ctx);
 
 #define SWAP_FLAG_PREFER	0x8000	/* set if swap priority specified */
 #define SWAP_FLAG_PRIO_MASK	0x7fff
