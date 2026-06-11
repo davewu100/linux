@@ -135,7 +135,6 @@ impl GenDiskBuilder {
             unlock_native_capacity: None,
             getgeo: None,
             set_read_only: None,
-            swap_slot_free_notify: None,
             report_zones: None,
             devnode: None,
             alternative_gpt_sector: None,
