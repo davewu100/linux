@@ -2799,23 +2799,6 @@ static void zram_submit_bio(struct bio *bio)
 	}
 }
 
-static void zram_slot_free_notify(struct block_device *bdev,
-				unsigned long index)
-{
-	struct zram *zram;
-
-	zram = bdev->bd_disk->private_data;
-
-	atomic64_inc(&zram->stats.notify_free);
-	if (!slot_trylock(zram, index)) {
-		atomic64_inc(&zram->stats.miss_free);
-		return;
-	}
-
-	slot_free(zram, index);
-	slot_unlock(zram, index);
-}
-
 static void zram_comp_params_reset(struct zram *zram)
 {
 	u32 prio;
@@ -3059,6 +3042,38 @@ out:
 	swap_write_end(sio, failed);
 }
 
+static __must_check bool slot_trylock(struct zram *zram, u32 index)
+{
+	unsigned long *lock = &zram->table[index].__lock;
+
+	if (!test_and_set_bit_lock(ZRAM_ENTRY_LOCK, lock)) {
+		mutex_acquire(slot_dep_map(zram, index), 0, 1, _RET_IP_);
+		lock_acquired(slot_dep_map(zram, index), _RET_IP_);
+		return true;
+	}
+
+	return false;
+}
+
+/*
+ * swap_range_free() holds the swap cluster lock. Use slot_trylock() so
+ * we never block on a slot that is already locked elsewhere.
+ */
+static void zram_swap_slot_free_notify(struct swap_info_struct *sis,
+				       unsigned long index)
+{
+	struct zram *zram = sis->bdev->bd_disk->private_data;
+
+	atomic64_inc(&zram->stats.notify_free);
+	if (!slot_trylock(zram, index)) {
+		atomic64_inc(&zram->stats.miss_free);
+		return;
+	}
+
+	slot_free(zram, index);
+	slot_unlock(zram, index);
+}
+
 /*
  * No ->can_merge: block rules exist to grow bios on contiguous sectors and
  * matching blkcg.  zram already batches through swap_iocb, and
@@ -3069,6 +3084,7 @@ out:
 static const struct swap_ops zram_swap_ops = {
 	.submit_read		= zram_swap_submit_read,
 	.submit_write		= zram_swap_submit_write,
+	.slot_free_notify	= zram_swap_slot_free_notify,
 };
 
 #endif /* CONFIG_SWAP */
@@ -3076,7 +3092,6 @@ static const struct swap_ops zram_swap_ops = {
 static const struct block_device_operations zram_devops = {
 	.open = zram_open,
 	.submit_bio = zram_submit_bio,
-	.swap_slot_free_notify = zram_slot_free_notify,
 	.owner = THIS_MODULE
 };
 
