@@ -2937,38 +2937,43 @@ static void zram_swap_submit_read(struct swap_io_ctx *ctx)
 	struct swap_iocb *sio = ctx->sio;
 	int nr = swap_iocb_nr_folios(sio);
 	bool failed = false;
-	int i, j;
-
-	/*
-	 * With a backing device configured, the batch may include ZRAM_WB
-	 * slots.  Fall back to the block read path for the whole iocb
-	 * instead of checking each slot.
-	 */
-#ifdef CONFIG_ZRAM_WRITEBACK
-	if (zram->backing_dev) {
-		swap_bdev_submit_read(ctx);
-		return;
-	}
-#endif
+	int i, j, ret = 0;
+	u32 idx = 0;
 
 	for (i = 0; i < nr; i++) {
 		struct folio *folio = swap_iocb_folio(sio, i);
 		u32 base = swp_offset(folio->swap);
 
 		for (j = 0; j < folio_nr_pages(folio); j++) {
-			u32 idx = base + j;
 			struct page *page = folio_page(folio, j);
 
-			if (zram_read_page(zram, page, idx, NULL) < 0) {
+			idx = base + j;
+			slot_lock(zram, idx);
+#ifdef CONFIG_ZRAM_WRITEBACK
+			if (unlikely(test_slot_flag(zram, idx, ZRAM_WB))) {
+				slot_unlock(zram, idx);
+				/*
+				 * Writeback slots still use the block read
+				 * path.  Fall back for the whole batch once
+				 * we hit one. backing_dev alone does not
+				 * mean every slot in the batch is WB.
+				 */
+				swap_bdev_submit_read(ctx);
+				return;
+			}
+#endif
+			ret = read_from_zspool(zram, page, idx);
+			if (!ret)
+				mark_slot_accessed(zram, idx);
+			slot_unlock(zram, idx);
+			if (ret) {
 				failed = true;
 				atomic64_inc(&zram->stats.failed_reads);
+				pr_alert_ratelimited("Read-error on swap-device %s at index %u: err=%d\n",
+						     zram->disk->disk_name, idx, ret);
 				goto out;
 			}
 			flush_dcache_page(page);
-
-			slot_lock(zram, idx);
-			mark_slot_accessed(zram, idx);
-			slot_unlock(zram, idx);
 		}
 	}
 out:
