@@ -40,6 +40,11 @@ struct swap_io_ctx {
  *             the iocb is full or the plug is flushed.
  * @submit_write: flush the accumulated write ctx to the backend.
  * @submit_read: flush the accumulated read ctx to the backend.
+ * @slot_free_notify: optional callback invoked when a swap slot
+ *                    becomes free. swap_range_free() calls it with the
+ *                    swap cluster lock held. The folio lock may also be
+ *                    held on swap-cache teardown paths. Must not sleep
+ *                    or block.
  */
 struct swap_ops {
 	unsigned int		flags;
@@ -49,6 +54,8 @@ struct swap_ops {
 					     size_t prev_folio_size, int rw);
 	void			(*submit_write)(struct swap_io_ctx *ctx);
 	void			(*submit_read)(struct swap_io_ctx *ctx);
+	void			(*slot_free_notify)(struct swap_info_struct *sis,
+						    unsigned long offset);
 };
 
 int swap_register_block_ops(const struct block_device_operations *fops,
