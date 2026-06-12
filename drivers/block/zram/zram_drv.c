@@ -34,6 +34,8 @@
 #include <linux/part_stat.h>
 #include <linux/kernel_read_file.h>
 #include <linux/rcupdate.h>
+#include <linux/swap.h>
+#include <linux/swapops.h>
 
 #include "zram_drv.h"
 
@@ -55,6 +57,9 @@ static unsigned int num_devices = 1;
 static size_t huge_class_size;
 
 static const struct block_device_operations zram_devops;
+#if IS_ENABLED(CONFIG_SWAP)
+static bool zram_swap_ops_registered;
+#endif
 
 static void slot_free(struct zram *zram, u32 index);
 #define slot_dep_map(zram, index) (&(zram)->table[(index)].dep_map)
@@ -2958,6 +2963,115 @@ static int zram_open(struct gendisk *disk, blk_mode_t mode)
 	return 0;
 }
 
+#if IS_ENABLED(CONFIG_SWAP)
+static void zram_swap_submit_read(struct swap_io_ctx *ctx)
+{
+	struct zram *zram = ctx->sis->bdev->bd_disk->private_data;
+	struct swap_iocb *sio = ctx->sio;
+	int nr = swap_iocb_nr_folios(sio);
+	bool failed = false;
+	int i, j;
+
+	/*
+	 * With a backing device configured, the batch may include ZRAM_WB
+	 * slots.  Fall back to the block read path for the whole iocb
+	 * instead of checking each slot.
+	 */
+#ifdef CONFIG_ZRAM_WRITEBACK
+	if (zram->backing_dev) {
+		swap_bdev_submit_read(ctx);
+		return;
+	}
+#endif
+
+	for (i = 0; i < nr; i++) {
+		struct folio *folio = swap_iocb_folio(sio, i);
+		u32 base = swp_offset(folio->swap);
+
+		for (j = 0; j < folio_nr_pages(folio); j++) {
+			u32 idx = base + j;
+			struct page *page = folio_page(folio, j);
+			int ret;
+
+			/*
+			 * read_from_zspool() and mark_slot_accessed() must run
+			 * under the same slot_lock.  zram_read_page() unlocks
+			 * before returning, which leaves a window where
+			 * writeback can pick an idle slot we just read.
+			 */
+			slot_lock(zram, idx);
+			ret = read_from_zspool(zram, page, idx);
+			if (!ret)
+				mark_slot_accessed(zram, idx);
+			slot_unlock(zram, idx);
+			if (ret) {
+				failed = true;
+				atomic64_inc(&zram->stats.failed_reads);
+				pr_alert_ratelimited("Read-error on swap-device %s at index %u: err=%d\n",
+						     zram->disk->disk_name, idx, ret);
+				goto out;
+			}
+			flush_dcache_page(page);
+		}
+	}
+out:
+	swap_read_end(sio, failed);
+}
+
+static void zram_swap_submit_write(struct swap_io_ctx *ctx)
+{
+	struct zram *zram = ctx->sis->bdev->bd_disk->private_data;
+	struct swap_iocb *sio = ctx->sio;
+	int nr = swap_iocb_nr_folios(sio);
+	bool failed = false;
+	int i, j, ret = 0;
+	u32 idx = 0;
+
+	for (i = 0; i < nr; i++) {
+		struct folio *folio = swap_iocb_folio(sio, i);
+		u32 base = swp_offset(folio->swap);
+
+		for (j = 0; j < folio_nr_pages(folio); j++) {
+			idx = base + j;
+			ret = zram_write_page(zram, folio_page(folio, j), idx);
+			if (ret) {
+				/*
+				 * Leave partial zram data in place, same as the bio
+				 * write path.  swap_write_end() re-dirties every
+				 * page in the batch so they stay in swapcache with
+				 * their swap entries.  Freeing zram slots here would
+				 * leave entries pointing at empty indices until
+				 * slot_free_notify runs.
+				 */
+				failed = true;
+				atomic64_inc(&zram->stats.failed_writes);
+				pr_alert_ratelimited("Write-error on swap-device %s at index %u: err=%d\n",
+						     zram->disk->disk_name, idx, ret);
+				goto out;
+			}
+			slot_lock(zram, idx);
+			mark_slot_accessed(zram, idx);
+			slot_unlock(zram, idx);
+		}
+	}
+out:
+	swap_write_end(sio, failed);
+}
+
+/*
+ * No ->can_merge: block rules exist to grow bios on contiguous sectors and
+ * matching blkcg.  zram already batches through swap_iocb, and
+ * submit_write() compresses each slot by index, not by sector layout.
+ * Reusing swap_bdev_can_merge() would only split batches without helping
+ * zspool I/O.
+ */
+static const struct swap_ops zram_swap_ops = {
+	.submit_read		= zram_swap_submit_read,
+	.submit_write		= zram_swap_submit_write,
+};
+
+#endif /* CONFIG_SWAP */
+
 static const struct block_device_operations zram_devops = {
 	.open = zram_open,
 	.submit_bio = zram_submit_bio,
@@ -3233,6 +3347,10 @@ static int zram_remove_cb(int id, void *ptr, void *data)
 
 static void destroy_devices(void)
 {
+#if IS_ENABLED(CONFIG_SWAP)
+	if (zram_swap_ops_registered)
+		swap_unregister_block_ops(&zram_devops);
+#endif
 	class_unregister(&zram_control_class);
 	idr_for_each(&zram_index_idr, &zram_remove_cb, NULL);
 	zram_debugfs_destroy();
@@ -3268,6 +3386,15 @@ static int __init zram_init(void)
 		cpuhp_remove_multi_state(CPUHP_ZCOMP_PREPARE);
 		return -EBUSY;
 	}
+
+#if IS_ENABLED(CONFIG_SWAP)
+	ret = swap_register_block_ops(&zram_devops, &zram_swap_ops);
+	if (ret) {
+		pr_err("zram: failed to register swap ops (%d)\n", ret);
+		goto out_error;
+	}
+	zram_swap_ops_registered = true;
+#endif
 
 	while (num_devices != 0) {
 		mutex_lock(&zram_index_mutex);
