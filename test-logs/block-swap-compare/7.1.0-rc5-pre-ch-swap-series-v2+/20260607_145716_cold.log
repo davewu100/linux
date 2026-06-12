@@ -1,0 +1,23 @@
+=== mode=cold flags=--cold --seed 42 --stride 64 --drop-caches gb=3 kernel=7.1.0-rc5-pre-ch-swap-series-v2+ ===
+block swap: /dev/loop28 -> /var/tmp/block-swap-bench.img
+NAME        TYPE      SIZE USED  PRIO
+/dev/loop28 partition  16G   0B 32767
+allocating 3 GB, 786432 pages, samples=12288 stride=64 random=1 seed=42 drop_caches=1 cold=1 swap=block
+samples=12288
+avg_ns=710
+p50_ns=539
+p99_ns=2165
+p999_ns=5179
+fault_samples=3072
+fault_samples=3072
+fault_avg_ns=1160
+fault_p50_ns=966
+fault_p99_ns=2747
+fault_p999_ns=6162
+pswpin_before=0
+pswpin_after=0
+pswpin_delta=0
+pswpin_per_sample=0.0000
+sink=1179648
+pswpin 0
+pswpout 783330

@@ -8,9 +8,14 @@ run_zram () {
 echo "--------------------"
 echo "running zram tests"
 echo "--------------------"
+make -s zram_swap_int 2>/dev/null || true
 ./zram01.sh
 echo ""
 ./zram02.sh
+echo ""
+./zram03.sh
+echo ""
+./zram04_loop_swap.sh
 }
 
 check_prereqs

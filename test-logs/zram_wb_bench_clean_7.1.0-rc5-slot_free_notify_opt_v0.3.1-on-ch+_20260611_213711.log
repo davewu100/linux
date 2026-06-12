@@ -1,0 +1,6 @@
+kernel=7.1.0-rc5-slot_free_notify_opt_v0.3.1-on-ch+
+timestamp=20260611_213711
+pswpin_at_start=pswpin 0
+pswpin_after_cleanup=pswpin 0
+== reset zram before benchmark ==
+./zram_wb_bench.sh: line 63: echo: write error: No such file or directory

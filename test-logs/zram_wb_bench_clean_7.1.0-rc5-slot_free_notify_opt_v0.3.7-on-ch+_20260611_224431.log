@@ -1,0 +1,149 @@
+kernel=7.1.0-rc5-slot_free_notify_opt_v0.3.7-on-ch+
+timestamp=20260611_224431
+pswpin_at_start=pswpin 0
+NAME       TYPE      SIZE USED PRIO
+/dev/zram0 partition  16G   0B  100
+pswpin_after_cleanup=pswpin 0
+== reset zram before benchmark ==
+Setting up swapspace version 1, size = 16 GiB (17179865088 bytes)
+no label, UUID=512fe7f1-5303-4418-b550-9100b28b88c3
+== /proc/vmstat ==
+pswpin 0
+pswpout 0
+== mm_stat ==
+    4096       74    12288        0    12288        0        0        0        0
+== bd_stat ==
+       0        0        0
+== io_stat ==
+       0        0 0        0
+bench flags: --cold --seed 42 --stride 64 --drop-caches
+== zspool swap-in benchmark ==
+== /proc/vmstat ==
+pswpin 0
+pswpout 0
+== mm_stat ==
+    4096       74    12288        0    12288        0        0        0        0
+== bd_stat ==
+       0        0        0
+== io_stat ==
+       0        0 0        0
+allocating 3 GB, 786432 pages, samples=12288 stride=64 writeback=0 random=1 seed=42 drop_caches=1 cold=1
+samples=12288
+avg_ns=4276
+p50_ns=3709
+p99_ns=12416
+p999_ns=20093
+fault_samples=7680
+fault_samples=7680
+fault_avg_ns=4860
+fault_p50_ns=4381
+fault_p99_ns=13842
+fault_p999_ns=21256
+bd_reads_before=0
+bd_reads_after=0
+bd_reads_delta=0
+bd_reads_per_sample=0.0000
+sink=1179648
+== /proc/vmstat ==
+pswpin 4608
+pswpout 783360
+== mm_stat ==
+    4096       74    12288        0 50147328        0        0        0        0
+== bd_stat ==
+       0        0        0
+== io_stat ==
+       0        0 0   786432
+== reset zram between benchmarks ==
+Setting up swapspace version 1, size = 16 GiB (17179865088 bytes)
+no label, UUID=8f38d245-cb48-451e-9e09-2b446dc6331e
+== /proc/vmstat ==
+pswpin 4608
+pswpout 783360
+== mm_stat ==
+    4096       74    12288        0    12288        0        0        0        0
+== bd_stat ==
+       0        0        0
+== io_stat ==
+       0        0 0        0
+== ZRAM_WB swap-in benchmark ==
+== /proc/vmstat ==
+pswpin 4608
+pswpout 783360
+== mm_stat ==
+    4096       74    12288        0    12288        0        0        0        0
+== bd_stat ==
+       0        0        0
+== io_stat ==
+       0        0 0        0
+allocating 3 GB, 786432 pages, samples=12288 stride=64 writeback=1 random=1 seed=42 drop_caches=1 cold=1
+samples=12288
+avg_ns=54758
+p50_ns=4677
+p99_ns=354185
+p999_ns=491302
+fault_samples=7678
+fault_samples=7678
+fault_avg_ns=85421
+fault_p50_ns=101798
+fault_p99_ns=394516
+fault_p999_ns=518287
+bd_reads_before=0
+bd_reads_after=4606
+bd_reads_delta=4606
+bd_reads_per_sample=0.3748
+sink=1179648
+== /proc/vmstat ==
+pswpin 9214
+pswpout 1566715
+== mm_stat ==
+    4096        0        0        0 50147328        0        0        0        0
+== bd_stat ==
+       1     4606   783356
+== io_stat ==
+       0        0 0   786427
+--------------------
+running zram tests
+--------------------
+create '1' zram device(s)
+zram modules already loaded, kernel supports zram-control interface
+all zram devices (/dev/zram1~1 successfully created
+set max_comp_streams to zram device(s)
+The device attribute max_comp_streams was deprecated in 4.7
+test that we can set compression algorithm
+supported algs: [lzo-rle] lzo lz4 lz4hc zstd deflate 842 
+/sys/block/zram1/comp_algorithm = 'lzo'
+zram set compression algorithm: OK
+set disk size to zram device(s)
+/sys/block/zram1/disksize = '2097152'
+zram set disksizes: OK
+set memory limit to zram device(s)
+/sys/block/zram1/mem_limit = '2M'
+zram set memory limit: OK
+make ext4 filesystem on /dev/zram1
+zram mkfs.ext4: OK
+mount /dev/zram1
+zram mount of zram device(s): OK
+fill zram1...
+zram1 can be filled with '1900' KB
+zram compression ratio: 21.59:1: OK
+zram cleanup
+zram01 : [PASS]
+
+create '1' zram device(s)
+zram modules already loaded, kernel supports zram-control interface
+all zram devices (/dev/zram1~1 successfully created
+set max_comp_streams to zram device(s)
+The device attribute max_comp_streams was deprecated in 4.7
+set disk size to zram device(s)
+/sys/block/zram1/disksize = '1048576'
+zram set disksizes: OK
+set memory limit to zram device(s)
+/sys/block/zram1/mem_limit = '1M'
+zram set memory limit: OK
+make swap with zram device(s)
+done with /dev/zram1
+zram making zram mkswap and swapon: OK
+zram swapoff: OK
+zram cleanup
+zram02 : [PASS]
+done: /mnt/data/kernel/clean/7.0_rc6/linux-7.0-rc6/test-logs/zram_wb_bench_clean_7.1.0-rc5-slot_free_notify_opt_v0.3.7-on-ch+_20260611_224431.log

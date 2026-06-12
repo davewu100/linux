@@ -19,11 +19,17 @@ CONFIG_ZSMALLOC=y
 ZRAM Testcases
 --------------
 zram_lib.sh: create library with initialization/cleanup functions
-zram.sh: For sanity check of CONFIG_ZRAM and to run zram01 and zram02
+zram.sh: runs zram01, zram02, zram03, and zram04_loop_swap
 
-Two functional tests: zram01 and zram02:
+Functional tests:
 zram01.sh: creates general purpose ram disks with ext4 filesystems
 zram02.sh: creates block device for swap
+zram03.sh: swap_ops path — swap integrity, slot_free_notify, writeback, cycles
+zram04_loop_swap.sh: loop block-device swap regression (stress-ng)
+
+Helpers / manual benchmark:
+zram_swap_int.c: mmap pattern verify after MADV_PAGEOUT (built as zram_swap_int)
+zram_wb_bench.c / zram_wb_bench.sh: writeback swap-in latency benchmark
 
 Commands required for testing:
  - bc

@@ -1,0 +1,101 @@
+kernel=7.1.0-rc5-slot_free_notify_opt_v0.3.5-on-ch+
+timestamp=20260611_214613
+pswpin_at_start=pswpin 9214
+pswpin_after_cleanup=pswpin 9214
+== reset zram before benchmark ==
+Setting up swapspace version 1, size = 16 GiB (17179865088 bytes)
+no label, UUID=f98c71c9-648f-4279-a3a4-c9ac7bb3b0dd
+== /proc/vmstat ==
+pswpin 9214
+pswpout 1566695
+== mm_stat ==
+    4096       74    12288        0    12288        0        0        0        0
+== bd_stat ==
+       0        0        0
+== io_stat ==
+       0        0 0        0
+bench flags: --cold --seed 42 --stride 64 --drop-caches
+== zspool swap-in benchmark ==
+== /proc/vmstat ==
+pswpin 9214
+pswpout 1566695
+== mm_stat ==
+    4096       74    12288        0    12288        0        0        0        0
+== bd_stat ==
+       0        0        0
+== io_stat ==
+       0        0 0        0
+allocating 3 GB, 786432 pages, samples=12288 stride=64 writeback=0 random=1 seed=42 drop_caches=1 cold=1
+samples=12288
+avg_ns=1721
+p50_ns=1456
+p99_ns=6260
+p999_ns=9563
+fault_samples=7680
+fault_samples=7680
+fault_avg_ns=1993
+fault_p50_ns=1637
+fault_p99_ns=6905
+fault_p999_ns=10478
+bd_reads_before=0
+bd_reads_after=0
+bd_reads_delta=0
+bd_reads_per_sample=0.0000
+sink=1179648
+== /proc/vmstat ==
+pswpin 13822
+pswpout 2350055
+== mm_stat ==
+    4096       74    12288        0 50147328        0        0        0        0
+== bd_stat ==
+       0        0        0
+== io_stat ==
+       0        0 0   786432
+== reset zram between benchmarks ==
+Setting up swapspace version 1, size = 16 GiB (17179865088 bytes)
+no label, UUID=96738b98-0bd3-469b-bb10-52ff36b2d532
+== /proc/vmstat ==
+pswpin 13822
+pswpout 2350055
+== mm_stat ==
+    4096       74    12288        0    12288        0        0        0        0
+== bd_stat ==
+       0        0        0
+== io_stat ==
+       0        0 0        0
+== ZRAM_WB swap-in benchmark ==
+== /proc/vmstat ==
+pswpin 13822
+pswpout 2350055
+== mm_stat ==
+    4096       74    12288        0    12288        0        0        0        0
+== bd_stat ==
+       0        0        0
+== io_stat ==
+       0        0 0        0
+allocating 3 GB, 786432 pages, samples=12288 stride=64 writeback=1 random=1 seed=42 drop_caches=1 cold=1
+samples=12288
+avg_ns=51767
+p50_ns=5117
+p99_ns=342699
+p999_ns=486024
+fault_samples=7680
+fault_samples=7680
+fault_avg_ns=80452
+fault_p50_ns=95705
+fault_p99_ns=371398
+fault_p999_ns=515329
+bd_reads_before=0
+bd_reads_after=4608
+bd_reads_delta=4608
+bd_reads_per_sample=0.3750
+sink=1179648
+== /proc/vmstat ==
+pswpin 18430
+pswpout 3133415
+== mm_stat ==
+    4096        0        0        0 50147328        0        0        0        0
+== bd_stat ==
+       1     4608   783361
+== io_stat ==
+       0        0 0   786432

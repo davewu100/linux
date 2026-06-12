@@ -1,0 +1,24 @@
+=== mode=legacy flags=--random --seed 42 --drop-caches gb=3 kernel=7.1.0-rc5-pre-ch-swap-series-v2+ ===
+mkswap: /dev/loop29: warning: wiping old swap signature.
+block swap: /dev/loop29 -> /var/tmp/block-swap-bench.img
+NAME        TYPE      SIZE USED  PRIO
+/dev/loop29 partition  16G   0B 32767
+allocating 3 GB, 786432 pages, samples=786432 stride=1 random=1 seed=42 drop_caches=1 cold=0 swap=block
+samples=786432
+avg_ns=507
+p50_ns=495
+p99_ns=674
+p999_ns=1080
+fault_samples=3072
+fault_samples=3072
+fault_avg_ns=1002
+fault_p50_ns=885
+fault_p99_ns=4619
+fault_p999_ns=5684
+pswpin_before=0
+pswpin_after=0
+pswpin_delta=0
+pswpin_per_sample=0.0000
+sink=100270080
+pswpin 0
+pswpout 1566660

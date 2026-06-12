@@ -1,0 +1,104 @@
+=== mode=legacy flags=--random --seed 42 --drop-caches gb=3 kernel=7.1.0-rc5-slot_free_notify_opt_v0.3.1-on-ch+ ===
+Setting up swapspace version 1, size = 16 GiB (17179865088 bytes)
+no label, UUID=7f2ae589-ded7-404e-8880-cad70be1a376
+backing loop: /dev/loop30
+/dev/loop30
+    4096       74    12288        0    12288        0        0        0        0
+       0        0        0
+== reset zram before benchmark ==
+Setting up swapspace version 1, size = 16 GiB (17179865088 bytes)
+no label, UUID=f8ca665b-824a-42f4-879e-33eb9aabbdaf
+== /proc/vmstat ==
+pswpin 36855
+pswpout 3133381
+== mm_stat ==
+    4096       74    12288        0    12288        0        0        0        0
+== bd_stat ==
+       0        0        0
+== io_stat ==
+       0        0 0        0
+bench flags: --random --seed 42 --drop-caches
+== zspool swap-in benchmark ==
+== /proc/vmstat ==
+pswpin 36855
+pswpout 3133381
+== mm_stat ==
+    4096       74    12288        0    12288        0        0        0        0
+== bd_stat ==
+       0        0        0
+== io_stat ==
+       0        0 0        0
+allocating 3 GB, 786432 pages, samples=786432 stride=1 writeback=0 random=1 seed=42 drop_caches=1 cold=0
+samples=786432
+avg_ns=889
+p50_ns=830
+p99_ns=1785
+p999_ns=5151
+fault_samples=24576
+fault_samples=24576
+fault_avg_ns=1483
+fault_p50_ns=1412
+fault_p99_ns=3060
+fault_p999_ns=6569
+bd_reads_before=0
+bd_reads_after=0
+bd_reads_delta=0
+bd_reads_per_sample=0.0000
+sink=100270080
+== /proc/vmstat ==
+pswpin 58359
+pswpout 3916740
+== mm_stat ==
+    4096       74    12288        0 50147328        0        0        0        0
+== bd_stat ==
+       0        0        0
+== io_stat ==
+       0        0 0   786431
+== reset zram between benchmarks ==
+Setting up swapspace version 1, size = 16 GiB (17179865088 bytes)
+no label, UUID=9568a25f-db12-447b-8140-2bc554ac64cc
+== /proc/vmstat ==
+pswpin 58359
+pswpout 3916740
+== mm_stat ==
+    4096       74    12288        0    12288        0        0        0        0
+== bd_stat ==
+       0        0        0
+== io_stat ==
+       0        0 0        0
+== ZRAM_WB swap-in benchmark ==
+== /proc/vmstat ==
+pswpin 58359
+pswpout 3916740
+== mm_stat ==
+    4096       74    12288        0    12288        0        0        0        0
+== bd_stat ==
+       0        0        0
+== io_stat ==
+       0        0 0        0
+allocating 3 GB, 786432 pages, samples=786432 stride=1 writeback=1 random=1 seed=42 drop_caches=1 cold=0
+samples=786432
+avg_ns=3294
+p50_ns=1069
+p99_ns=73059
+p999_ns=101322
+fault_samples=24576
+fault_samples=24576
+fault_avg_ns=64581
+fault_p50_ns=65520
+fault_p99_ns=126588
+fault_p999_ns=379160
+bd_reads_before=0
+bd_reads_after=21504
+bd_reads_delta=21504
+bd_reads_per_sample=0.0273
+sink=100270080
+== /proc/vmstat ==
+pswpin 79863
+pswpout 4700079
+== mm_stat ==
+    4096        0        0        0 50147328        0        0        0        0
+== bd_stat ==
+       1    21504   783340
+== io_stat ==
+       0        0 0   786411

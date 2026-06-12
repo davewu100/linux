@@ -1,0 +1,9 @@
+timestamp,kernel,mode,gb,avg_ns,p50_ns,p99_ns,p999_ns,fault_avg_ns,fault_p99_ns,pswpin_delta,pswpin_per_sample,log
+20260607_145600,7.1.0-rc5-ch-swap-series-v2+,cold,3,802,520,2290,7064,1627,6114,0,0.0000,/mnt/data/kernel/clean/7.0_rc6/linux-7.0-rc6/test-logs/block-swap-compare/7.1.0-rc5-ch-swap-series-v2+/20260607_145600_cold.log
+20260607_145600,7.1.0-rc5-ch-swap-series-v2+,legacy,3,529,508,706,1478,1135,3600,0,0.0000,/mnt/data/kernel/clean/7.0_rc6/linux-7.0-rc6/test-logs/block-swap-compare/7.1.0-rc5-ch-swap-series-v2+/20260607_145600_legacy.log
+20260607_145716,7.1.0-rc5-pre-ch-swap-series-v2+,cold,3,710,539,2165,5179,1160,2747,0,0.0000,/mnt/data/kernel/clean/7.0_rc6/linux-7.0-rc6/test-logs/block-swap-compare/7.1.0-rc5-pre-ch-swap-series-v2+/20260607_145716_cold.log
+20260607_145716,7.1.0-rc5-pre-ch-swap-series-v2+,legacy,3,507,495,674,1080,1002,4619,0,0.0000,/mnt/data/kernel/clean/7.0_rc6/linux-7.0-rc6/test-logs/block-swap-compare/7.1.0-rc5-pre-ch-swap-series-v2+/20260607_145716_legacy.log
+20260607_151414,7.1.0-rc5-pre-ch-swap-series-v2+,cold,3,690,505,2197,5612,1215,5181,0,0.0000,/mnt/data/kernel/clean/7.0_rc6/linux-7.0-rc6/test-logs/block-swap-compare/7.1.0-rc5-pre-ch-swap-series-v2+/20260607_151414_cold.log
+20260607_151414,7.1.0-rc5-pre-ch-swap-series-v2+,legacy,3,506,492,675,1755,1023,4648,0,0.0000,/mnt/data/kernel/clean/7.0_rc6/linux-7.0-rc6/test-logs/block-swap-compare/7.1.0-rc5-pre-ch-swap-series-v2+/20260607_151414_legacy.log
+20260607_153602,7.1.0-rc5-slot_free_notify_opt_v0.3.1-on-ch+,cold,3,688,508,2247,6151,1097,5441,0,0.0000,/mnt/data/kernel/clean/7.0_rc6/linux-7.0-rc6/test-logs/block-swap-compare/7.1.0-rc5-slot_free_notify_opt_v0.3.1-on-ch+/20260607_153602_cold.log
+20260607_153602,7.1.0-rc5-slot_free_notify_opt_v0.3.1-on-ch+,legacy,3,509,492,675,2455,1028,3717,0,0.0000,/mnt/data/kernel/clean/7.0_rc6/linux-7.0-rc6/test-logs/block-swap-compare/7.1.0-rc5-slot_free_notify_opt_v0.3.1-on-ch+/20260607_153602_legacy.log

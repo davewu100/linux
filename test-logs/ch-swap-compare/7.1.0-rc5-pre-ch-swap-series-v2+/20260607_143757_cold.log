@@ -1,0 +1,5 @@
+kernel=7.1.0-rc5-pre-ch-swap-series-v2+
+timestamp=20260607_143757
+gb=3
+=== mode=cold flags=--cold --seed 42 --stride 64 --drop-caches gb=3 kernel=7.1.0-rc5-pre-ch-swap-series-v2+ ===
+mkswap: cannot open /dev/zram0: No such device or address

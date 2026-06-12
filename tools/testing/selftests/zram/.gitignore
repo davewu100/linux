@@ -1,2 +1,4 @@
 # SPDX-License-Identifier: GPL-2.0-only
 err.log
+zram_swap_int
+zram_wb_bench

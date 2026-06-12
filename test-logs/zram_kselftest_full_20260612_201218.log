@@ -1,0 +1,154 @@
+[sudo] password for jianyuew: --------------------
+running zram tests
+--------------------
+create '1' zram device(s)
+zram modules already loaded, kernel supports zram-control interface
+all zram devices (/dev/zram1~1 successfully created
+set max_comp_streams to zram device(s)
+The device attribute max_comp_streams was deprecated in 4.7
+test that we can set compression algorithm
+supported algs: [lzo-rle] lzo lz4 lz4hc zstd deflate 842 
+/sys/block/zram1/comp_algorithm = 'lzo'
+zram set compression algorithm: OK
+set disk size to zram device(s)
+/sys/block/zram1/disksize = '2097152'
+zram set disksizes: OK
+set memory limit to zram device(s)
+/sys/block/zram1/mem_limit = '2M'
+zram set memory limit: OK
+make ext4 filesystem on /dev/zram1
+zram mkfs.ext4: OK
+mount /dev/zram1
+zram mount of zram device(s): OK
+fill zram1...
+zram1 can be filled with '1900' KB
+zram compression ratio: 21.59:1: OK
+zram cleanup
+zram01 : [PASS]
+
+create '1' zram device(s)
+zram modules already loaded, kernel supports zram-control interface
+all zram devices (/dev/zram1~1 successfully created
+set max_comp_streams to zram device(s)
+The device attribute max_comp_streams was deprecated in 4.7
+set disk size to zram device(s)
+/sys/block/zram1/disksize = '1048576'
+zram set disksizes: OK
+set memory limit to zram device(s)
+/sys/block/zram1/mem_limit = '1M'
+zram set memory limit: OK
+make swap with zram device(s)
+done with /dev/zram1
+zram making zram mkswap and swapon: OK
+zram swapoff: OK
+zram cleanup
+zram02 : [PASS]
+
+create '1' zram device(s)
+zram modules already loaded, kernel supports zram-control interface
+all zram devices (/dev/zram1~1 successfully created
+set max_comp_streams to zram device(s)
+The device attribute max_comp_streams was deprecated in 4.7
+== test_swap_integrity_zspool ==
+test that we can set compression algorithm
+supported algs: [lzo-rle] lzo lz4 lz4hc zstd deflate 842 
+/sys/block/zram1/comp_algorithm = 'lzo-rle'
+zram set compression algorithm: OK
+set disk size to zram device(s)
+/sys/block/zram1/disksize = '536870912'
+zram set disksizes: OK
+set memory limit to zram device(s)
+/sys/block/zram1/mem_limit = '512M'
+zram set memory limit: OK
+zram swap configured on /dev/zram1: OK
+zram_swap_int: 64 MB, 16384 pages, stride=1 seed=42 writeback=0
+bd_reads_before=0 bd_reads_after=0 delta=0
+notify_free=16384 mm_compr=73
+zspool swap integrity: OK
+zram swapoff: OK
+== test_slot_free_on_swapoff ==
+test that we can set compression algorithm
+supported algs: [lzo-rle] lzo lz4 lz4hc zstd deflate 842 
+/sys/block/zram1/comp_algorithm = 'lzo-rle'
+zram set compression algorithm: OK
+set disk size to zram device(s)
+/sys/block/zram1/disksize = '536870912'
+zram set disksizes: OK
+set memory limit to zram device(s)
+/sys/block/zram1/mem_limit = '512M'
+zram set memory limit: OK
+zram swap configured on /dev/zram1: OK
+zram_swap_int: 32 MB, 8192 pages, stride=4 seed=7 writeback=0
+bd_reads_before=0 bd_reads_after=0 delta=0
+notify_free=2033 mm_compr=73
+zram swapoff: OK
+FAIL: notify_free did not increase (2033 -> 2033)
+FAIL: mm_stat compr_data did not drop (73 -> 73)
+miss_free reasonable (0): OK
+== test_writeback_integrity ==
+test that we can set compression algorithm
+supported algs: [lzo-rle] lzo lz4 lz4hc zstd deflate 842 
+/sys/block/zram1/comp_algorithm = 'lzo-rle'
+zram set compression algorithm: OK
+set memory limit to zram device(s)
+/sys/block/zram1/mem_limit = '512M'
+zram set memory limit: OK
+zram writeback swap on /dev/zram1 backing /dev/loop28: OK
+expected backing reads but delta is 0
+zram_swap_int: 128 MB, 32768 pages, stride=4 seed=99 writeback=1
+bd_reads_before=0 bd_reads_after=0 delta=0
+notify_free=8179 mm_compr=0
+FAIL: writeback swap integrity
+zram swapoff: OK
+== test_swapoff_cycles ==
+test that we can set compression algorithm
+supported algs: [lzo-rle] lzo lz4 lz4hc zstd deflate 842 
+/sys/block/zram1/comp_algorithm = 'lzo-rle'
+zram set compression algorithm: OK
+set disk size to zram device(s)
+/sys/block/zram1/disksize = '536870912'
+zram set disksizes: OK
+set memory limit to zram device(s)
+/sys/block/zram1/mem_limit = '512M'
+zram set memory limit: OK
+zram swap configured on /dev/zram1: OK
+zram_swap_int: 16 MB, 4096 pages, stride=8 seed=1 writeback=0
+bd_reads_before=0 bd_reads_after=0 delta=0
+notify_free=512 mm_compr=73
+zram swapoff: OK
+test that we can set compression algorithm
+supported algs: [lzo-rle] lzo lz4 lz4hc zstd deflate 842 
+/sys/block/zram1/comp_algorithm = 'lzo-rle'
+zram set compression algorithm: OK
+set disk size to zram device(s)
+/sys/block/zram1/disksize = '536870912'
+zram set disksizes: OK
+set memory limit to zram device(s)
+/sys/block/zram1/mem_limit = '512M'
+zram set memory limit: OK
+zram swap configured on /dev/zram1: OK
+zram_swap_int: 16 MB, 4096 pages, stride=8 seed=2 writeback=0
+bd_reads_before=0 bd_reads_after=0 delta=0
+notify_free=512 mm_compr=73
+zram swapoff: OK
+test that we can set compression algorithm
+supported algs: [lzo-rle] lzo lz4 lz4hc zstd deflate 842 
+/sys/block/zram1/comp_algorithm = 'lzo-rle'
+zram set compression algorithm: OK
+set disk size to zram device(s)
+/sys/block/zram1/disksize = '536870912'
+zram set disksizes: OK
+set memory limit to zram device(s)
+/sys/block/zram1/mem_limit = '512M'
+zram set memory limit: OK
+zram swap configured on /dev/zram1: OK
+zram_swap_int: 16 MB, 4096 pages, stride=8 seed=3 writeback=0
+bd_reads_before=0 bd_reads_after=0 delta=0
+notify_free=512 mm_compr=73
+zram swapoff: OK
+swapoff cycles: OK
+zram cleanup
+zram03 : [FAIL]
+
+loop swap stress-ng: OK
+zram04_loop_swap : [PASS]

@@ -1,0 +1,45 @@
+[sudo] password for jianyuew: --------------------
+running zram tests
+--------------------
+create '1' zram device(s)
+zram modules already loaded, kernel supports zram-control interface
+all zram devices (/dev/zram1~1 successfully created
+set max_comp_streams to zram device(s)
+The device attribute max_comp_streams was deprecated in 4.7
+test that we can set compression algorithm
+supported algs: [lzo-rle] lzo lz4 lz4hc zstd deflate 842 
+/sys/block/zram1/comp_algorithm = 'lzo'
+zram set compression algorithm: OK
+set disk size to zram device(s)
+/sys/block/zram1/disksize = '2097152'
+zram set disksizes: OK
+set memory limit to zram device(s)
+/sys/block/zram1/mem_limit = '2M'
+zram set memory limit: OK
+make ext4 filesystem on /dev/zram1
+zram mkfs.ext4: OK
+mount /dev/zram1
+zram mount of zram device(s): OK
+fill zram1...
+zram1 can be filled with '1900' KB
+zram compression ratio: 31.66:1: OK
+zram cleanup
+zram01 : [PASS]
+
+create '1' zram device(s)
+zram modules already loaded, kernel supports zram-control interface
+all zram devices (/dev/zram1~1 successfully created
+set max_comp_streams to zram device(s)
+The device attribute max_comp_streams was deprecated in 4.7
+set disk size to zram device(s)
+/sys/block/zram1/disksize = '1048576'
+zram set disksizes: OK
+set memory limit to zram device(s)
+/sys/block/zram1/mem_limit = '1M'
+zram set memory limit: OK
+make swap with zram device(s)
+done with /dev/zram1
+zram making zram mkswap and swapon: OK
+zram swapoff: OK
+zram cleanup
+zram02 : [PASS]
