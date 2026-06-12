@@ -2931,21 +2931,49 @@ static int zram_open(struct gendisk *disk, blk_mode_t mode)
 }
 
 #if IS_ENABLED(CONFIG_SWAP)
+#ifdef CONFIG_ZRAM_WRITEBACK
+/*
+ * backing_dev being set does not mean every slot in the batch is
+ * writeback data.  Scan once so a zspool-only batch skips the block
+ * layer.  The read loop re-checks each slot under slot_lock and falls
+ * back to swap_bdev_submit_read() if a slot became ZRAM_WB after the
+ * scan, so we never drive WB through read_from_bdev_sync().
+ */
+static bool zram_swap_batch_has_wb(struct zram *zram, struct swap_iocb *sio)
+{
+	int nr = swap_iocb_nr_folios(sio);
+	int i, j;
+
+	for (i = 0; i < nr; i++) {
+		struct folio *folio = swap_iocb_folio(sio, i);
+		u32 base = swp_offset(folio->swap);
+
+		for (j = 0; j < folio_nr_pages(folio); j++) {
+			u32 idx = base + j;
+			bool wb;
+
+			slot_lock(zram, idx);
+			wb = test_slot_flag(zram, idx, ZRAM_WB);
+			slot_unlock(zram, idx);
+			if (wb)
+				return true;
+		}
+	}
+	return false;
+}
+#endif
+
 static void zram_swap_submit_read(struct swap_io_ctx *ctx)
 {
 	struct zram *zram = ctx->sis->bdev->bd_disk->private_data;
 	struct swap_iocb *sio = ctx->sio;
 	int nr = swap_iocb_nr_folios(sio);
 	bool failed = false;
-	int i, j;
+	int i, j, ret;
+	u32 idx;
 
-	/*
-	 * With a backing device configured, the batch may include ZRAM_WB
-	 * slots.  Fall back to the block read path for the whole iocb
-	 * instead of checking each slot.
-	 */
 #ifdef CONFIG_ZRAM_WRITEBACK
-	if (zram->backing_dev) {
+	if (zram->backing_dev && zram_swap_batch_has_wb(zram, sio)) {
 		swap_bdev_submit_read(ctx);
 		return;
 	}
@@ -2956,19 +2984,30 @@ static void zram_swap_submit_read(struct swap_io_ctx *ctx)
 		u32 base = swp_offset(folio->swap);
 
 		for (j = 0; j < folio_nr_pages(folio); j++) {
-			u32 idx = base + j;
 			struct page *page = folio_page(folio, j);
 
-			if (zram_read_page(zram, page, idx, NULL) < 0) {
+			idx = base + j;
+			slot_lock(zram, idx);
+#ifdef CONFIG_ZRAM_WRITEBACK
+			if (unlikely(zram->backing_dev &&
+				     test_slot_flag(zram, idx, ZRAM_WB))) {
+				slot_unlock(zram, idx);
+				swap_bdev_submit_read(ctx);
+				return;
+			}
+#endif
+			ret = read_from_zspool(zram, page, idx);
+			if (!ret)
+				mark_slot_accessed(zram, idx);
+			slot_unlock(zram, idx);
+			if (ret) {
 				failed = true;
 				atomic64_inc(&zram->stats.failed_reads);
+				pr_alert_ratelimited("Read-error on swap-device %s at index %u: err=%d\n",
+						     zram->disk->disk_name, idx, ret);
 				goto out;
 			}
 			flush_dcache_page(page);
-
-			slot_lock(zram, idx);
-			mark_slot_accessed(zram, idx);
-			slot_unlock(zram, idx);
 		}
 	}
 out:
