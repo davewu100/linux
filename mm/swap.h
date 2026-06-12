@@ -4,6 +4,7 @@
 
 #include <linux/atomic.h> /* for atomic_long_t */
 #include <linux/mm.h> /* for PAGE_SHIFT */
+#include <linux/swap.h>
 
 struct mempolicy;
 struct swap_iocb;
@@ -77,22 +78,6 @@ enum swap_cluster_flags {
 	CLUSTER_FLAG_FULL,
 	CLUSTER_FLAG_DISCARD,
 	CLUSTER_FLAG_MAX,
-};
-
-struct swap_io_ctx {
-	struct swap_iocb	*sio;
-	struct swap_info_struct	*sis;
-};
-
-#define SWAP_OPS_F_NOFS		(1U << 0)
-
-struct swap_ops {
-	unsigned int		flags;
-
-	bool (*can_merge)(struct folio *folio, struct folio *prev_folio,
-			size_t prev_folio_size, int rw);
-	void (*submit_write)(struct swap_io_ctx *ctx);
-	void (*submit_read)(struct swap_io_ctx *ctx);
 };
 
 #ifdef CONFIG_SWAP
@@ -472,6 +457,7 @@ static inline void __swap_cache_replace_folio(struct swap_cluster_info *ci,
 #endif /* CONFIG_SWAP */
 
 extern const struct swap_ops swap_bdev_ops;
+const struct swap_ops *lookup_swap_block_ops(struct swap_info_struct *sis);
 
 int shmem_writeout(struct swap_io_ctx *ctx, struct folio *folio,
 		struct list_head *folio_list);
