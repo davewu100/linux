@@ -19,6 +19,53 @@
 struct notifier_block;
 
 struct bio;
+struct block_device_operations;
+struct folio;
+struct swap_iocb;
+struct swap_info_struct;
+
+struct swap_io_ctx {
+	struct swap_iocb	*sio;
+	struct swap_info_struct	*sis;
+};
+
+/* Set when the swap backend requires GFP_NOFS allocations. */
+#define SWAP_OPS_F_NOFS		(1U << 0)
+
+/**
+ * struct swap_ops - per-swap-area I/O batching callbacks
+ * @can_merge: optional. Return true iff @folio can be appended to a ctx
+ *             that already holds @prev_folio of @prev_folio_size bytes.
+ *             When NULL, folios on the same swap area are batched until
+ *             the iocb is full or the plug is flushed.
+ * @submit_write: flush the accumulated write ctx to the backend.
+ * @submit_read: flush the accumulated read ctx to the backend.
+ * @slot_free_notify: optional callback invoked when a swap slot
+ *                    becomes free. swap_range_free() calls it with the
+ *                    swap cluster lock held. The folio lock may also be
+ *                    held on swap-cache teardown paths. Must not sleep
+ *                    or block.
+ */
+struct swap_ops {
+	unsigned int		flags;
+
+	bool			(*can_merge)(struct folio *folio,
+					     struct folio *prev_folio,
+					     size_t prev_folio_size, int rw);
+	void			(*submit_write)(struct swap_io_ctx *ctx);
+	void			(*submit_read)(struct swap_io_ctx *ctx);
+	void			(*slot_free_notify)(struct swap_info_struct *sis,
+						    unsigned long offset);
+};
+
+int swap_register_block_ops(const struct block_device_operations *fops,
+			    const struct swap_ops *ops);
+void swap_unregister_block_ops(const struct block_device_operations *fops);
+int swap_iocb_nr_folios(struct swap_iocb *sio);
+struct folio *swap_iocb_folio(struct swap_iocb *sio, int idx);
+void swap_read_end(struct swap_iocb *sio, bool failed);
+void swap_write_end(struct swap_iocb *sio, bool failed);
+void swap_bdev_submit_read(struct swap_io_ctx *ctx);
 
 #define SWAP_FLAG_PREFER	0x8000	/* set if swap priority specified */
 #define SWAP_FLAG_PRIO_MASK	0x7fff

@@ -24,6 +24,8 @@
 #include <linux/uio.h>
 #include <linux/sched/task.h>
 #include <linux/delayacct.h>
+#include <linux/export.h>
+#include <linux/mutex.h>
 #include <linux/zswap.h>
 #include "swap.h"
 #include "swap_table.h"
@@ -325,6 +327,8 @@ static bool swap_can_merge(struct swap_io_ctx *ctx, struct folio *folio,
 
 	if (ctx->sis != sis)
 		return false;
+	if (!sis->ops->can_merge)
+		return true;
 	return sis->ops->can_merge(folio, prev_folio, prev_folio_size, rw);
 }
 
@@ -482,7 +486,21 @@ finish:
 	delayacct_swapin_end();
 }
 
-static void swap_write_end(struct swap_iocb *sio, bool failed)
+/**
+ * swap_write_end - finish a swap write iocb
+ * @sio:    swap_iocb whose pages were just written
+ * @failed: true if any of the underlying writes failed
+ *
+ * Ends writeback on every page captured by @sio. On failure each page
+ * is also re-dirtied and PG_reclaim is cleared, mirroring the bio
+ * write completion path. @sio is returned to the swap iocb mempool.
+ *
+ * swap_ops providers must call this exactly once per submit_write()
+ * ctx (typically at the end of their submit_write callback).
+ *
+ * Context: any context the submit_write() callback runs in.
+ */
+void swap_write_end(struct swap_iocb *sio, bool failed)
 {
 	int p;
 
@@ -497,6 +515,7 @@ static void swap_write_end(struct swap_iocb *sio, bool failed)
 	}
 	mempool_free(sio, sio_pool);
 }
+EXPORT_SYMBOL_GPL(swap_write_end);
 
 static void swap_fs_write_complete(struct kiocb *iocb, long ret)
 {
@@ -532,7 +551,26 @@ static void end_swap_bio_write(struct bio *bio)
 	swap_write_end(sio, failed);
 }
 
-static void swap_read_end(struct swap_iocb *sio, bool failed)
+/**
+ * swap_read_end - finish a swap read iocb
+ * @sio:    swap_iocb whose folios were just read in
+ * @failed: true if any of the underlying reads failed
+ *
+ * Unlocks every folio captured by @sio. On success each folio is also
+ * marked uptodate and swap-in counters (PSWPIN, mTHP, memcg) are bumped
+ * by folio_nr_pages(). On failure folios are left not-uptodate so the
+ * caller observes the failure and retries or surfaces an error. @sio is
+ * returned to the swap iocb mempool.
+ *
+ * swap_ops providers must call this exactly once per submit_read() ctx
+ * (typically at the end of their submit_read callback). If the provider
+ * defers to swap_bdev_ops.submit_read() for fallback, the bdev path
+ * will call swap_read_end() itself and the provider must not call it
+ * again for the same ctx.
+ *
+ * Context: any context the submit_read() callback runs in.
+ */
+void swap_read_end(struct swap_iocb *sio, bool failed)
 {
 	int p;
 
@@ -553,6 +591,34 @@ static void swap_read_end(struct swap_iocb *sio, bool failed)
 
 	mempool_free(sio, sio_pool);
 }
+EXPORT_SYMBOL_GPL(swap_read_end);
+
+/**
+ * swap_iocb_nr_folios - number of folios in a swap I/O batch
+ * @sio: swap_iocb passed to a swap_ops submit callback.
+ *
+ * Returns how many folios the swap core has batched into @sio. Used
+ * together with swap_iocb_folio() so swap_ops providers can walk the
+ * batch without depending on the swap core's internal iocb layout.
+ */
+int swap_iocb_nr_folios(struct swap_iocb *sio)
+{
+	return sio->nr_bvecs;
+}
+EXPORT_SYMBOL_GPL(swap_iocb_nr_folios);
+
+/**
+ * swap_iocb_folio - folio at slot @idx in a swap I/O batch
+ * @sio: swap_iocb passed to a swap_ops submit callback.
+ * @idx: index in the range [0, swap_iocb_nr_folios(@sio)).
+ *
+ * Returns the folio at the given batch slot.
+ */
+struct folio *swap_iocb_folio(struct swap_iocb *sio, int idx)
+{
+	return page_folio(sio->bvecs[idx].bv_page);
+}
+EXPORT_SYMBOL_GPL(swap_iocb_folio);
 
 static void swap_fs_read_complete(struct kiocb *iocb, long ret)
 {
@@ -577,6 +643,18 @@ static void swap_bio_read_end_io(struct bio *bio)
 	swap_read_end(sio, failed);
 }
 
+/**
+ * swap_bdev_submit_write - default block-device write path for swap
+ * @ctx: in-progress submit_write context.
+ *
+ * Builds a bio for the accumulated ctx and submits it through the normal
+ * block layer. This is the submit_write implementation used by swap_bdev_ops
+ * for ordinary block swap areas. swap_ops providers that override submit_write
+ * (e.g. zram) but still fall back to the block layer for some I/Os should use
+ * their own bio construction; this function is not exported.
+ *
+ * Context: process context (may sleep if SWP_SYNCHRONOUS_IO is set).
+ */
 static void swap_bdev_submit_write(struct swap_io_ctx *ctx)
 {
 	struct swap_iocb *sio = ctx->sio;
@@ -597,7 +675,19 @@ static void swap_bdev_submit_write(struct swap_io_ctx *ctx)
 	}
 }
 
-static void swap_bdev_submit_read(struct swap_io_ctx *ctx)
+/**
+ * swap_bdev_submit_read - fall back to the default block-device read path
+ * @ctx: in-progress submit_read context.
+ *
+ * Builds a bio for the accumulated ctx and submits it through the
+ * normal block layer. swap_ops providers can call this when they
+ * cannot serve a particular ctx themselves (for example zram folios
+ * stored on a backing device). The bio completion path takes care of
+ * calling swap_read_end() on @ctx. The caller must not call it again.
+ *
+ * Context: any context the submit_read() callback runs in.
+ */
+void swap_bdev_submit_read(struct swap_io_ctx *ctx)
 {
 	struct swap_iocb *sio = ctx->sio;
 	struct bio *bio = &sio->bio;
@@ -622,6 +712,7 @@ static void swap_bdev_submit_read(struct swap_io_ctx *ctx)
 		submit_bio(bio);
 	}
 }
+EXPORT_SYMBOL_GPL(swap_bdev_submit_read);
 
 static bool swap_bdev_can_merge(struct folio *folio, struct folio *prev_folio,
 		size_t prev_folio_size, int rw)
@@ -639,6 +730,96 @@ const struct swap_ops swap_bdev_ops = {
 	.submit_read		= swap_bdev_submit_read,
 	.can_merge		= swap_bdev_can_merge,
 };
+
+static DEFINE_MUTEX(swap_block_ops_lock);
+static const struct block_device_operations *swap_block_fops;
+static const struct swap_ops *swap_block_ops;
+
+/**
+ * swap_register_block_ops - install swap callbacks for a block driver
+ * @fops: block_device_operations identifying the driver. Used as a
+ *        match key in setup_swap_extents(): a S_ISBLK swap area is
+ *        routed to @ops when its bdev's gendisk fops equals @fops.
+ * @ops:  swap_ops vtable selected for matching swap areas. Must populate
+ *        ->submit_read and ->submit_write. ->can_merge is optional.
+ *
+ * Lets a block driver (zram and similar) replace the default
+ * swap_bdev_ops with its own submit_read / submit_write implementation.
+ *
+ * Returns 0 on success, -EINVAL when @fops or @ops are bad (a required
+ * callback is missing), or -EBUSY when the single registration slot is
+ * already taken. That slot is enough while only zram needs custom swap I/O.
+ * Several block drivers would need a per-fops lookup table instead.
+ *
+ * Context: process context, may sleep.
+ */
+int swap_register_block_ops(const struct block_device_operations *fops,
+			    const struct swap_ops *ops)
+{
+	int ret;
+
+	if (WARN_ON_ONCE(!fops || !ops || !ops->submit_read ||
+			 !ops->submit_write))
+		return -EINVAL;
+
+	mutex_lock(&swap_block_ops_lock);
+	if (swap_block_fops || swap_block_ops) {
+		ret = -EBUSY;
+		goto out;
+	}
+	swap_block_fops = fops;
+	swap_block_ops = ops;
+	ret = 0;
+out:
+	mutex_unlock(&swap_block_ops_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(swap_register_block_ops);
+
+/**
+ * swap_unregister_block_ops - undo swap_register_block_ops()
+ * @fops: same block_device_operations passed to swap_register_block_ops().
+ *
+ * Clears the registered fops/ops slot so future swapon calls fall back
+ * to swap_bdev_ops. The @fops match acts as a soft owner check so a
+ * driver cannot accidentally tear down another driver's registration.
+ * A mismatch is treated as a bug and triggers WARN_ON_ONCE. Swap areas
+ * that already captured the registered ops keep their sis->ops pointer.
+ * The caller must ensure the module owning the ops outlives any such
+ * swap area. For block drivers this is guaranteed by the bdev open
+ * reference held across swapon.
+ * Calling unregister before a successful register is a no-op.
+ *
+ * Context: process context, may sleep.
+ */
+void swap_unregister_block_ops(const struct block_device_operations *fops)
+{
+	mutex_lock(&swap_block_ops_lock);
+	/* never registered or already unregistered. */
+	if (!swap_block_fops)
+		goto out;
+	if (WARN_ON_ONCE(swap_block_fops != fops))
+		goto out;
+	swap_block_fops = NULL;
+	swap_block_ops = NULL;
+out:
+	mutex_unlock(&swap_block_ops_lock);
+}
+EXPORT_SYMBOL_GPL(swap_unregister_block_ops);
+
+const struct swap_ops *lookup_swap_block_ops(struct swap_info_struct *sis)
+{
+	const struct swap_ops *ops = NULL;
+
+	if (!sis->bdev)
+		return NULL;
+
+	mutex_lock(&swap_block_ops_lock);
+	if (swap_block_fops && sis->bdev->bd_disk->fops == swap_block_fops)
+		ops = swap_block_ops;
+	mutex_unlock(&swap_block_ops_lock);
+	return ops;
+}
 
 static void swap_fs_submit(struct swap_io_ctx *ctx, int rw)
 {
