@@ -661,4 +661,24 @@ source "drivers/misc/mchp_pci1xxxx/Kconfig"
 source "drivers/misc/keba/Kconfig"
 source "drivers/misc/amd-sbi/Kconfig"
 source "drivers/misc/rp1/Kconfig"
+
+config KSERIAL
+	tristate "kserial: BTF-aware kernel serial protocol"
+	depends on DEBUG_INFO_BTF && BPF_SYSCALL
+	help
+	  Provides /dev/kserial, a character device that accepts raw kernel
+	  struct bytes from userspace together with a BTF type name.  The
+	  kernel walks the struct using vmlinux BTF, serialises every field
+	  into a protobuf-compatible binary message, and places the encoded
+	  message in a per-fd ring buffer that userspace can consume via
+	  read() or mmap().
+
+	  Wire format uses the same varint and wire-type encoding as protocol
+	  buffers, making the output compatible with any protobuf decoder
+	  (given a matching .proto schema).
+
+	  Requires CONFIG_DEBUG_INFO_BTF=y to provide vmlinux BTF.
+
+	  If unsure, say N.
+
 endmenu
