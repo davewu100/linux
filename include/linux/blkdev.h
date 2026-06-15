@@ -1679,8 +1679,6 @@ struct block_device_operations {
 	 */
 	int (*swap_activate)(struct swap_info_struct *sis, struct file *file,
 			     sector_t *span);
-	/* this callback is with swap_lock and sometimes page table lock held */
-	void (*swap_slot_free_notify) (struct block_device *, unsigned long);
 	int (*report_zones)(struct gendisk *, sector_t sector,
 			    unsigned int nr_zones,
 			    struct blk_report_zones_args *args);
