@@ -19,6 +19,38 @@
 struct notifier_block;
 
 struct bio;
+struct block_device_operations;
+struct folio;
+struct swap_iocb;
+struct swap_info_struct;
+
+struct swap_io_ctx {
+	struct swap_iocb	*sio;
+	struct swap_info_struct	*sis;
+};
+
+/* Set when the swap backend requires GFP_NOFS allocations. */
+#define SWAP_OPS_F_NOFS		(1U << 0)
+
+/**
+ * struct swap_ops - per-swap-area I/O batching callbacks
+ * @can_merge: optional. Return true iff @folio can be appended to a ctx
+ *             that already holds @prev_folio of @prev_folio_size bytes.
+ *             When NULL, folios on the same swap area are batched until
+ *             the iocb is full or the plug is flushed.
+ * @submit_write: flush the accumulated write ctx to the backend.
+ * @submit_read: flush the accumulated read ctx to the backend.
+ */
+struct swap_ops {
+	unsigned int		flags;
+
+	bool			(*can_merge)(struct folio *folio,
+					     struct folio *prev_folio,
+					     size_t prev_folio_size, int rw);
+	void			(*submit_write)(struct swap_io_ctx *ctx);
+	void			(*submit_read)(struct swap_io_ctx *ctx);
+};
+
 
 #define SWAP_FLAG_PREFER	0x8000	/* set if swap priority specified */
 #define SWAP_FLAG_PRIO_MASK	0x7fff
@@ -281,6 +313,12 @@ struct swap_info_struct {
 	struct list_head discard_clusters; /* discard clusters list */
 	struct plist_node avail_list;   /* entry in swap_avail_head */
 	const struct swap_ops *ops;
+	/*
+	 * Opaque backend context for custom swap_ops.  Block drivers
+	 * that install their own ops set this in ->swap_activate().
+	 * Cleared in destroy_swap_extents().
+	 */
+	void			*private_data;
 };
 
 static inline swp_entry_t page_swap_entry(struct page *page)
@@ -403,6 +441,7 @@ extern void __meminit kswapd_stop(int nid);
 #ifdef CONFIG_SWAP
 
 int swap_fs_activate(struct swap_info_struct *sis);
+int swap_bdev_activate(struct swap_info_struct *sis, sector_t *span);
 int add_swap_extent(struct swap_info_struct *sis, unsigned long start_page,
 		unsigned long nr_pages, sector_t start_block);
 int generic_swapfile_activate(struct swap_info_struct *, struct file *,
