@@ -34,6 +34,8 @@
 #include <linux/part_stat.h>
 #include <linux/kernel_read_file.h>
 #include <linux/rcupdate.h>
+#include <linux/swap.h>
+#include <linux/swapops.h>
 
 #include "zram_drv.h"
 
@@ -2958,12 +2960,176 @@ static int zram_open(struct gendisk *disk, blk_mode_t mode)
 	return 0;
 }
 
+#if IS_ENABLED(CONFIG_SWAP)
+static void zram_swap_submit_read(struct swap_io_ctx *ctx)
+{
+	struct zram *zram = ctx->sis->private_data;
+	struct swap_iocb *sio = ctx->sio;
+	int nr = swap_iocb_nr_folios(sio);
+	bool failed = false;
+	int i, j;
+
+	/*
+	 * With a backing device configured, the batch may include ZRAM_WB
+	 * slots.  Fall back to the block read path for the whole iocb
+	 * instead of checking each slot.
+	 */
+#ifdef CONFIG_ZRAM_WRITEBACK
+	if (zram->backing_dev) {
+		swap_bdev_submit_read(ctx);
+		return;
+	}
+#endif
+
+	for (i = 0; i < nr; i++) {
+		struct folio *folio = swap_iocb_folio(sio, i);
+		u32 base = swp_offset(folio->swap);
+
+		for (j = 0; j < folio_nr_pages(folio); j++) {
+			u32 idx = base + j;
+			struct page *page = folio_page(folio, j);
+			int ret;
+
+			slot_lock(zram, idx);
+			ret = read_from_zspool(zram, page, idx);
+			if (!ret)
+				mark_slot_accessed(zram, idx);
+			slot_unlock(zram, idx);
+			if (ret) {
+				failed = true;
+				atomic64_inc(&zram->stats.failed_reads);
+				pr_alert_ratelimited("Read-error on swap-device %s at index %u: err=%d\n",
+						     zram->disk->disk_name, idx, ret);
+				goto out;
+			}
+			flush_dcache_page(page);
+		}
+	}
+out:
+	swap_read_end(sio, failed);
+}
+
+static void zram_swap_submit_write(struct swap_io_ctx *ctx)
+{
+	struct zram *zram = ctx->sis->private_data;
+	struct swap_iocb *sio = ctx->sio;
+	int nr = swap_iocb_nr_folios(sio);
+	bool failed = false;
+	int i, j, ret = 0;
+	u32 idx = 0;
+
+	for (i = 0; i < nr; i++) {
+		struct folio *folio = swap_iocb_folio(sio, i);
+		u32 base = swp_offset(folio->swap);
+
+		for (j = 0; j < folio_nr_pages(folio); j++) {
+			idx = base + j;
+			ret = zram_write_page(zram, folio_page(folio, j), idx);
+			if (ret) {
+				/*
+				 * Leave partial zram data in place, same as the bio
+				 * write path.  swap_write_end() re-dirties every
+				 * page in the batch so they stay in swapcache with
+				 * their swap entries.  Freeing zram slots here would
+				 * leave entries pointing at empty indices until
+				 * slot_free_notify runs.
+				 */
+				failed = true;
+				atomic64_inc(&zram->stats.failed_writes);
+				pr_alert_ratelimited("Write-error on swap-device %s at index %u: err=%d\n",
+						     zram->disk->disk_name, idx, ret);
+				goto out;
+			}
+			slot_lock(zram, idx);
+			mark_slot_accessed(zram, idx);
+			slot_unlock(zram, idx);
+		}
+	}
+out:
+	swap_write_end(sio, failed);
+}
+
+/*
+ * entry locking rules:
+ *
+ * 1) Lock is exclusive
+ *
+ * 2) lock() function can sleep waiting for the lock
+ *
+ * 3) Lock owner can sleep
+ *
+ * 4) Use TRY lock variant when in atomic context
+ *    - must check return value and handle locking failures
+ */
+static __must_check bool slot_trylock(struct zram *zram, u32 index)
+{
+	unsigned long *lock = &zram->table[index].__lock;
+
+	if (!test_and_set_bit_lock(ZRAM_ENTRY_LOCK, lock)) {
+		mutex_acquire(slot_dep_map(zram, index), 0, 1, _RET_IP_);
+		lock_acquired(slot_dep_map(zram, index), _RET_IP_);
+		return true;
+	}
+
+	return false;
+}
+
+/*
+ * swap_range_free() holds the swap cluster lock. Use slot_trylock() so
+ * we never block on a slot that is already locked elsewhere.
+ */
+static void zram_swap_slot_free_notify(struct swap_info_struct *sis,
+				       unsigned long index)
+{
+	struct zram *zram = sis->private_data;
+
+	atomic64_inc(&zram->stats.notify_free);
+	if (!slot_trylock(zram, index)) {
+		atomic64_inc(&zram->stats.miss_free);
+		return;
+	}
+
+	slot_free(zram, index);
+	slot_unlock(zram, index);
+}
+
+/*
+ * No ->can_merge: block rules exist to grow bios on contiguous sectors and
+ * matching blkcg.  zram already batches through swap_iocb, and
+ * submit_write() compresses each slot by index, not by sector layout.
+ * Reusing swap_bdev_can_merge() would only split batches without helping
+ * zspool I/O.
+ */
+
+static int zram_swap_activate(struct swap_info_struct *sis,
+			      struct file __maybe_unused *file,
+			      sector_t *span)
+{
+	int ret;
+
+	sis->private_data = sis->bdev->bd_disk->private_data;
+	sis->ops = &zram_swap_ops;
+	ret = add_swap_extent(sis, 0, sis->max, 0);
+	if (ret < 0)
+		return ret;
+	*span = sis->pages;
+	return ret;
+}
+
+static const struct swap_ops zram_swap_ops = {
+	.submit_read		= zram_swap_submit_read,
+	.submit_write		= zram_swap_submit_write,
+};
+
+#else
 static const struct block_device_operations zram_devops = {
 	.open = zram_open,
 	.submit_bio = zram_submit_bio,
+	.swap_activate = zram_swap_activate,
 	.swap_slot_free_notify = zram_slot_free_notify,
 	.owner = THIS_MODULE
 };
+#endif /* CONFIG_SWAP */
 
 static DEVICE_ATTR_RO(io_stat);
 static DEVICE_ATTR_RO(mm_stat);

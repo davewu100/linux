@@ -500,6 +500,7 @@ void swap_write_end(struct swap_iocb *sio, bool failed)
 	}
 	mempool_free(sio, sio_pool);
 }
+EXPORT_SYMBOL_GPL(swap_write_end);
 
 static void swap_fs_write_complete(struct kiocb *iocb, long ret)
 {
@@ -640,6 +641,7 @@ void swap_bdev_submit_read(struct swap_io_ctx *ctx)
 		submit_bio(bio);
 	}
 }
+EXPORT_SYMBOL_GPL(swap_bdev_submit_read);
 
 static bool swap_bdev_can_merge(struct folio *folio, struct folio *prev_folio,
 		size_t prev_folio_size, int rw)
