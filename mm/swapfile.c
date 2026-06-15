@@ -2759,6 +2759,9 @@ static void destroy_swap_extents(struct swap_info_struct *sis,
 		if (mapping->a_ops->swap_deactivate)
 			mapping->a_ops->swap_deactivate(swap_file);
 	}
+
+	sis->ops = NULL;
+	sis->private_data = NULL;
 }
 
 /*
@@ -2846,13 +2849,22 @@ static int setup_swap_extents(struct swap_info_struct *sis,
 	if (ret)
 		return ret;
 
-	sis->ops = &swap_bdev_ops;
-
 	if (S_ISBLK(inode->i_mode)) {
-		ret = add_swap_extent(sis, 0, sis->max, 0);
-		*span = sis->pages;
-		return ret;
+		const struct block_device_operations *fops =
+			sis->bdev->bd_disk->fops;
+
+		if (fops && fops->swap_activate)
+			return fops->swap_activate(sis, swap_file, span);
+
+		return swap_bdev_activate(sis, span);
 	}
+
+	/*
+	 * Default ops for file-based swap.  swap_fs_activate() (called by
+	 * shmem/NFS/CIFS) will override this with &swap_fs_ops.  iomap-based
+	 * filesystems (XFS, btrfs, f2fs, ext4 ...) keep this default.
+	 */
+	sis->ops = &swap_bdev_ops;
 
 	if (mapping->a_ops->swap_activate) {
 		ret = mapping->a_ops->swap_activate(sis, swap_file, span);

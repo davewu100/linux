@@ -325,6 +325,8 @@ static bool swap_can_merge(struct swap_io_ctx *ctx, struct folio *folio,
 
 	if (ctx->sis != sis)
 		return false;
+	if (!sis->ops->can_merge)
+		return true;
 	return sis->ops->can_merge(folio, prev_folio, prev_folio_size, rw);
 }
 
@@ -482,7 +484,8 @@ finish:
 	delayacct_swapin_end();
 }
 
-static void swap_write_end(struct swap_iocb *sio, bool failed)
+/* Must be called exactly once per submit_write() ctx; failure re-dirties all pages. */
+void swap_write_end(struct swap_iocb *sio, bool failed)
 {
 	int p;
 
@@ -532,7 +535,8 @@ static void end_swap_bio_write(struct bio *bio)
 	swap_write_end(sio, failed);
 }
 
-static void swap_read_end(struct swap_iocb *sio, bool failed)
+/* Must be called exactly once per submit_read() ctx. Do not call after swap_bdev_submit_read(). */
+void swap_read_end(struct swap_iocb *sio, bool failed)
 {
 	int p;
 
@@ -553,6 +557,19 @@ static void swap_read_end(struct swap_iocb *sio, bool failed)
 
 	mempool_free(sio, sio_pool);
 }
+EXPORT_SYMBOL_GPL(swap_read_end);
+
+int swap_iocb_nr_folios(struct swap_iocb *sio)
+{
+	return sio->nr_bvecs;
+}
+EXPORT_SYMBOL_GPL(swap_iocb_nr_folios);
+
+struct folio *swap_iocb_folio(struct swap_iocb *sio, int idx)
+{
+	return page_folio(sio->bvecs[idx].bv_page);
+}
+EXPORT_SYMBOL_GPL(swap_iocb_folio);
 
 static void swap_fs_read_complete(struct kiocb *iocb, long ret)
 {
@@ -597,7 +614,8 @@ static void swap_bdev_submit_write(struct swap_io_ctx *ctx)
 	}
 }
 
-static void swap_bdev_submit_read(struct swap_io_ctx *ctx)
+/* Submits a bio read; completion calls swap_read_end()—caller must not call it again. */
+void swap_bdev_submit_read(struct swap_io_ctx *ctx)
 {
 	struct swap_iocb *sio = ctx->sio;
 	struct bio *bio = &sio->bio;
@@ -639,6 +657,18 @@ const struct swap_ops swap_bdev_ops = {
 	.submit_read		= swap_bdev_submit_read,
 	.can_merge		= swap_bdev_can_merge,
 };
+int swap_bdev_activate(struct swap_info_struct *sis, sector_t *span)
+{
+	int ret;
+
+	sis->ops = &swap_bdev_ops;
+	ret = add_swap_extent(sis, 0, sis->max, 0);
+	if (ret < 0)
+		return ret;
+	*span = sis->pages;
+	return ret;
+}
+EXPORT_SYMBOL_GPL(swap_bdev_activate);
 
 static void swap_fs_submit(struct swap_io_ctx *ctx, int rw)
 {

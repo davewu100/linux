@@ -43,6 +43,7 @@ struct hd_geometry;
 struct blk_report_zones_args;
 struct blk_queue_stats;
 struct blk_stat_callback;
+struct swap_info_struct;
 struct blk_crypto_profile;
 
 extern const struct device_type disk_type;
@@ -1669,6 +1670,15 @@ struct block_device_operations {
 	int (*getgeo)(struct gendisk *, struct hd_geometry *);
 	int (*set_read_only)(struct block_device *bdev, bool ro);
 	void (*free_disk)(struct gendisk *disk);
+	/*
+	 * Optional swap setup for block-device swap targets.  Called from
+	 * setup_swap_extents() when swapon targets this bdev.  The driver
+	 * should install sis->ops, call add_swap_extent(), and return its
+	 * value (negative errno on error, 0 or 1 on success).
+	 * When NULL, the core uses swap_bdev_activate().
+	 */
+	int (*swap_activate)(struct swap_info_struct *sis, struct file *file,
+			     sector_t *span);
 	/* this callback is with swap_lock and sometimes page table lock held */
 	void (*swap_slot_free_notify) (struct block_device *, unsigned long);
 	int (*report_zones)(struct gendisk *, sector_t sector,

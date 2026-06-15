@@ -144,6 +144,7 @@ impl GenDiskBuilder {
             owner: core::ptr::null_mut(),
             pr_ops: core::ptr::null_mut(),
             free_disk: None,
+            swap_activate: None,
             poll_bio: None,
         };
 
