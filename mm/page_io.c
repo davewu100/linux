@@ -24,6 +24,8 @@
 #include <linux/uio.h>
 #include <linux/sched/task.h>
 #include <linux/delayacct.h>
+#include <linux/export.h>
+#include <linux/mutex.h>
 #include <linux/zswap.h>
 #include "swap.h"
 #include "swap_table.h"
@@ -325,6 +327,8 @@ static bool swap_can_merge(struct swap_io_ctx *ctx, struct folio *folio,
 
 	if (ctx->sis != sis)
 		return false;
+	if (!sis->ops->can_merge)
+		return true;
 	return sis->ops->can_merge(folio, prev_folio, prev_folio_size, rw);
 }
 
@@ -577,6 +581,18 @@ static void swap_bio_read_end_io(struct bio *bio)
 	swap_read_end(sio, failed);
 }
 
+/**
+ * swap_bdev_submit_write - default block-device write path for swap
+ * @ctx: in-progress submit_write context.
+ *
+ * Builds a bio for the accumulated ctx and submits it through the normal
+ * block layer. This is the submit_write implementation used by swap_bdev_ops
+ * for ordinary block swap areas. swap_ops providers that override submit_write
+ * (e.g. zram) but still fall back to the block layer for some I/Os should use
+ * their own bio construction, this function is not exported.
+ *
+ * Context: process context (may sleep if SWP_SYNCHRONOUS_IO is set).
+ */
 static void swap_bdev_submit_write(struct swap_io_ctx *ctx)
 {
 	struct swap_iocb *sio = ctx->sio;
@@ -639,6 +655,18 @@ const struct swap_ops swap_bdev_ops = {
 	.submit_read		= swap_bdev_submit_read,
 	.can_merge		= swap_bdev_can_merge,
 };
+
+int swap_bdev_activate(struct swap_info_struct *sis, sector_t *span)
+{
+	int ret;
+
+	sis->ops = &swap_bdev_ops;
+	ret = add_swap_extent(sis, 0, sis->max, 0);
+	if (!ret)
+		*span = sis->pages;
+	return ret;
+}
+EXPORT_SYMBOL_GPL(swap_bdev_activate);
 
 static void swap_fs_submit(struct swap_io_ctx *ctx, int rw)
 {
