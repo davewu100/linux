@@ -265,6 +265,13 @@ struct swap_backend_ops {
 	int (*load)(struct swap_info_struct *si, unsigned long offset,
 		    void *dst, unsigned int *len);
 	/*
+	 * Read @folio from @offset when the slot bypasses compressed blobs
+	 * (for example zram writeback).  Return 0 on success, -EOPNOTSUPP
+	 * to fall back to load() plus core decompress, or another errno.
+	 */
+	int (*read_folio)(struct swap_info_struct *si, struct folio *folio,
+			  unsigned long offset);
+	/*
 	 * Called when swap slots are freed in swap_range_free().  May run
 	 * under swap_lock and sometimes with the page table lock held.
 	 */

@@ -3132,6 +3132,13 @@ static int zram_backend_load(struct swap_info_struct *si, unsigned long offset,
 		goto unlock;
 	}
 
+#ifdef CONFIG_ZRAM_WRITEBACK
+	if (test_slot_flag(zram, offset, ZRAM_WB)) {
+		ret = -EOPNOTSUPP;
+		goto unlock;
+	}
+#endif
+
 	if (test_slot_flag(zram, offset, ZRAM_SAME)) {
 		zram_fill_page(dst, PAGE_SIZE, get_slot_handle(zram, offset));
 		*len = PAGE_SIZE;
@@ -3155,9 +3162,63 @@ unlock:
 	return ret;
 }
 
+#ifdef CONFIG_ZRAM_WRITEBACK
+static int zram_backend_read_folio(struct swap_info_struct *si,
+				     struct folio *folio, unsigned long offset)
+{
+	struct zram *zram = si->bdev->bd_disk->private_data;
+	unsigned int i;
+	int ret = 0;
+
+	for (i = 0; i < folio_nr_pages(folio); i++) {
+		unsigned long index = offset + i;
+
+		slot_lock(zram, index);
+		if (!get_slot_handle(zram, index) ||
+		    !test_slot_flag(zram, index, ZRAM_WB)) {
+			slot_unlock(zram, index);
+			return -EOPNOTSUPP;
+		}
+		slot_unlock(zram, index);
+	}
+
+	for (i = 0; i < folio_nr_pages(folio); i++) {
+		unsigned long index = offset + i;
+		struct page *page = folio_page(folio, i);
+		unsigned long blk_idx;
+
+		slot_lock(zram, index);
+		blk_idx = get_slot_handle(zram, index);
+		slot_unlock(zram, index);
+
+		atomic64_inc(&zram->stats.bd_reads);
+		ret = read_from_bdev_sync(zram, page, index, blk_idx);
+		if (!ret) {
+			slot_lock(zram, index);
+			mark_slot_accessed(zram, index);
+			slot_unlock(zram, index);
+		} else {
+			atomic64_inc(&zram->stats.failed_reads);
+			pr_alert_ratelimited("Read-error on swap-device %s at index %lu: err=%d\n",
+					     zram->disk->disk_name, index, ret);
+			return ret;
+		}
+	}
+
+	return 0;
+}
+#else
+static int zram_backend_read_folio(struct swap_info_struct *si,
+				     struct folio *folio, unsigned long offset)
+{
+	return -EOPNOTSUPP;
+}
+#endif
+
 static const struct swap_backend_ops zram_swap_backend_ops = {
 	.store = zram_backend_store,
 	.load = zram_backend_load,
+	.read_folio = zram_backend_read_folio,
 	.drop = zram_backend_drop,
 };
 

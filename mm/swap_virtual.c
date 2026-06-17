@@ -9,6 +9,7 @@
  * opaque blobs.
  */
 #include <linux/kernel_stat.h>
+#include <linux/highmem.h>
 #include <linux/swap.h>
 #include <linux/swap_compress.h>
 #include <linux/zswap.h>
@@ -24,6 +25,16 @@ bool swap_virtual_try_store(struct folio *folio)
 	}
 #endif
 	return false;
+}
+
+static void swap_virtual_read_done(struct folio *folio)
+{
+	flush_dcache_folio(folio);
+	count_mthp_stat(folio_order(folio), MTHP_STAT_SWPIN);
+	count_memcg_folio_events(folio, PSWPIN, folio_nr_pages(folio));
+	count_vm_events(PSWPIN, folio_nr_pages(folio));
+	folio_mark_uptodate(folio);
+	folio_unlock(folio);
 }
 
 #if IS_ENABLED(CONFIG_SWAP_COMPRESS)
@@ -71,59 +82,69 @@ bool swap_virtual_backend_write(struct folio *folio,
 	folio_unlock(folio);
 	return true;
 }
-
-bool swap_virtual_backend_read(struct folio *folio,
-			       struct swap_info_struct *sis)
-{
-	struct zcomp_strm *zstrm;
-	unsigned long offset = swp_offset(folio->swap);
-	unsigned int comp_len;
-	void *mem, *buf;
-	int ret;
-
-	if (!sis->backend_ops || !sis->backend_ops->load)
-		return false;
-
-	zstrm = swap_compress_stream_get();
-	if (!zstrm)
-		return false;
-
-	buf = swap_compress_buffer(zstrm);
-	ret = sis->backend_ops->load(sis, offset, buf, &comp_len);
-	if (ret)
-		goto out;
-
-	mem = kmap_local_folio(folio, 0);
-	if (comp_len >= PAGE_SIZE)
-		memcpy(mem, buf, PAGE_SIZE);
-	else
-		ret = swap_decompress(zstrm, buf, comp_len, mem);
-	kunmap_local(mem);
-
-	if (!ret) {
-		count_mthp_stat(folio_order(folio), MTHP_STAT_SWPIN);
-		count_memcg_folio_events(folio, PSWPIN, folio_nr_pages(folio));
-		count_vm_events(PSWPIN, folio_nr_pages(folio));
-		folio_mark_uptodate(folio);
-		folio_unlock(folio);
-	}
-out:
-	swap_compress_stream_put(zstrm);
-	return !ret;
-}
 #else
 bool swap_virtual_backend_write(struct folio *folio,
 				struct swap_info_struct *sis)
 {
 	return false;
 }
+#endif
 
 bool swap_virtual_backend_read(struct folio *folio,
 			       struct swap_info_struct *sis)
 {
+	unsigned long offset = swp_offset(folio->swap);
+	int ret;
+
+	if (!sis->backend_ops)
+		return false;
+
+	if (sis->backend_ops->read_folio) {
+		ret = sis->backend_ops->read_folio(sis, folio, offset);
+		if (ret == 0) {
+			swap_virtual_read_done(folio);
+			return true;
+		}
+		if (ret != -EOPNOTSUPP)
+			return false;
+	}
+
+#if IS_ENABLED(CONFIG_SWAP_COMPRESS)
+	{
+		struct zcomp_strm *zstrm;
+		unsigned int comp_len;
+		void *mem, *buf;
+
+		if (!sis->backend_ops->load)
+			return false;
+
+		zstrm = swap_compress_stream_get();
+		if (!zstrm)
+			return false;
+
+		buf = swap_compress_buffer(zstrm);
+		ret = sis->backend_ops->load(sis, offset, buf, &comp_len);
+		if (ret)
+			goto out_compress;
+
+		mem = kmap_local_folio(folio, 0);
+		if (comp_len >= PAGE_SIZE)
+			memcpy(mem, buf, PAGE_SIZE);
+		else
+			ret = swap_decompress(zstrm, buf, comp_len, mem);
+		kunmap_local(mem);
+
+		if (!ret) {
+			swap_compress_stream_put(zstrm);
+			swap_virtual_read_done(folio);
+			return true;
+		}
+out_compress:
+		swap_compress_stream_put(zstrm);
+	}
+#endif
 	return false;
 }
-#endif
 
 bool swap_virtual_try_read(struct folio *folio, struct swap_info_struct *sis)
 {
