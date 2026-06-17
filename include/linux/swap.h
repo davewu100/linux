@@ -253,6 +253,18 @@ struct swap_sequential_cluster {
  */
 struct swap_backend_ops {
 	/*
+	 * Store a compressed swap page blob for @offset.  Called from
+	 * the mm swap write path with compression already applied.
+	 */
+	int (*store)(struct swap_info_struct *si, unsigned long offset,
+		     const void *src, unsigned int len);
+	/*
+	 * Load a compressed blob for @offset into @dst.  @len is set to
+	 * the number of bytes stored in @dst on success.
+	 */
+	int (*load)(struct swap_info_struct *si, unsigned long offset,
+		    void *dst, unsigned int *len);
+	/*
 	 * Called when swap slots are freed in swap_range_free().  May run
 	 * under swap_lock and sometimes with the page table lock held.
 	 */

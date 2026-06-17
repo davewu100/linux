@@ -2303,6 +2303,62 @@ static int write_incompressible_page(struct zram *zram, struct page *page,
 	return 0;
 }
 
+static int zram_store_blob(struct zram *zram, u32 index, const void *src,
+			   unsigned int len)
+{
+	unsigned long handle;
+
+	if (len >= PAGE_SIZE) {
+		handle = zs_malloc(zram->mem_pool, PAGE_SIZE,
+				   GFP_NOIO | __GFP_NOWARN |
+				   __GFP_HIGHMEM | __GFP_MOVABLE, NUMA_NO_NODE);
+		if (IS_ERR_VALUE(handle))
+			return PTR_ERR((void *)handle);
+
+		if (!zram_can_store_page(zram)) {
+			zs_free(zram->mem_pool, handle);
+			return -ENOMEM;
+		}
+
+		zs_obj_write(zram->mem_pool, handle, (void *)src, PAGE_SIZE);
+
+		slot_lock(zram, index);
+		slot_free(zram, index);
+		set_slot_flag(zram, index, ZRAM_HUGE);
+		set_slot_handle(zram, index, handle);
+		set_slot_size(zram, index, PAGE_SIZE);
+		slot_unlock(zram, index);
+
+		atomic64_add(PAGE_SIZE, &zram->stats.compr_data_size);
+		atomic64_inc(&zram->stats.huge_pages);
+		atomic64_inc(&zram->stats.huge_pages_since);
+	} else {
+		handle = zs_malloc(zram->mem_pool, len,
+				   GFP_NOIO | __GFP_NOWARN |
+				   __GFP_HIGHMEM | __GFP_MOVABLE, NUMA_NO_NODE);
+		if (IS_ERR_VALUE(handle))
+			return PTR_ERR((void *)handle);
+
+		if (!zram_can_store_page(zram)) {
+			zs_free(zram->mem_pool, handle);
+			return -ENOMEM;
+		}
+
+		zs_obj_write(zram->mem_pool, handle, (void *)src, len);
+
+		slot_lock(zram, index);
+		slot_free(zram, index);
+		set_slot_handle(zram, index, handle);
+		set_slot_size(zram, index, len);
+		slot_unlock(zram, index);
+
+		atomic64_add(len, &zram->stats.compr_data_size);
+	}
+
+	atomic64_inc(&zram->stats.pages_stored);
+	return 0;
+}
+
 static int zram_write_page(struct zram *zram, struct page *page, u32 index)
 {
 	int ret = 0;
@@ -3049,7 +3105,59 @@ static void zram_backend_drop(struct swap_info_struct *si,
 	}
 }
 
+static int zram_backend_store(struct swap_info_struct *si, unsigned long offset,
+			      const void *src, unsigned int len)
+{
+	struct zram *zram = si->bdev->bd_disk->private_data;
+	int ret;
+
+	ret = zram_store_blob(zram, offset, src, len);
+	if (!ret)
+		mark_slot_accessed(zram, offset);
+	return ret;
+}
+
+static int zram_backend_load(struct swap_info_struct *si, unsigned long offset,
+			     void *dst, unsigned int *len)
+{
+	struct zram *zram = si->bdev->bd_disk->private_data;
+	unsigned long handle;
+	unsigned int size;
+	void *src;
+	int ret = 0;
+
+	slot_lock(zram, offset);
+	if (!get_slot_handle(zram, offset)) {
+		ret = -ENOENT;
+		goto unlock;
+	}
+
+	if (test_slot_flag(zram, offset, ZRAM_SAME)) {
+		zram_fill_page(dst, PAGE_SIZE, get_slot_handle(zram, offset));
+		*len = PAGE_SIZE;
+		goto unlock;
+	}
+
+	handle = get_slot_handle(zram, offset);
+	size = get_slot_size(zram, offset);
+	src = zs_obj_read_begin(zram->mem_pool, handle, size, NULL);
+	if (test_slot_flag(zram, offset, ZRAM_HUGE)) {
+		memcpy(dst, src, PAGE_SIZE);
+		*len = PAGE_SIZE;
+	} else {
+		memcpy(dst, src, size);
+		*len = size;
+	}
+	zs_obj_read_end(zram->mem_pool, handle, size, src);
+	mark_slot_accessed(zram, offset);
+unlock:
+	slot_unlock(zram, offset);
+	return ret;
+}
+
 static const struct swap_backend_ops zram_swap_backend_ops = {
+	.store = zram_backend_store,
+	.load = zram_backend_load,
 	.drop = zram_backend_drop,
 };
 

@@ -25,6 +25,7 @@
 #include <linux/sched/task.h>
 #include <linux/delayacct.h>
 #include <linux/zswap.h>
+#include <linux/swap_compress.h>
 #include "swap.h"
 #include "swap_table.h"
 
@@ -458,11 +459,106 @@ static void swap_writepage_bdev_async(struct folio *folio,
 	submit_bio(bio);
 }
 
+#if IS_ENABLED(CONFIG_SWAP_COMPRESS)
+static void swap_writepage_backend(struct folio *folio,
+				   struct swap_info_struct *sis)
+{
+	struct zcomp_strm *zstrm;
+	unsigned long offset = swp_offset(folio->swap);
+	unsigned int comp_len;
+	void *mem, *buf;
+	int ret;
+
+	zstrm = swap_compress_stream_get();
+	if (!zstrm)
+		goto err;
+
+	buf = swap_compress_buffer(zstrm);
+	mem = kmap_local_folio(folio, 0);
+	ret = swap_compress(zstrm, mem, &comp_len);
+	if (!ret) {
+		if (comp_len >= PAGE_SIZE)
+			ret = sis->backend_ops->store(sis, offset, mem, PAGE_SIZE);
+		else
+			ret = sis->backend_ops->store(sis, offset, buf, comp_len);
+	}
+	kunmap_local(mem);
+	swap_compress_stream_put(zstrm);
+
+	if (ret)
+		goto err;
+
+	count_swpout_vm_event(folio);
+	folio_start_writeback(folio);
+	folio_unlock(folio);
+	return;
+
+err:
+	folio_mark_dirty(folio);
+	folio_unlock(folio);
+}
+
+static bool swap_read_folio_backend(struct folio *folio,
+				    struct swap_info_struct *sis)
+{
+	struct zcomp_strm *zstrm;
+	unsigned long offset = swp_offset(folio->swap);
+	unsigned int comp_len;
+	void *mem, *buf;
+	int ret;
+
+	zstrm = swap_compress_stream_get();
+	if (!zstrm)
+		return false;
+
+	buf = swap_compress_buffer(zstrm);
+	ret = sis->backend_ops->load(sis, offset, buf, &comp_len);
+	if (ret)
+		goto out;
+
+	mem = kmap_local_folio(folio, 0);
+	if (comp_len >= PAGE_SIZE)
+		memcpy(mem, buf, PAGE_SIZE);
+	else
+		ret = swap_decompress(zstrm, buf, comp_len, mem);
+	kunmap_local(mem);
+
+	if (!ret) {
+		count_mthp_stat(folio_order(folio), MTHP_STAT_SWPIN);
+		count_memcg_folio_events(folio, PSWPIN, folio_nr_pages(folio));
+		count_vm_events(PSWPIN, folio_nr_pages(folio));
+		folio_mark_uptodate(folio);
+		folio_unlock(folio);
+	}
+out:
+	swap_compress_stream_put(zstrm);
+	return !ret;
+}
+#else
+static void swap_writepage_backend(struct folio *folio,
+				   struct swap_info_struct *sis)
+{
+	folio_mark_dirty(folio);
+	folio_unlock(folio);
+}
+
+static bool swap_read_folio_backend(struct folio *folio,
+				    struct swap_info_struct *sis)
+{
+	return false;
+}
+#endif
+
 void __swap_writepage(struct folio *folio, struct swap_iocb **swap_plug)
 {
 	struct swap_info_struct *sis = __swap_entry_to_info(folio->swap);
 
 	VM_BUG_ON_FOLIO(!folio_test_swapcache(folio), folio);
+
+	if (sis->backend_ops && sis->backend_ops->store) {
+		swap_writepage_backend(folio, sis);
+		return;
+	}
 	/*
 	 * ->flags can be updated non-atomically,
 	 * but that will never affect SWP_FS_OPS, so the data_race
@@ -682,6 +778,10 @@ void swap_read_folio(struct folio *folio, struct swap_iocb **plug)
 	}
 
 	if (zswap_load(folio) != -ENOENT)
+		goto finish;
+
+	if (sis->backend_ops && sis->backend_ops->load &&
+	    swap_read_folio_backend(folio, sis))
 		goto finish;
 
 	/* We have to read from slower devices. Increase zswap protection. */

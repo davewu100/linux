@@ -111,3 +111,9 @@ int swap_decompress(struct zcomp_strm *zstrm, const void *src, unsigned int src_
 	return zcomp_decompress(swap_comp, zstrm, src, src_len, dst);
 }
 EXPORT_SYMBOL_GPL(swap_decompress);
+
+void *swap_compress_buffer(struct zcomp_strm *zstrm)
+{
+	return zstrm->buffer;
+}
+EXPORT_SYMBOL_GPL(swap_compress_buffer);
