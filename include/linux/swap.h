@@ -31,6 +31,11 @@ struct bio;
 				 SWAP_FLAG_DISCARD_PAGES)
 #define SWAP_BATCH 64
 
+struct swap_info_struct;
+#if IS_ENABLED(CONFIG_ZRAM)
+int zram_setup_swap_backend(struct swap_info_struct *si);
+#endif
+
 static inline int current_is_kswapd(void)
 {
 	return current->flags & PF_KSWAPD;
@@ -246,6 +251,15 @@ struct swap_sequential_cluster {
 /*
  * The in-memory structure used to track swap areas.
  */
+struct swap_backend_ops {
+	/*
+	 * Called when swap slots are freed in swap_range_free().  May run
+	 * under swap_lock and sometimes with the page table lock held.
+	 */
+	void (*drop)(struct swap_info_struct *si, unsigned long offset,
+		     unsigned int nr);
+};
+
 struct swap_info_struct {
 	struct percpu_ref users;	/* indicate and keep swap device valid. */
 	unsigned long	flags;		/* SWP_USED etc: see above */
@@ -282,6 +296,7 @@ struct swap_info_struct {
 	struct work_struct reclaim_work; /* reclaim worker */
 	struct list_head discard_clusters; /* discard clusters list */
 	struct plist_node avail_list;   /* entry in swap_avail_head */
+	const struct swap_backend_ops *backend_ops;
 };
 
 static inline swp_entry_t page_swap_entry(struct page *page)

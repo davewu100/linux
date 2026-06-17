@@ -252,6 +252,9 @@ void swap_write_unplug(struct swap_iocb *sio);
 int swap_writeout(struct folio *folio, struct swap_iocb **swap_plug);
 void __swap_writepage(struct folio *folio, struct swap_iocb **swap_plug);
 
+/* linux/mm/swap_backend.c */
+void swap_backend_setup(struct swap_info_struct *si);
+
 /* linux/mm/swap_state.c */
 extern struct address_space swap_space __read_mostly;
 static inline struct address_space *swap_address_space(swp_entry_t entry)

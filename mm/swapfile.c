@@ -1310,23 +1310,34 @@ static void swap_range_alloc(struct swap_info_struct *si,
 static void swap_range_free(struct swap_info_struct *si, unsigned long offset,
 			    unsigned int nr_entries)
 {
+	unsigned long start = offset;
 	unsigned long end = offset + nr_entries - 1;
-	void (*swap_slot_free_notify)(struct block_device *, unsigned long);
 	unsigned int i;
 
 	for (i = 0; i < nr_entries; i++)
 		zswap_invalidate(swp_entry(si->type, offset + i));
 
-	if (si->flags & SWP_BLKDEV)
-		swap_slot_free_notify =
-			si->bdev->bd_disk->fops->swap_slot_free_notify;
-	else
-		swap_slot_free_notify = NULL;
 	while (offset <= end) {
 		arch_swap_invalidate_page(si->type, offset);
-		if (swap_slot_free_notify)
-			swap_slot_free_notify(si->bdev, offset);
 		offset++;
+	}
+
+	if (si->backend_ops && si->backend_ops->drop) {
+		si->backend_ops->drop(si, start, nr_entries);
+	} else {
+		void (*swap_slot_free_notify)(struct block_device *, unsigned long);
+
+		offset = start;
+		if (si->flags & SWP_BLKDEV)
+			swap_slot_free_notify =
+				si->bdev->bd_disk->fops->swap_slot_free_notify;
+		else
+			swap_slot_free_notify = NULL;
+		while (offset <= end) {
+			if (swap_slot_free_notify)
+				swap_slot_free_notify(si->bdev, offset);
+			offset++;
+		}
 	}
 
 	/*
@@ -2944,6 +2955,8 @@ static int setup_swap_extents(struct swap_info_struct *sis,
 	if (S_ISBLK(inode->i_mode)) {
 		ret = add_swap_extent(sis, 0, sis->max, 0);
 		*span = sis->pages;
+		if (ret >= 0)
+			swap_backend_setup(sis);
 		return ret;
 	}
 

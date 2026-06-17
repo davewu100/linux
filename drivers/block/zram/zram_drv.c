@@ -34,6 +34,7 @@
 #include <linux/part_stat.h>
 #include <linux/kernel_read_file.h>
 #include <linux/rcupdate.h>
+#include <linux/swap.h>
 #include <linux/swap_compress.h>
 
 #include "zram_drv.h"
@@ -2863,23 +2864,6 @@ static void zram_submit_bio(struct bio *bio)
 	}
 }
 
-static void zram_slot_free_notify(struct block_device *bdev,
-				unsigned long index)
-{
-	struct zram *zram;
-
-	zram = bdev->bd_disk->private_data;
-
-	atomic64_inc(&zram->stats.notify_free);
-	if (!slot_trylock(zram, index)) {
-		atomic64_inc(&zram->stats.miss_free);
-		return;
-	}
-
-	slot_free(zram, index);
-	slot_unlock(zram, index);
-}
-
 static void zram_comp_params_reset(struct zram *zram)
 {
 	u32 prio;
@@ -3043,9 +3027,46 @@ static int zram_open(struct gendisk *disk, blk_mode_t mode)
 static const struct block_device_operations zram_devops = {
 	.open = zram_open,
 	.submit_bio = zram_submit_bio,
-	.swap_slot_free_notify = zram_slot_free_notify,
 	.owner = THIS_MODULE
 };
+
+static void zram_backend_drop(struct swap_info_struct *si,
+			      unsigned long offset, unsigned int nr)
+{
+	struct zram *zram = si->bdev->bd_disk->private_data;
+	unsigned int i;
+
+	for (i = 0; i < nr; i++) {
+		unsigned long index = offset + i;
+
+		atomic64_inc(&zram->stats.notify_free);
+		if (!slot_trylock(zram, index)) {
+			atomic64_inc(&zram->stats.miss_free);
+			continue;
+		}
+		slot_free(zram, index);
+		slot_unlock(zram, index);
+	}
+}
+
+static const struct swap_backend_ops zram_swap_backend_ops = {
+	.drop = zram_backend_drop,
+};
+
+int zram_setup_swap_backend(struct swap_info_struct *si)
+{
+	struct gendisk *disk;
+
+	if (!(si->flags & SWP_BLKDEV) || !si->bdev)
+		return -ENODEV;
+	disk = si->bdev->bd_disk;
+	if (!disk || !disk->private_data || disk->fops != &zram_devops)
+		return -ENODEV;
+
+	si->backend_ops = &zram_swap_backend_ops;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(zram_setup_swap_backend);
 
 static DEVICE_ATTR_RO(io_stat);
 static DEVICE_ATTR_RO(mm_stat);
