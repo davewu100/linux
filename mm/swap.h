@@ -255,6 +255,11 @@ void __swap_writepage(struct folio *folio, struct swap_iocb **swap_plug);
 /* linux/mm/swap_backend.c */
 void swap_backend_setup(struct swap_info_struct *si);
 
+bool swap_virtual_try_store(struct folio *folio);
+bool swap_virtual_try_read(struct folio *folio, struct swap_info_struct *sis);
+bool swap_virtual_backend_write(struct folio *folio, struct swap_info_struct *sis);
+bool swap_virtual_backend_read(struct folio *folio, struct swap_info_struct *sis);
+
 /* linux/mm/swap_state.c */
 extern struct address_space swap_space __read_mostly;
 static inline struct address_space *swap_address_space(swp_entry_t entry)

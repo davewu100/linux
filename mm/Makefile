@@ -75,7 +75,7 @@ ifdef CONFIG_MMU
 	obj-$(CONFIG_ADVISE_SYSCALLS)	+= madvise.o
 endif
 
-obj-$(CONFIG_SWAP)	+= page_io.o swap_state.o swapfile.o swap_backend.o
+obj-$(CONFIG_SWAP)	+= page_io.o swap_state.o swapfile.o swap_backend.o swap_virtual.o
 obj-$(CONFIG_SWAP_COMPRESS) += swap_compress.o
 CFLAGS_swap_compress.o += -I$(srctree)/lib/zcomp
 obj-$(CONFIG_ZSWAP)	+= zswap.o
