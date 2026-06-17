@@ -2927,18 +2927,6 @@ static void zram_swap_submit_read(struct swap_io_ctx *ctx)
 	bool failed = false;
 	int i, j;
 
-	/*
-	 * With a backing device configured, the batch may include ZRAM_WB
-	 * slots.  Fall back to the block read path for the whole iocb
-	 * instead of checking each slot.
-	 */
-#ifdef CONFIG_ZRAM_WRITEBACK
-	if (zram->backing_dev) {
-		swap_bdev_submit_read(ctx);
-		return;
-	}
-#endif
-
 	for (i = 0; i < nr; i++) {
 		struct folio *folio = swap_iocb_folio(sio, i);
 		u32 base = swp_offset(folio->swap);
@@ -2949,10 +2937,30 @@ static void zram_swap_submit_read(struct swap_io_ctx *ctx)
 			int ret;
 
 			slot_lock(zram, idx);
+#ifdef CONFIG_ZRAM_WRITEBACK
+			if (test_slot_flag(zram, idx, ZRAM_WB)) {
+				unsigned long blk_idx = get_slot_handle(zram, idx);
+
+				slot_unlock(zram, idx);
+				atomic64_inc(&zram->stats.bd_reads);
+				ret = read_from_bdev_sync(zram, page, idx, blk_idx);
+				if (!ret) {
+					slot_lock(zram, idx);
+					mark_slot_accessed(zram, idx);
+					slot_unlock(zram, idx);
+				}
+			} else {
+				ret = read_from_zspool(zram, page, idx);
+				if (!ret)
+					mark_slot_accessed(zram, idx);
+				slot_unlock(zram, idx);
+			}
+#else
 			ret = read_from_zspool(zram, page, idx);
 			if (!ret)
 				mark_slot_accessed(zram, idx);
 			slot_unlock(zram, idx);
+#endif
 			if (ret) {
 				failed = true;
 				atomic64_inc(&zram->stats.failed_reads);
@@ -2984,14 +2992,6 @@ static void zram_swap_submit_write(struct swap_io_ctx *ctx)
 			idx = base + j;
 			ret = zram_write_page(zram, folio_page(folio, j), idx);
 			if (ret) {
-				/*
-				 * Leave partial zram data in place, same as the bio
-				 * write path.  swap_write_end() re-dirties every
-				 * page in the batch so they stay in swapcache with
-				 * their swap entries.  Freeing zram slots here would
-				 * leave entries pointing at empty indices until
-				 * slot_free_notify runs.
-				 */
 				failed = true;
 				atomic64_inc(&zram->stats.failed_writes);
 				pr_alert_ratelimited("Write-error on swap-device %s at index %u: err=%d\n",
