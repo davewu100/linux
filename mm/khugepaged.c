@@ -23,6 +23,7 @@
 #include <linux/ksm.h>
 #include <linux/pgalloc.h>
 #include <linux/backing-dev.h>
+#include <linux/slab.h>
 
 #include <asm/tlb.h>
 #include "internal.h"
@@ -915,6 +916,34 @@ static void __collapse_huge_page_copy_failed(pte_t *pte,
 	release_pte_pages(pte, pte + nr_pages, compound_pagelist);
 }
 
+static enum scan_result copy_pte_pages_to_folio(pte_t *pte,
+		struct folio *folio, struct vm_area_struct *vma,
+		unsigned long address, unsigned int order)
+{
+	const unsigned long nr_pages = 1UL << order;
+	unsigned int i;
+
+	/*
+	 * Copying pages' contents is subject to memory poison at any iteration.
+	 */
+	for (i = 0; i < nr_pages; i++) {
+		pte_t pteval = ptep_get(pte + i);
+		struct page *page = folio_page(folio, i);
+		unsigned long src_addr = address + i * PAGE_SIZE;
+		struct page *src_page;
+
+		if (pte_none_or_zero(pteval)) {
+			clear_user_highpage(page, src_addr);
+			continue;
+		}
+		src_page = pte_page(pteval);
+		if (copy_mc_user_highpage(page, src_page, src_addr, vma) > 0)
+			return SCAN_COPY_MC;
+	}
+
+	return SCAN_SUCCEED;
+}
+
 /*
  * __collapse_huge_page_copy - attempts to copy memory contents from raw
  * pages to a hugepage. Cleans up the raw pages if copying succeeds;
@@ -935,30 +964,9 @@ static enum scan_result __collapse_huge_page_copy(pte_t *pte, struct folio *foli
 		unsigned long address, spinlock_t *ptl, unsigned int order,
 		struct list_head *compound_pagelist)
 {
-	const unsigned long nr_pages = 1UL << order;
-	unsigned int i;
-	enum scan_result result = SCAN_SUCCEED;
+	enum scan_result result;
 
-	/*
-	 * Copying pages' contents is subject to memory poison at any iteration.
-	 */
-	for (i = 0; i < nr_pages; i++) {
-		pte_t pteval = ptep_get(pte + i);
-		struct page *page = folio_page(folio, i);
-		unsigned long src_addr = address + i * PAGE_SIZE;
-		struct page *src_page;
-
-		if (pte_none_or_zero(pteval)) {
-			clear_user_highpage(page, src_addr);
-			continue;
-		}
-		src_page = pte_page(pteval);
-		if (copy_mc_user_highpage(page, src_page, src_addr, vma) > 0) {
-			result = SCAN_COPY_MC;
-			break;
-		}
-	}
-
+	result = copy_pte_pages_to_folio(pte, folio, vma, address, order);
 	if (likely(result == SCAN_SUCCEED))
 		__collapse_huge_page_copy_succeeded(pte, vma, address, ptl,
 						    order, compound_pagelist);
@@ -1469,6 +1477,257 @@ static unsigned int max_order_from_offset(unsigned int offset)
 	return min_t(unsigned int, __ffs(offset), HPAGE_PMD_ORDER);
 }
 
+struct mthp_collapse_candidate {
+	unsigned int offset;
+	struct folio *folio;
+	bool succeeded;
+};
+
+static unsigned int single_subpmd_order(unsigned long enabled_orders)
+{
+	unsigned long subpmd_orders = enabled_orders & ~BIT(HPAGE_PMD_ORDER);
+
+	if (!is_power_of_2(subpmd_orders))
+		return 0;
+
+	return __ffs(subpmd_orders);
+}
+
+static unsigned int collect_mthp_collapse_candidates(
+		struct mthp_collapse_candidate *candidates,
+		unsigned int max_candidates, struct collapse_control *cc,
+		unsigned int order)
+{
+	const unsigned int nr_ptes = 1U << order;
+	unsigned int max_ptes_none = collapse_max_ptes_none(cc, NULL, order);
+	unsigned int offset, nr_candidates = 0;
+
+	for (offset = 0; offset < HPAGE_PMD_NR; offset += nr_ptes) {
+		unsigned int nr_occupied_ptes;
+
+		nr_occupied_ptes = bitmap_weight_from(cc->mthp_present_ptes,
+						      offset,
+						      offset + nr_ptes);
+		if (nr_occupied_ptes < nr_ptes - max_ptes_none)
+			continue;
+
+		if (WARN_ON_ONCE(nr_candidates >= max_candidates))
+			break;
+
+		candidates[nr_candidates++].offset = offset;
+	}
+
+	return nr_candidates;
+}
+
+static void free_mthp_collapse_candidates(
+		struct mthp_collapse_candidate *candidates,
+		unsigned int nr_candidates)
+{
+	unsigned int i;
+
+	for (i = 0; i < nr_candidates; i++) {
+		if (candidates[i].folio)
+			folio_put(candidates[i].folio);
+	}
+}
+
+static enum scan_result alloc_mthp_collapse_candidates(struct mm_struct *mm,
+		struct collapse_control *cc,
+		struct mthp_collapse_candidate *candidates,
+		unsigned int nr_candidates, unsigned int order)
+{
+	unsigned int i;
+
+	for (i = 0; i < nr_candidates; i++) {
+		enum scan_result result;
+
+		result = alloc_charge_folio(&candidates[i].folio, mm, cc, order);
+		if (result != SCAN_SUCCEED)
+			return result;
+
+		if (folio_memcg_alloc_deferred(candidates[i].folio))
+			return SCAN_ALLOC_HUGE_PAGE_FAIL;
+	}
+
+	return SCAN_SUCCEED;
+}
+
+static void map_mthp_collapse_candidates(struct vm_area_struct *vma,
+		pte_t *pte, struct mthp_collapse_candidate *candidates,
+		unsigned int nr_candidates, unsigned int order,
+		unsigned long pmd_addr)
+{
+	unsigned int i;
+
+	for (i = 0; i < nr_candidates; i++) {
+		unsigned long addr;
+		struct folio *folio;
+
+		if (!candidates[i].succeeded)
+			continue;
+
+		addr = pmd_addr + candidates[i].offset * PAGE_SIZE;
+		folio = candidates[i].folio;
+		__folio_mark_uptodate(folio);
+		map_anon_folio_pte_nopf(folio, pte + candidates[i].offset,
+					vma, addr, /*uffd_wp=*/ false);
+		candidates[i].folio = NULL;
+
+		trace_mm_collapse_huge_page(vma->vm_mm, true, SCAN_SUCCEED,
+					    order);
+	}
+}
+
+static enum scan_result collapse_mthp_batch(struct mm_struct *mm,
+		unsigned long pmd_addr, struct collapse_control *cc,
+		unsigned int order)
+{
+	const unsigned int max_candidates = HPAGE_PMD_NR >> order;
+	const unsigned long batch_end = pmd_addr + HPAGE_PMD_SIZE;
+	struct mthp_collapse_candidate *candidates;
+	unsigned int nr_candidates, i, nr_succeeded = 0;
+	enum scan_result result, last_result = SCAN_FAIL;
+	struct vm_area_struct *vma;
+	spinlock_t *pmd_ptl, *pte_ptl;
+	struct mmu_notifier_range range;
+	bool anon_vma_locked = false;
+	pte_t *pte = NULL;
+	pmd_t *pmd, _pmd;
+
+	candidates = kcalloc(max_candidates, sizeof(*candidates), GFP_KERNEL);
+	if (!candidates)
+		return SCAN_ALLOC_HUGE_PAGE_FAIL;
+
+	nr_candidates = collect_mthp_collapse_candidates(candidates,
+							max_candidates, cc,
+							order);
+	if (!nr_candidates) {
+		result = SCAN_FAIL;
+		goto out_free;
+	}
+
+	result = alloc_mthp_collapse_candidates(mm, cc, candidates,
+					       nr_candidates, order);
+	if (result != SCAN_SUCCEED)
+		goto out_free_folios;
+
+	mmap_read_lock(mm);
+	result = hugepage_vma_revalidate(mm, pmd_addr, /*expect_anon=*/ true,
+					 &vma, cc, order);
+	if (result != SCAN_SUCCEED) {
+		mmap_read_unlock(mm);
+		goto out_free_folios;
+	}
+
+	result = find_pmd_or_thp_or_none(mm, pmd_addr, &pmd);
+	if (result != SCAN_SUCCEED) {
+		mmap_read_unlock(mm);
+		goto out_free_folios;
+	}
+	mmap_read_unlock(mm);
+
+	mmap_write_lock(mm);
+	result = hugepage_vma_revalidate(mm, pmd_addr, /*expect_anon=*/ true,
+					 &vma, cc, order);
+	if (result != SCAN_SUCCEED)
+		goto out_unlock_mmap;
+
+	vma_start_write(vma);
+	result = check_pmd_still_valid(mm, pmd_addr, pmd);
+	if (result != SCAN_SUCCEED)
+		goto out_unlock_mmap;
+
+	anon_vma_lock_write(vma->anon_vma);
+	anon_vma_locked = true;
+
+	mmu_notifier_range_init(&range, MMU_NOTIFY_CLEAR, 0, mm, pmd_addr,
+				batch_end);
+	mmu_notifier_invalidate_range_start(&range);
+
+	pmd_ptl = pmd_lock(mm, pmd);
+	_pmd = pmdp_collapse_flush(vma, pmd_addr, pmd);
+	spin_unlock(pmd_ptl);
+	mmu_notifier_invalidate_range_end(&range);
+	tlb_remove_table_sync_one();
+
+	pte = pte_offset_map_lock(mm, &_pmd, pmd_addr, &pte_ptl);
+	if (!pte) {
+		result = SCAN_NO_PTE_TABLE;
+		goto restore_pmd;
+	}
+	spin_unlock(pte_ptl);
+
+	for (i = 0; i < nr_candidates; i++) {
+		unsigned long addr = pmd_addr + candidates[i].offset * PAGE_SIZE;
+		pte_t *candidate_pte = pte + candidates[i].offset;
+		LIST_HEAD(candidate_pagelist);
+
+		spin_lock(pte_ptl);
+		result = __collapse_huge_page_isolate(vma, addr, candidate_pte,
+						      cc, order,
+						      &candidate_pagelist);
+		spin_unlock(pte_ptl);
+		if (result != SCAN_SUCCEED) {
+			last_result = result;
+			trace_mm_collapse_huge_page(mm, false, result, order);
+			break;
+		}
+
+		result = copy_pte_pages_to_folio(candidate_pte,
+						 candidates[i].folio, vma,
+						 addr, order);
+		if (result != SCAN_SUCCEED) {
+			release_pte_pages(candidate_pte,
+					  candidate_pte + (1U << order),
+					  &candidate_pagelist);
+			last_result = result;
+			trace_mm_collapse_huge_page(mm, false, result, order);
+			break;
+		}
+
+		__collapse_huge_page_copy_succeeded(candidate_pte, vma, addr,
+						    pte_ptl, order,
+						    &candidate_pagelist);
+		candidates[i].succeeded = true;
+		nr_succeeded++;
+	}
+
+restore_pmd:
+	pmd_ptl = pmd_lock(mm, pmd);
+	VM_WARN_ON_ONCE(!pmd_none(*pmd));
+	if (pte && nr_succeeded) {
+		if (pte_ptl != pmd_ptl)
+			spin_lock_nested(pte_ptl, SINGLE_DEPTH_NESTING);
+		pmd_populate(mm, pmd, pmd_pgtable(_pmd));
+		map_mthp_collapse_candidates(vma, pte, candidates,
+					     nr_candidates, order, pmd_addr);
+		if (pte_ptl != pmd_ptl)
+			spin_unlock(pte_ptl);
+	} else {
+		pmd_populate(mm, pmd, pmd_pgtable(_pmd));
+	}
+	spin_unlock(pmd_ptl);
+
+	if (pte)
+		pte_unmap(pte);
+
+	if (nr_succeeded)
+		result = SCAN_SUCCEED;
+	else if (last_result != SCAN_FAIL)
+		result = last_result;
+
+out_unlock_mmap:
+	if (anon_vma_locked)
+		anon_vma_unlock_write(vma->anon_vma);
+	mmap_write_unlock(mm);
+out_free_folios:
+	free_mthp_collapse_candidates(candidates, nr_candidates);
+out_free:
+	kfree(candidates);
+	return result;
+}
+
 /*
  * mthp_collapse() consumes the bitmap that is generated during
  * collapse_scan_pmd() to determine what regions and mTHP orders fit best.
@@ -1491,12 +1750,61 @@ static enum scan_result mthp_collapse(struct mm_struct *mm,
 		struct collapse_control *cc, unsigned long enabled_orders)
 {
 	unsigned int nr_occupied_ptes, nr_ptes, max_ptes_none;
+	unsigned int batch_order = single_subpmd_order(enabled_orders);
 	enum scan_result last_result = SCAN_FAIL;
 	int collapsed = 0;
 	bool alloc_failed = false;
 	unsigned long collapse_address;
 	unsigned int offset = 0;
 	unsigned int order = HPAGE_PMD_ORDER;
+
+	if (batch_order && !unmapped) {
+		if (test_bit(HPAGE_PMD_ORDER, &enabled_orders)) {
+			nr_ptes = HPAGE_PMD_NR;
+			max_ptes_none = collapse_max_ptes_none(cc, NULL,
+							       HPAGE_PMD_ORDER);
+			nr_occupied_ptes = bitmap_weight_from(cc->mthp_present_ptes,
+							      0, nr_ptes);
+
+			if (nr_occupied_ptes >= nr_ptes - max_ptes_none) {
+				enum scan_result ret;
+
+				ret = collapse_huge_page(mm, address, referenced,
+							 unmapped, cc,
+							 HPAGE_PMD_ORDER);
+				switch (ret) {
+				case SCAN_SUCCEED:
+					return ret;
+				case SCAN_ALLOC_HUGE_PAGE_FAIL:
+				case SCAN_LACK_REFERENCED_PAGE:
+				case SCAN_EXCEED_NONE_PTE:
+				case SCAN_EXCEED_SWAP_PTE:
+				case SCAN_EXCEED_SHARED_PTE:
+				case SCAN_PAGE_LOCK:
+				case SCAN_PAGE_COUNT:
+				case SCAN_PAGE_NULL:
+				case SCAN_DEL_PAGE_LRU:
+				case SCAN_PTE_NON_PRESENT:
+				case SCAN_PTE_UFFD_WP:
+				case SCAN_PAGE_LAZYFREE:
+					last_result = ret;
+					break;
+				default:
+					return ret;
+				}
+			}
+		}
+
+		if (enabled_orders & BIT(batch_order)) {
+			enum scan_result ret;
+
+			ret = collapse_mthp_batch(mm, address, cc, batch_order);
+			if (ret == SCAN_SUCCEED || last_result == SCAN_FAIL)
+				return ret;
+		}
+
+		return last_result;
+	}
 
 	while (offset < HPAGE_PMD_NR) {
 		nr_ptes = 1UL << order;
