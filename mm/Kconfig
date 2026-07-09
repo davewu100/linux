@@ -1104,6 +1104,24 @@ config CMA_AREAS
 
 	  If unsure, leave the default value "8" in UMA and "20" in NUMA.
 
+config LHP
+	bool "Layered HugePage pool (1G/2M/4K split-merge)"
+	depends on CMA && CONTIG_ALLOC && 64BIT
+	help
+	  Reserve a physically contiguous pool at boot and manage it as a
+	  three-level (1G / 2M / 4K) hierarchy that can be split downwards on
+	  demand and merged back up towards 1G, buddy-style.  Because the pool
+	  never returns its pages to the buddy allocator, physical contiguity is
+	  preserved and merging back to 1G is deterministic.  Intended as a
+	  controlled source for unmovable allocations so they do not fragment
+	  1G pages.
+
+	  Enable with "lhp=<size>" on the kernel command line (rounded up to a
+	  1G multiple).  A debugfs interface under /sys/kernel/debug/lhp is
+	  provided to observe and drive the pool.
+
+	  If unsure, say "n".
+
 #
 # Select this config option from the architecture Kconfig, if available, to set
 # the max page order for physically contiguous allocations.

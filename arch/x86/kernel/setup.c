@@ -12,6 +12,7 @@
 #include <linux/dma-map-ops.h>
 #include <linux/efi.h>
 #include <linux/hugetlb.h>
+#include <linux/lhp.h>
 #include <linux/ima.h>
 #include <linux/init_ohci1394_dma.h>
 #include <linux/initrd.h>
@@ -1190,6 +1191,7 @@ void __init setup_arch(char **cmdline_p)
 
 	initmem_init();
 	dma_contiguous_reserve(max_pfn_mapped << PAGE_SHIFT);
+	lhp_cma_reserve();
 
 	/*
 	 * Reserve memory for crash kernel after SRAT is parsed so that it
