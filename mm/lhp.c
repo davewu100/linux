@@ -278,11 +278,21 @@ static struct lhp_child_array *lhp_cache_pop(struct lhp_region *rg)
 	return a;
 }
 
-/* Push an array into the region cache (caller holds region lock). */
-static void lhp_cache_push(struct lhp_region *rg, struct lhp_child_array *a)
+/* Upper bound on how many recycled arrays a single region caches. */
+#define LHP_ARRAY_CACHE_MAX	64
+
+/*
+ * Push an array into the region cache (caller holds region lock).  Returns true
+ * if it was cached, or false if the cache is already at LHP_ARRAY_CACHE_MAX, in
+ * which case the caller owns @a and must free it.
+ */
+static bool lhp_cache_push(struct lhp_region *rg, struct lhp_child_array *a)
 {
+	if (rg->nr_cached >= LHP_ARRAY_CACHE_MAX)
+		return false;
 	list_add(&a->cache, &rg->array_cache);
 	rg->nr_cached++;
+	return true;
 }
 
 /*
@@ -300,8 +310,14 @@ static int lhp_reservoir_fill(struct lhp_reservoir *r, unsigned int need,
 		struct lhp_child_array *a = lhp_array_alloc(gfp);
 
 		if (!a) {
+			/*
+			 * kvfree_atomic() rather than kvfree(): a GFP_ATOMIC
+			 * caller reaches this error path in atomic context, and
+			 * a vmalloc-backed array would otherwise sleep in
+			 * vfree().
+			 */
 			while (r->nr)
-				kvfree(r->arr[--r->nr]);
+				kvfree_atomic(r->arr[--r->nr]);
 			return -ENOMEM;
 		}
 		r->arr[r->nr++] = a;
@@ -319,22 +335,24 @@ static struct lhp_child_array *lhp_reservoir_take(struct lhp_reservoir *r)
 
 /*
  * Drain leftover reservoir arrays into a region cache (caller holds the region
- * lock).  Stops once the per-region cache is full, leaving any remainder in the
- * reservoir; the caller frees that remainder with lhp_reservoir_free() *after*
- * dropping the lock, so kvfree() never runs under the region spinlock.
+ * lock).  Stops once the per-region cache is full (lhp_cache_push() returns
+ * false), leaving any remainder in the reservoir for lhp_reservoir_free().
  */
-#define LHP_ARRAY_CACHE_MAX	64
 static void lhp_reservoir_drain(struct lhp_region *rg, struct lhp_reservoir *r)
 {
-	while (r->nr && rg->nr_cached < LHP_ARRAY_CACHE_MAX)
-		lhp_cache_push(rg, r->arr[--r->nr]);
+	while (r->nr && lhp_cache_push(rg, r->arr[r->nr - 1]))
+		r->nr--;
 }
 
-/* Free any arrays still left in the reservoir.  Call with no lock held. */
+/*
+ * Free any arrays still left in the reservoir.  Uses kvfree_atomic() so it is
+ * safe to call from atomic context (a GFP_ATOMIC caller) even for the
+ * vmalloc-backed arrays, where plain kvfree() -> vfree() would sleep.
+ */
 static void lhp_reservoir_free(struct lhp_reservoir *r)
 {
 	while (r->nr)
-		kvfree(r->arr[--r->nr]);
+		kvfree_atomic(r->arr[--r->nr]);
 }
 
 /*
@@ -417,10 +435,15 @@ static void lhp_try_merge(struct lhp_region *rg, struct lhp_node *node)
 		 * recycle the child array into the region cache instead of
 		 * kvfree()ing it.  This avoids repeated alloc/free and, when the
 		 * array lives in vmalloc, the unmap + TLB flush kvfree() incurs.
+		 *
+		 * If the cache is full, free the overflow with kvfree_atomic():
+		 * lhp_free() (hence this path) may run in atomic context, so a
+		 * vmalloc-backed array must not sleep in vfree() here.
 		 */
 		lhp_freelist_del_bulk(rg, node->children->nodes, LHP_FANOUT,
 				      child_level);
-		lhp_cache_push(rg, node->children);
+		if (!lhp_cache_push(rg, node->children))
+			kvfree_atomic(node->children);
 		node->children = NULL;
 		node->free_children = 0;
 		node->state = LHP_FREE;
