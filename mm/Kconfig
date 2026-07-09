@@ -1104,6 +1104,26 @@ config CMA_AREAS
 
 	  If unsure, leave the default value "8" in UMA and "20" in NUMA.
 
+config LHP_CMA
+	bool "Layered HugePage view over CMA (1G/2M/4K split-merge)"
+	depends on CMA && CONTIG_ALLOC && 64BIT
+	help
+	  Layer a three-level (1G / 2M / 4K) hierarchy on top of the existing
+	  Contiguous Memory Allocator.  Chunks are backed by real cma_alloc()
+	  pages, so contiguity and reclaim are handled by CMA, while a thin
+	  layering bitmap tracks which 2M/4K sub-ranges of each 1G region are in
+	  use.  A 1G region becomes "merged" (reusable as a whole 1G) once its
+	  bitmap is empty.
+
+	  This is the lower-cost hybrid alternative to a private pool: it reuses
+	  CMA's migration/reclaim machinery instead of owning the memory.
+
+	  Enable with "lhp_cma=<size>" on the kernel command line (rounded up to
+	  a 1G multiple).  A debugfs interface under /sys/kernel/debug/lhp_cma is
+	  provided to observe and drive it.
+
+	  If unsure, say "n".
+
 #
 # Select this config option from the architecture Kconfig, if available, to set
 # the max page order for physically contiguous allocations.
