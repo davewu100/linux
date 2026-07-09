@@ -660,6 +660,7 @@ struct hstate {
 	int next_nid_to_free;
 	unsigned int order;
 	unsigned int demote_order;
+	unsigned int promote_order;	/* LHP plan A: merge target order */
 	unsigned long mask;
 	unsigned long max_huge_pages;
 	unsigned long nr_huge_pages;

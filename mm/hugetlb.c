@@ -3676,6 +3676,14 @@ static void __init hugetlb_init_hstates(void)
 			if (h2->order < h->order &&
 			    h2->order > h->demote_order)
 				h->demote_order = h2->order;
+			/*
+			 * LHP plan A: promote target is the next *larger*
+			 * hstate, i.e. the smallest order strictly above ours.
+			 * This is the inverse of demote_order.
+			 */
+			if (h2->order > h->order &&
+			    (!h->promote_order || h2->order < h->promote_order))
+				h->promote_order = h2->order;
 		}
 	}
 }
@@ -4082,6 +4090,206 @@ long demote_pool_huge_page(struct hstate *src, nodemask_t *nodes_allowed,
 	 * Only way to get here is if all pages on free lists are poisoned.
 	 * Return -EBUSY so that caller will not retry.
 	 */
+	return -EBUSY;
+}
+
+/*
+ * LHP plan A: promote (merge) support.  This is the inverse of demote:
+ * reconstruct a larger (e.g. gigantic 1G) hugetlb folio from a physically
+ * contiguous, correctly aligned run of smaller (e.g. 2M) free folios.
+ *
+ * The hard requirement that makes this work is *contiguity*: the constituent
+ * small folios must cover [base, base + pages_per_huge_page(dst)) with no gaps.
+ * Because demote never moves memory (it only rewrites compound metadata), a run
+ * that was produced by demote is still contiguous as long as none of it was
+ * handed out and freed elsewhere.  We verify contiguity explicitly rather than
+ * trusting a demote "anchor", so the path is also correct for small folios that
+ * happen to line up for other reasons.
+ */
+
+/*
+ * Given the first small folio of a candidate run, check that the next
+ * (nr_small - 1) PFNs are also free folios of @src at the expected offsets, and
+ * collect them into @run.  Returns true on success with @run populated.
+ *
+ * Caller must hold hugetlb_lock.
+ */
+static bool promote_collect_run(struct hstate *src, struct folio *first,
+				unsigned long nr_small, struct folio **run)
+{
+	unsigned long small_pages = pages_per_huge_page(src);
+	unsigned long dst_pages = nr_small * small_pages;
+	unsigned long base_pfn = folio_pfn(first);
+	unsigned long i;
+
+	lockdep_assert_held(&hugetlb_lock);
+
+	/* The whole run must be aligned to the destination (gigantic) size. */
+	if (!IS_ALIGNED(base_pfn, dst_pages))
+		return false;
+
+	for (i = 0; i < nr_small; i++) {
+		unsigned long pfn = base_pfn + i * small_pages;
+		struct page *page;
+		struct folio *folio;
+
+		if (!pfn_valid(pfn))
+			return false;
+		page = pfn_to_page(pfn);
+		folio = page_folio(page);
+
+		/* Must be the head of a free src folio at the right offset. */
+		if (folio_pfn(folio) != pfn)
+			return false;
+		if (!folio_test_hugetlb(folio))
+			return false;
+		if (folio_hstate(folio) != src)
+			return false;
+		if (!folio_test_hugetlb_freed(folio))
+			return false;
+		if (folio_test_hwpoison(folio))
+			return false;
+		/* Never merge across a CMA / non-CMA boundary. */
+		if (folio_test_hugetlb_cma(folio) !=
+		    folio_test_hugetlb_cma(first))
+			return false;
+
+		run[i] = folio;
+	}
+	return true;
+}
+
+/*
+ * Rebuild one @dst folio out of @nr_small already-removed @src folios whose head
+ * is @run[0].  Mirrors demote_free_hugetlb_folios() in reverse.
+ *
+ * Must be called with no locks held (does vmemmap work); the folios in @run must
+ * already have been removed from the src pool by the caller.
+ */
+static int promote_rebuild_folio(struct hstate *src, struct hstate *dst,
+				 struct folio **run, unsigned long nr_small)
+{
+	struct folio *dst_folio = run[0];
+	bool cma = folio_test_hugetlb_cma(run[0]);
+	unsigned long i;
+	int rc;
+	LIST_HEAD(dst_list);
+
+	/*
+	 * Restore vmemmap for every constituent folio first: to write through
+	 * the reconstructed compound page's tail structs, all backing vmemmap
+	 * must be present.
+	 */
+	for (i = 0; i < nr_small; i++) {
+		rc = hugetlb_vmemmap_restore_folio(src, run[i]);
+		if (rc)
+			return rc;
+	}
+
+	/* Tear down the small compound heads so we can build a big one. */
+	for (i = 0; i < nr_small; i++) {
+		struct page *page = &run[i]->page;
+		unsigned long j;
+
+		for (j = 0; j < pages_per_huge_page(src); j++)
+			clear_compound_head(folio_page(run[i], j));
+		__folio_clear_hugetlb(run[i]);
+		page->mapping = NULL;
+	}
+
+	/* Build the destination-order compound page over the whole run. */
+	prep_compound_page(&dst_folio->page, dst->order);
+	dst_folio->mapping = NULL;
+	init_new_hugetlb_folio(dst_folio);
+	if (cma)
+		folio_set_hugetlb_cma(dst_folio);
+
+	split_page_owner(&dst_folio->page, huge_page_order(src),
+			 huge_page_order(dst));
+	pgalloc_tag_split(dst_folio, huge_page_order(src),
+			  huge_page_order(dst));
+
+	list_add(&dst_folio->lru, &dst_list);
+	prep_and_add_allocated_folios(dst, &dst_list);
+	return 0;
+}
+
+/*
+ * Promote up to @nr_to_promote destination folios from @src's free pool.
+ * Returns the number promoted, or a negative errno.
+ *
+ * Must be called holding hugetlb_lock; may drop and re-acquire it.
+ */
+long promote_pool_huge_page(struct hstate *src, nodemask_t *nodes_allowed,
+			    unsigned long nr_to_promote)
+	__must_hold(&hugetlb_lock)
+{
+	unsigned long nr_small, i;
+	struct hstate *dst;
+	struct folio **run;
+	long nr_promoted = 0;
+	int nr_nodes, node;
+	int rc = 0;
+
+	lockdep_assert_held(&hugetlb_lock);
+
+	if (!src->promote_order) {
+		pr_warn("HugeTLB: no promote order for %s\n", src->name);
+		return -EINVAL;
+	}
+	dst = size_to_hstate(PAGE_SIZE << src->promote_order);
+	if (!dst)
+		return -EINVAL;
+
+	nr_small = pages_per_huge_page(dst) / pages_per_huge_page(src);
+	run = kcalloc(nr_small, sizeof(*run), GFP_ATOMIC);
+	if (!run)
+		return -ENOMEM;
+
+	for_each_node_mask_to_free(src, nr_nodes, node, nodes_allowed) {
+		struct folio *folio, *next;
+
+		list_for_each_entry_safe(folio, next,
+					 &src->hugepage_freelists[node], lru) {
+			if (folio_test_hwpoison(folio))
+				continue;
+
+			if (!promote_collect_run(src, folio, nr_small, run))
+				continue;
+
+			/* Remove the whole run from the src pool. */
+			for (i = 0; i < nr_small; i++)
+				remove_hugetlb_folio(src, run[i], false);
+
+			spin_unlock_irq(&hugetlb_lock);
+			rc = promote_rebuild_folio(src, dst, run, nr_small);
+			spin_lock_irq(&hugetlb_lock);
+
+			if (rc) {
+				/* Put the run back as src folios on failure. */
+				for (i = 0; i < nr_small; i++)
+					add_hugetlb_folio(src, run[i], false);
+				goto out;
+			}
+
+			nr_promoted++;
+			src->max_huge_pages -= nr_small;
+			dst->max_huge_pages++;
+
+			if (nr_promoted == nr_to_promote)
+				goto out;
+
+			/* Freelist mutated under us; restart this node. */
+			break;
+		}
+	}
+
+out:
+	kfree(run);
+	if (rc)
+		return rc;
+	if (nr_promoted)
+		return nr_promoted;
 	return -EBUSY;
 }
 

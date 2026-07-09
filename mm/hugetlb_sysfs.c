@@ -237,6 +237,67 @@ static ssize_t demote_store(struct kobject *kobj,
 }
 HSTATE_ATTR_WO(demote);
 
+/*
+ * LHP plan A: promote merges smaller free hugetlb folios back into a larger
+ * (e.g. gigantic) folio.  This attribute is attached to the *smaller* hstate
+ * (the one that owns the free folios being merged), mirroring how "demote" is
+ * attached to the larger hstate.
+ */
+static ssize_t promote_store(struct kobject *kobj,
+	       struct kobj_attribute *attr, const char *buf, size_t len)
+{
+	unsigned long nr_promote;
+	nodemask_t nodes_allowed, *n_mask;
+	struct hstate *h;
+	int err;
+	int nid;
+
+	err = kstrtoul(buf, 10, &nr_promote);
+	if (err)
+		return err;
+	h = kobj_to_hstate(kobj, &nid);
+
+	if (nid != NUMA_NO_NODE) {
+		init_nodemask_of_node(&nodes_allowed, nid);
+		n_mask = &nodes_allowed;
+	} else {
+		n_mask = &node_states[N_MEMORY];
+	}
+
+	mutex_lock(&h->resize_lock);
+	spin_lock_irq(&hugetlb_lock);
+
+	while (nr_promote) {
+		long rc = promote_pool_huge_page(h, n_mask, nr_promote);
+
+		if (rc < 0) {
+			/* -EBUSY simply means "no eligible run", so stop. */
+			if (rc != -EBUSY)
+				err = rc;
+			break;
+		}
+		nr_promote -= rc;
+	}
+
+	spin_unlock_irq(&hugetlb_lock);
+	mutex_unlock(&h->resize_lock);
+
+	if (err)
+		return err;
+	return len;
+}
+HSTATE_ATTR_WO(promote);
+
+static ssize_t promote_size_show(struct kobject *kobj,
+					struct kobj_attribute *attr, char *buf)
+{
+	struct hstate *h = kobj_to_hstate(kobj, NULL);
+	unsigned long promote_size = (PAGE_SIZE << h->promote_order) / SZ_1K;
+
+	return sysfs_emit(buf, "%lukB\n", promote_size);
+}
+HSTATE_ATTR_RO(promote_size);
+
 static ssize_t demote_size_show(struct kobject *kobj,
 					struct kobj_attribute *attr, char *buf)
 {
@@ -303,6 +364,16 @@ static const struct attribute_group hstate_demote_attr_group = {
 	.attrs = hstate_demote_attrs,
 };
 
+static struct attribute *hstate_promote_attrs[] = {
+	&promote_size_attr.attr,
+	&promote_attr.attr,
+	NULL,
+};
+
+static const struct attribute_group hstate_promote_attr_group = {
+	.attrs = hstate_promote_attrs,
+};
+
 static int hugetlb_sysfs_add_hstate(struct hstate *h, struct kobject *parent,
 				    struct kobject **hstate_kobjs,
 				    const struct attribute_group *hstate_attr_group)
@@ -331,6 +402,14 @@ static int hugetlb_sysfs_add_hstate(struct hstate *h, struct kobject *parent,
 			hstate_kobjs[hi] = NULL;
 			return retval;
 		}
+	}
+
+	if (h->promote_order) {
+		retval = sysfs_create_group(hstate_kobjs[hi],
+					    &hstate_promote_attr_group);
+		if (retval)
+			pr_warn("HugeTLB unable to create promote interfaces for %s\n",
+				h->name);
 	}
 
 	return 0;
@@ -409,6 +488,8 @@ void hugetlb_unregister_node(struct node *node)
 			continue;
 		if (h->demote_order)
 			sysfs_remove_group(hstate_kobj, &hstate_demote_attr_group);
+		if (h->promote_order)
+			sysfs_remove_group(hstate_kobj, &hstate_promote_attr_group);
 		sysfs_remove_group(hstate_kobj, &per_node_hstate_attr_group);
 		kobject_put(hstate_kobj);
 		nhs->hstate_kobjs[idx] = NULL;

@@ -102,6 +102,9 @@ extern void prep_and_add_allocated_folios(struct hstate *h,
 extern long demote_pool_huge_page(struct hstate *src,
 				  nodemask_t *nodes_allowed,
 				  unsigned long nr_to_demote);
+extern long promote_pool_huge_page(struct hstate *src,
+				   nodemask_t *nodes_allowed,
+				   unsigned long nr_to_promote);
 extern ssize_t __nr_hugepages_store_common(bool obey_mempolicy,
 					   struct hstate *h, int nid,
 					   unsigned long count, size_t len);
