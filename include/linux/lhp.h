@@ -23,6 +23,7 @@
 
 #include <linux/types.h>
 #include <linux/list.h>
+#include <linux/gfp_types.h>
 
 /* Fixed three-level hierarchy.  Orders assume 4K base pages. */
 enum lhp_level {
@@ -76,8 +77,14 @@ int lhp_pool_available(void);
 /*
  * Allocate one chunk of the requested level, returning its head page (usage
  * right) or NULL.  Splits higher levels on demand.
+ *
+ * @gfp controls the child-array preallocation the split path may need.  Pass
+ * GFP_KERNEL from process context; pass a non-sleeping mask (e.g. GFP_ATOMIC
+ * or GFP_NOWAIT) when calling from atomic context, in which case allocation
+ * failure simply makes lhp_alloc() return NULL.  The mask must not request
+ * placement (zone/movable) flags; only the reclaim behaviour is honoured.
  */
-struct page *lhp_alloc(enum lhp_level level);
+struct page *lhp_alloc(enum lhp_level level, gfp_t gfp);
 
 /*
  * Return a chunk previously obtained from lhp_alloc().  Merges back up towards
@@ -89,7 +96,10 @@ void lhp_free(struct page *page, enum lhp_level level);
 
 static inline void lhp_cma_reserve(void) { }
 static inline int lhp_pool_available(void) { return 0; }
-static inline struct page *lhp_alloc(enum lhp_level level) { return NULL; }
+static inline struct page *lhp_alloc(enum lhp_level level, gfp_t gfp)
+{
+	return NULL;
+}
 static inline void lhp_free(struct page *page, enum lhp_level level) { }
 
 #endif /* CONFIG_LHP */

@@ -259,9 +259,9 @@ struct lhp_reservoir {
 	unsigned int		nr;
 };
 
-static struct lhp_child_array *lhp_array_alloc(void)
+static struct lhp_child_array *lhp_array_alloc(gfp_t gfp)
 {
-	return kvzalloc(sizeof(struct lhp_child_array), GFP_KERNEL);
+	return kvzalloc(sizeof(struct lhp_child_array), gfp);
 }
 
 /* Pop a recycled array from the region cache (caller holds region lock). */
@@ -292,11 +292,12 @@ static void lhp_cache_push(struct lhp_region *rg, struct lhp_child_array *a)
  * inspected under a region lock; unused arrays are recycled into a region cache
  * later.
  */
-static int lhp_reservoir_fill(struct lhp_reservoir *r, unsigned int need)
+static int lhp_reservoir_fill(struct lhp_reservoir *r, unsigned int need,
+			      gfp_t gfp)
 {
 	r->nr = 0;
 	while (r->nr < need) {
-		struct lhp_child_array *a = lhp_array_alloc();
+		struct lhp_child_array *a = lhp_array_alloc(gfp);
 
 		if (!a) {
 			while (r->nr)
@@ -505,10 +506,15 @@ static struct page *lhp_region_alloc(struct lhp_region *rg, enum lhp_level level
 
 int lhp_pool_available(void)
 {
-	return READ_ONCE(lhp_pool.ready);
+	/*
+	 * Acquire load pairs with the smp_store_release() in lhp_pool_init():
+	 * a caller that observes ready == true is guaranteed to also see the
+	 * fully initialised regions array.
+	 */
+	return smp_load_acquire(&lhp_pool.ready);
 }
 
-struct page *lhp_alloc(enum lhp_level level)
+struct page *lhp_alloc(enum lhp_level level, gfp_t gfp)
 {
 	struct lhp_pool *p = &lhp_pool;
 	struct lhp_reservoir res;
@@ -523,17 +529,20 @@ struct page *lhp_alloc(enum lhp_level level)
 	 * region lock, so the locked path never allocates.  A region's recycle
 	 * cache usually satisfies splits, in which case these go straight into
 	 * that region's cache via lhp_reservoir_drain() and no real allocation
-	 * happened at all; the remainder is freed after unlocking.
+	 * happened at all; the remainder is freed after unlocking.  @gfp lets an
+	 * atomic-context caller pass a non-sleeping mask.
 	 */
-	if (lhp_reservoir_fill(&res, lhp_splits_needed(level)))
+	if (lhp_reservoir_fill(&res, lhp_splits_needed(level), gfp))
 		return NULL;
 
 	/*
 	 * Round-robin across regions from a shared cursor to spread contention,
 	 * then linear-probe.  Only one region lock is held at a time, so CPUs
-	 * hitting different regions never contend.
+	 * hitting different regions never contend.  The cursor is read as an
+	 * unsigned int so wrapping past INT_MAX keeps advancing the start index
+	 * by one region rather than jumping after sign-extension.
 	 */
-	start = (unsigned long)atomic_fetch_inc(&p->cursor);
+	start = (unsigned int)atomic_fetch_inc(&p->cursor);
 	for (i = 0; i < p->nr_regions; i++) {
 		struct lhp_region *rg = &p->regions[(start + i) % p->nr_regions];
 
@@ -701,7 +710,11 @@ static int __init lhp_pool_init(void)
 		return 0;
 	}
 
-	WRITE_ONCE(p->ready, true);
+	/*
+	 * Release store: publishes the fully initialised regions array to any
+	 * consumer that observes ready == true via lhp_pool_available().
+	 */
+	smp_store_release(&p->ready, true);
 	pr_info("pool ready: %lu x 1G regions (per-region locking)\n",
 		p->nr_regions);
 	return 0;
@@ -736,7 +749,7 @@ static int lhp_stats_show(struct seq_file *m, void *v)
 	unsigned long cached = 0, free_1g = 0, i;
 	int l;
 
-	if (!READ_ONCE(p->ready)) {
+	if (!smp_load_acquire(&p->ready)) {
 		seq_puts(m, "ready: 0\n");
 		return 0;
 	}
@@ -780,7 +793,7 @@ static ssize_t lhp_alloc_write(struct file *file, const char __user *ubuf,
 	if (level >= LHP_NR_LEVELS)
 		return -EINVAL;
 
-	pg = lhp_alloc(level);
+	pg = lhp_alloc(level, GFP_KERNEL);
 	if (!pg)
 		return -ENOMEM;
 
@@ -838,7 +851,7 @@ static int lhp_bench_fn(void *arg)
 
 	t0 = ktime_get();
 	for (i = 0; i < t->ops; i++) {
-		struct page *pg = lhp_alloc(LHP_LEVEL_4K);
+		struct page *pg = lhp_alloc(LHP_LEVEL_4K, GFP_KERNEL);
 
 		if (!pg)
 			break;
@@ -863,6 +876,13 @@ static int lhp_bench_run(unsigned long ops_per_thread, unsigned int threads)
 	u64 wall = 0, sum = 0;
 	unsigned long total_done = 0;
 
+	/*
+	 * Cap at one thread per online CPU so each thread gets a distinct CPU
+	 * via kthread_bind() below.  Otherwise threads would share CPUs and the
+	 * reported "parallel /op" scaling number would be skewed.
+	 */
+	threads = min(threads, num_online_cpus());
+
 	t = kcalloc(threads, sizeof(*t), GFP_KERNEL);
 	if (!t)
 		return -ENOMEM;
@@ -875,7 +895,7 @@ static int lhp_bench_run(unsigned long ops_per_thread, unsigned int threads)
 					   "lhp_bench/%u", i);
 		if (IS_ERR(t[i].task))
 			break;
-		kthread_bind(t[i].task, i % num_online_cpus());
+		kthread_bind(t[i].task, i);
 		wake_up_process(t[i].task);
 		launched++;
 	}
