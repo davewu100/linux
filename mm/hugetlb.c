@@ -4165,9 +4165,16 @@ static bool promote_collect_run(struct hstate *src, struct folio *first,
  *
  * Must be called with no locks held (does vmemmap work); the folios in @run must
  * already have been removed from the src pool by the caller.
+ *
+ * On failure returns a negative errno and stores in @nr_restored the number of
+ * leading run folios (run[0..*nr_restored-1]) whose vmemmap was already
+ * restored (and whose HVO flag is therefore now clear) before the failure, so
+ * the caller can put the run back in a consistent state.  On success
+ * *nr_restored is left at nr_small.
  */
 static int promote_rebuild_folio(struct hstate *src, struct hstate *dst,
-				 struct folio **run, unsigned long nr_small)
+				 struct folio **run, unsigned long nr_small,
+				 unsigned long *nr_restored)
 {
 	struct folio *dst_folio = run[0];
 	bool cma = folio_test_hugetlb_cma(run[0]);
@@ -4175,15 +4182,19 @@ static int promote_rebuild_folio(struct hstate *src, struct hstate *dst,
 	int rc;
 	LIST_HEAD(dst_list);
 
+	*nr_restored = 0;
+
 	/*
 	 * Restore vmemmap for every constituent folio first: to write through
 	 * the reconstructed compound page's tail structs, all backing vmemmap
-	 * must be present.
+	 * must be present.  Each successful restore clears the folio's HVO flag,
+	 * so report how many completed if we bail out partway.
 	 */
 	for (i = 0; i < nr_small; i++) {
 		rc = hugetlb_vmemmap_restore_folio(src, run[i]);
 		if (rc)
 			return rc;
+		*nr_restored = i + 1;
 	}
 
 	/* Tear down the small compound heads so we can build a big one. */
@@ -4210,8 +4221,48 @@ static int promote_rebuild_folio(struct hstate *src, struct hstate *dst,
 			  huge_page_order(dst));
 
 	list_add(&dst_folio->lru, &dst_list);
+	/*
+	 * Taking the destination hstate mutex synchronizes with
+	 * set_max_huge_pages(); without it the newly added folio could be
+	 * accounted as a surplus page.  This mirrors demote_free_hugetlb_folios()
+	 * which takes dst->resize_lock around prep_and_add_allocated_folios().
+	 */
+	mutex_lock(&dst->resize_lock);
 	prep_and_add_allocated_folios(dst, &dst_list);
+	mutex_unlock(&dst->resize_lock);
 	return 0;
+}
+
+/*
+ * Put a run back into the src pool after a failed promote.  Folios in
+ * run[0..nr_restored-1] have had their vmemmap restored (HVO flag clear), so
+ * they are re-added as fully mapped hugetlb folios; the rest still carry the
+ * HVO flag and go back via add_hugetlb_folio().  Caller holds hugetlb_lock.
+ */
+static void promote_putback_run(struct hstate *src, struct folio **run,
+				unsigned long nr_small,
+				unsigned long nr_restored)
+{
+	unsigned long i;
+
+	lockdep_assert_held(&hugetlb_lock);
+
+	for (i = 0; i < nr_small; i++) {
+		struct folio *folio = run[i];
+
+		if (i < nr_restored) {
+			/*
+			 * vmemmap already restored: add_hugetlb_folio() cannot
+			 * take this folio (it asserts the HVO flag is set), so
+			 * re-add it as a fresh fully mapped hugetlb folio.
+			 */
+			init_new_hugetlb_folio(folio);
+			account_new_hugetlb_folio(src, folio);
+			enqueue_hugetlb_folio(src, folio);
+		} else {
+			add_hugetlb_folio(src, folio, false);
+		}
+	}
 }
 
 /*
@@ -4251,6 +4302,8 @@ long promote_pool_huge_page(struct hstate *src, nodemask_t *nodes_allowed,
 
 		list_for_each_entry_safe(folio, next,
 					 &src->hugepage_freelists[node], lru) {
+			unsigned long nr_restored;
+
 			if (folio_test_hwpoison(folio))
 				continue;
 
@@ -4262,13 +4315,14 @@ long promote_pool_huge_page(struct hstate *src, nodemask_t *nodes_allowed,
 				remove_hugetlb_folio(src, run[i], false);
 
 			spin_unlock_irq(&hugetlb_lock);
-			rc = promote_rebuild_folio(src, dst, run, nr_small);
+			rc = promote_rebuild_folio(src, dst, run, nr_small,
+						   &nr_restored);
 			spin_lock_irq(&hugetlb_lock);
 
 			if (rc) {
-				/* Put the run back as src folios on failure. */
-				for (i = 0; i < nr_small; i++)
-					add_hugetlb_folio(src, run[i], false);
+				/* Put the run back consistently on failure. */
+				promote_putback_run(src, run, nr_small,
+						    nr_restored);
 				goto out;
 			}
 
