@@ -49,7 +49,14 @@ struct lhp_node {
 	enum lhp_level		level;
 	enum lhp_state		state;
 	struct lhp_node		*parent;	/* NULL for 1G roots */
-	struct lhp_node		**children;	/* [LHP_FANOUT] when SPLIT */
+	/*
+	 * When SPLIT, @children points at a single bulk allocation of
+	 * LHP_FANOUT contiguous lhp_node structs (not 512 separate objects).
+	 * This lets split/merge allocate, free, list-splice and account the
+	 * whole fan-out in O(1) batch operations instead of 512 times each.
+	 * child i lives at &children[i].
+	 */
+	struct lhp_node		*children;	/* [LHP_FANOUT] when SPLIT */
 	unsigned int		free_children;	/* # children in LHP_FREE */
 	struct list_head	list;		/* member of a per-level freelist */
 };
@@ -120,6 +127,20 @@ void __init lhp_cma_reserve(void)
  * Node helpers
  * -------------------------------------------------------------------------- */
 
+/* Initialise a node in place (used for both bulk children and single roots). */
+static void lhp_node_init(struct lhp_node *n, struct page *base,
+			  enum lhp_level level, struct lhp_node *parent)
+{
+	n->base = base;
+	n->level = level;
+	n->state = LHP_FREE;
+	n->parent = parent;
+	n->children = NULL;
+	n->free_children = 0;
+	INIT_LIST_HEAD(&n->list);
+}
+
+/* Allocate and initialise a single node (used for 1G roots). */
 static struct lhp_node *lhp_node_alloc(struct page *base, enum lhp_level level,
 				       struct lhp_node *parent)
 {
@@ -128,11 +149,7 @@ static struct lhp_node *lhp_node_alloc(struct page *base, enum lhp_level level,
 	n = kzalloc(sizeof(*n), GFP_KERNEL);
 	if (!n)
 		return NULL;
-	n->base = base;
-	n->level = level;
-	n->state = LHP_FREE;
-	n->parent = parent;
-	INIT_LIST_HEAD(&n->list);
+	lhp_node_init(n, base, level, parent);
 	return n;
 }
 
@@ -149,6 +166,40 @@ static void lhp_freelist_del(struct lhp_pool *p, struct lhp_node *n)
 	p->nr_free[n->level]--;
 }
 
+/*
+ * Bulk-add a whole fan-out of @count nodes (all of the same @level) to their
+ * freelist in one O(1) list_splice plus a single counter update, instead of
+ * @count individual list_add + increments.
+ */
+static void lhp_freelist_add_bulk(struct lhp_pool *p, struct lhp_node *nodes,
+				  unsigned int count, enum lhp_level level)
+{
+	LIST_HEAD(batch);
+	unsigned int i;
+
+	for (i = 0; i < count; i++) {
+		nodes[i].state = LHP_FREE;
+		list_add_tail(&nodes[i].list, &batch);
+	}
+	list_splice_tail(&batch, &p->free_lists[level]);
+	p->nr_free[level] += count;
+}
+
+/*
+ * Bulk-remove a whole fan-out of @count nodes from their freelist.  The nodes
+ * are contiguous (one allocation) so we just unlink each and drop the counter
+ * once.  Unlinking is required because merge frees the backing array afterwards.
+ */
+static void lhp_freelist_del_bulk(struct lhp_pool *p, struct lhp_node *nodes,
+				  unsigned int count, enum lhp_level level)
+{
+	unsigned int i;
+
+	for (i = 0; i < count; i++)
+		list_del_init(&nodes[i].list);
+	p->nr_free[level] -= count;
+}
+
 /* --------------------------------------------------------------------------
  * Split / merge state machine
  * -------------------------------------------------------------------------- */
@@ -161,7 +212,7 @@ static int lhp_split_node(struct lhp_pool *p, struct lhp_node *node)
 {
 	enum lhp_level child_level = node->level - 1;
 	unsigned long child_pages = lhp_level_nr_pages(child_level);
-	struct lhp_node **children;
+	struct lhp_node *children;
 	unsigned int i;
 
 	if (WARN_ON_ONCE(node->level == LHP_LEVEL_4K))
@@ -169,21 +220,18 @@ static int lhp_split_node(struct lhp_pool *p, struct lhp_node *node)
 	if (WARN_ON_ONCE(node->state != LHP_FREE))
 		return -EINVAL;
 
-	children = kcalloc(LHP_FANOUT, sizeof(*children), GFP_KERNEL);
+	/*
+	 * One bulk allocation for the entire fan-out instead of LHP_FANOUT
+	 * separate kzalloc()s.  kvcalloc() falls back to vmalloc for the larger
+	 * (2M->4K) arrays, and the whole batch is later freed in one kvfree().
+	 */
+	children = kvcalloc(LHP_FANOUT, sizeof(*children), GFP_KERNEL);
 	if (!children)
 		return -ENOMEM;
 
-	for (i = 0; i < LHP_FANOUT; i++) {
-		struct page *cbase = node->base + i * child_pages;
-
-		children[i] = lhp_node_alloc(cbase, child_level, node);
-		if (!children[i]) {
-			while (i--)
-				kfree(children[i]);
-			kfree(children);
-			return -ENOMEM;
-		}
-	}
+	for (i = 0; i < LHP_FANOUT; i++)
+		lhp_node_init(&children[i], node->base + i * child_pages,
+			      child_level, node);
 
 	/* Commit: publish children and move parent to SPLIT. */
 	lhp_freelist_del(p, node);
@@ -191,8 +239,8 @@ static int lhp_split_node(struct lhp_pool *p, struct lhp_node *node)
 	node->free_children = LHP_FANOUT;
 	node->state = LHP_SPLIT;
 
-	for (i = 0; i < LHP_FANOUT; i++)
-		lhp_freelist_add(p, children[i]);
+	/* Batch-insert all LHP_FANOUT children in one splice + one counter add. */
+	lhp_freelist_add_bulk(p, children, LHP_FANOUT, child_level);
 
 	return 0;
 }
@@ -204,17 +252,19 @@ static int lhp_split_node(struct lhp_pool *p, struct lhp_node *node)
  */
 static void lhp_try_merge(struct lhp_pool *p, struct lhp_node *node)
 {
-	unsigned int i;
-
 	while (node && node->state == LHP_SPLIT &&
 	       node->free_children == LHP_FANOUT) {
 		struct lhp_node *parent = node->parent;
+		enum lhp_level child_level = node->level - 1;
 
-		for (i = 0; i < LHP_FANOUT; i++) {
-			lhp_freelist_del(p, node->children[i]);
-			kfree(node->children[i]);
-		}
-		kfree(node->children);
+		/*
+		 * Batch-unlink the whole fan-out (one counter subtract) and
+		 * release the children with a single kvfree(), rather than
+		 * LHP_FANOUT individual list_del + kfree pairs.
+		 */
+		lhp_freelist_del_bulk(p, node->children, LHP_FANOUT,
+				      child_level);
+		kvfree(node->children);
 		node->children = NULL;
 		node->free_children = 0;
 
@@ -323,7 +373,7 @@ static struct lhp_node *lhp_lookup(struct lhp_pool *p, struct page *page,
 
 				if (idx >= LHP_FANOUT)
 					return NULL;
-				n = n->children[idx];
+				n = &n->children[idx];
 			}
 		}
 		return NULL;
