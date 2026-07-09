@@ -21,6 +21,7 @@
 
 #include <linux/types.h>
 #include <linux/init.h>
+#include <linux/gfp_types.h>
 
 enum lhp_cma_level {
 	LHP_CMA_4K = 0,
@@ -61,8 +62,16 @@ struct page;
 void __init lhp_cma_reserve(void);
 int lhp_cma_available(void);
 
-/* Allocate one chunk at @level (real CMA pages), or NULL. */
-struct page *lhp_cma_alloc(enum lhp_cma_level level);
+/*
+ * Allocate one chunk at @level (real CMA pages), or NULL.
+ *
+ * @gfp is used for the small bookkeeping allocations (region descriptor, 4K
+ * bitmap).  Note that a LHP_CMA_1G allocation, and any level that has to carve
+ * a fresh region, calls cma_alloc(), which may sleep and migrate pages; those
+ * cases require process context regardless of @gfp.  Pass a non-sleeping mask
+ * only when the requested level can be satisfied without creating a new region.
+ */
+struct page *lhp_cma_alloc(enum lhp_cma_level level, gfp_t gfp);
 
 /* Release a chunk previously returned by lhp_cma_alloc(). */
 void lhp_cma_free(struct page *page, enum lhp_cma_level level);
@@ -71,7 +80,7 @@ void lhp_cma_free(struct page *page, enum lhp_cma_level level);
 
 static inline void lhp_cma_reserve(void) { }
 static inline int lhp_cma_available(void) { return 0; }
-static inline struct page *lhp_cma_alloc(enum lhp_cma_level level)
+static inline struct page *lhp_cma_alloc(enum lhp_cma_level level, gfp_t gfp)
 {
 	return NULL;
 }

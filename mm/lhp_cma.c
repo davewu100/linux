@@ -117,7 +117,8 @@ static struct lhp_cma_region *lhp_cma_region_of(struct lhp_cma_pool *p,
 }
 
 /* Grab a fresh 1G region from CMA and register it. */
-static struct lhp_cma_region *lhp_cma_new_region(struct lhp_cma_pool *p)
+static struct lhp_cma_region *lhp_cma_new_region(struct lhp_cma_pool *p,
+						 gfp_t gfp)
 {
 	unsigned long region_pages = lhp_cma_level_nr_pages(LHP_CMA_1G);
 	struct lhp_cma_region *r;
@@ -127,7 +128,7 @@ static struct lhp_cma_region *lhp_cma_new_region(struct lhp_cma_pool *p)
 	if (!base)
 		return NULL;
 
-	r = kzalloc(sizeof(*r), GFP_KERNEL);
+	r = kzalloc(sizeof(*r), gfp);
 	if (!r) {
 		cma_release(p->cma, base, region_pages);
 		return NULL;
@@ -173,7 +174,7 @@ static unsigned long __maybe_unused lhp_cma_trim(struct lhp_cma_pool *p)
  * Allocation
  * -------------------------------------------------------------------------- */
 
-static struct page *lhp_cma_alloc_1g(struct lhp_cma_pool *p)
+static struct page *lhp_cma_alloc_1g(struct lhp_cma_pool *p, gfp_t gfp)
 {
 	struct lhp_cma_region *r;
 
@@ -184,7 +185,7 @@ static struct page *lhp_cma_alloc_1g(struct lhp_cma_pool *p)
 		/* Re-thread onto the populated list. */
 		list_add(&r->list, &p->regions);
 	} else {
-		r = lhp_cma_new_region(p);
+		r = lhp_cma_new_region(p, gfp);
 		if (!r)
 			return NULL;
 	}
@@ -195,7 +196,7 @@ static struct page *lhp_cma_alloc_1g(struct lhp_cma_pool *p)
 
 /* Find (or create) a region with a free 2M slice and return its index. */
 static struct lhp_cma_region *lhp_cma_region_with_free_2m(struct lhp_cma_pool *p,
-							  int *idx_out)
+							  int *idx_out, gfp_t gfp)
 {
 	struct lhp_cma_region *r;
 	int idx;
@@ -210,19 +211,19 @@ static struct lhp_cma_region *lhp_cma_region_with_free_2m(struct lhp_cma_pool *p
 		}
 	}
 
-	r = lhp_cma_new_region(p);
+	r = lhp_cma_new_region(p, gfp);
 	if (!r)
 		return NULL;
 	*idx_out = 0;
 	return r;
 }
 
-static struct page *lhp_cma_alloc_2m(struct lhp_cma_pool *p)
+static struct page *lhp_cma_alloc_2m(struct lhp_cma_pool *p, gfp_t gfp)
 {
 	struct lhp_cma_region *r;
 	int idx;
 
-	r = lhp_cma_region_with_free_2m(p, &idx);
+	r = lhp_cma_region_with_free_2m(p, &idx, gfp);
 	if (!r)
 		return NULL;
 
@@ -232,7 +233,7 @@ static struct page *lhp_cma_alloc_2m(struct lhp_cma_pool *p)
 	return r->base + idx * lhp_cma_level_nr_pages(LHP_CMA_2M);
 }
 
-static struct page *lhp_cma_alloc_4k(struct lhp_cma_pool *p)
+static struct page *lhp_cma_alloc_4k(struct lhp_cma_pool *p, gfp_t gfp)
 {
 	struct lhp_cma_region *r;
 	int t, b;
@@ -253,11 +254,10 @@ static struct page *lhp_cma_alloc_4k(struct lhp_cma_pool *p)
 	{
 		int idx;
 
-		r = lhp_cma_region_with_free_2m(p, &idx);
+		r = lhp_cma_region_with_free_2m(p, &idx, gfp);
 		if (!r)
 			return NULL;
-		r->fourk_used[idx] = bitmap_zalloc(LHP_CMA_4K_PER_2M,
-						   GFP_KERNEL);
+		r->fourk_used[idx] = bitmap_zalloc(LHP_CMA_4K_PER_2M, gfp);
 		if (!r->fourk_used[idx])
 			return NULL;
 		set_bit(idx, r->twom_used);
@@ -273,7 +273,7 @@ found:
 	return r->base + t * lhp_cma_level_nr_pages(LHP_CMA_2M) + b;
 }
 
-struct page *lhp_cma_alloc(enum lhp_cma_level level)
+struct page *lhp_cma_alloc(enum lhp_cma_level level, gfp_t gfp)
 {
 	struct lhp_cma_pool *p = &lhp_cma_pool;
 	struct page *page = NULL;
@@ -284,13 +284,13 @@ struct page *lhp_cma_alloc(enum lhp_cma_level level)
 	mutex_lock(&p->lock);
 	switch (level) {
 	case LHP_CMA_1G:
-		page = lhp_cma_alloc_1g(p);
+		page = lhp_cma_alloc_1g(p, gfp);
 		break;
 	case LHP_CMA_2M:
-		page = lhp_cma_alloc_2m(p);
+		page = lhp_cma_alloc_2m(p, gfp);
 		break;
 	default:
-		page = lhp_cma_alloc_4k(p);
+		page = lhp_cma_alloc_4k(p, gfp);
 		break;
 	}
 	mutex_unlock(&p->lock);
@@ -385,7 +385,12 @@ EXPORT_SYMBOL_GPL(lhp_cma_free);
 
 int lhp_cma_available(void)
 {
-	return READ_ONCE(lhp_cma_pool.ready);
+	/*
+	 * Acquire load pairs with the smp_store_release() in
+	 * lhp_cma_pool_init(): a caller that observes ready == true also sees
+	 * the initialised p->cma and list heads.
+	 */
+	return smp_load_acquire(&lhp_cma_pool.ready);
 }
 EXPORT_SYMBOL_GPL(lhp_cma_available);
 
@@ -401,7 +406,11 @@ static int __init lhp_cma_pool_init(void)
 		return 0;
 
 	p->cma = lhp_cma_area;
-	WRITE_ONCE(p->ready, true);
+	/*
+	 * Release store: publishes p->cma and the initialised list heads to any
+	 * consumer that observes ready == true via lhp_cma_available().
+	 */
+	smp_store_release(&p->ready, true);
 	pr_info("layered CMA view ready (%llu MiB)\n",
 		(u64)cma_get_size(lhp_cma_area) / SZ_1M);
 	return 0;
@@ -459,7 +468,7 @@ static ssize_t lhp_cma_alloc_write(struct file *file, const char __user *ubuf,
 	if (level >= LHP_CMA_NR_LEVELS)
 		return -EINVAL;
 
-	pg = lhp_cma_alloc(level);
+	pg = lhp_cma_alloc(level, GFP_KERNEL);
 	if (!pg)
 		return -ENOMEM;
 
