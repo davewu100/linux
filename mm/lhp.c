@@ -20,13 +20,17 @@
 #include <linux/mm.h>
 #include <linux/slab.h>
 #include <linux/list.h>
-#include <linux/mutex.h>
+#include <linux/spinlock.h>
+#include <linux/atomic.h>
 #include <linux/init.h>
 #include <linux/sizes.h>
 #include <linux/memblock.h>
 #include <linux/debugfs.h>
 #include <linux/seq_file.h>
 #include <linux/ktime.h>
+#include <linux/kthread.h>
+#include <linux/completion.h>
+#include <linux/sched.h>
 
 /*
  * A node in the layered hierarchy.  One struct describes a single 1G, 2M or 4K
@@ -78,20 +82,39 @@ struct lhp_child_array {
 #define LHP_MAX_SPLIT_DEPTH	(LHP_NR_LEVELS - 1)
 
 /*
- * The pool.  A single global instance for now.  free_lists[level] holds all
- * LHP_FREE nodes of that level, newest-first.
+ * A single 1G region.  This is the unit of locking: a region owns its whole
+ * subtree (its 1G root and any 2M/4K nodes it was split into), its own free
+ * lists and its own child-array recycle cache.  Because a region's subtree
+ * never spans another region, all split/merge/alloc/free within it are
+ * serialised only by the region's own lock -- different CPUs operating on
+ * different regions never contend.
+ *
+ * free_lists[]/nr_free[] only ever hold sub-1G levels (2M, 4K); the 1G root's
+ * availability is tracked separately by @root_free so a whole-region 1G alloc
+ * does not have to walk a list.
  */
-struct lhp_pool {
-	struct cma		*cma;
-	unsigned long		nr_1g;			/* # of 1G roots */
-	struct lhp_node		**roots;		/* [nr_1g] */
+struct lhp_region {
+	spinlock_t		lock;
+	struct lhp_node		*root;			/* the 1G node */
+	bool			root_free;		/* root allocatable as 1G */
 	struct list_head	free_lists[LHP_NR_LEVELS];
 	unsigned long		nr_free[LHP_NR_LEVELS];
 	unsigned long		nr_alloc[LHP_NR_LEVELS];
-	/* Recycled child-array cache (see struct lhp_child_array). */
+	/* Per-region recycled child-array cache (see struct lhp_child_array). */
 	struct list_head	array_cache;
 	unsigned long		nr_cached;
-	struct mutex		lock;
+	struct page		*base;			/* 1G head page */
+};
+
+/*
+ * The pool: an immutable-after-init array of regions plus a round-robin cursor
+ * used to spread allocations across regions and reduce per-region contention.
+ */
+struct lhp_pool {
+	struct cma		*cma;
+	unsigned long		nr_regions;
+	struct lhp_region	*regions;		/* [nr_regions] */
+	atomic_t		cursor;			/* round-robin start hint */
 	bool			ready;
 };
 
@@ -172,17 +195,17 @@ static struct lhp_node *lhp_node_alloc(struct page *base, enum lhp_level level,
 	return n;
 }
 
-static void lhp_freelist_add(struct lhp_pool *p, struct lhp_node *n)
+static void lhp_freelist_add(struct lhp_region *rg, struct lhp_node *n)
 {
 	n->state = LHP_FREE;
-	list_add(&n->list, &p->free_lists[n->level]);
-	p->nr_free[n->level]++;
+	list_add(&n->list, &rg->free_lists[n->level]);
+	rg->nr_free[n->level]++;
 }
 
-static void lhp_freelist_del(struct lhp_pool *p, struct lhp_node *n)
+static void lhp_freelist_del(struct lhp_region *rg, struct lhp_node *n)
 {
 	list_del_init(&n->list);
-	p->nr_free[n->level]--;
+	rg->nr_free[n->level]--;
 }
 
 /*
@@ -190,7 +213,7 @@ static void lhp_freelist_del(struct lhp_pool *p, struct lhp_node *n)
  * freelist in one O(1) list_splice plus a single counter update, instead of
  * @count individual list_add + increments.
  */
-static void lhp_freelist_add_bulk(struct lhp_pool *p, struct lhp_node *nodes,
+static void lhp_freelist_add_bulk(struct lhp_region *rg, struct lhp_node *nodes,
 				  unsigned int count, enum lhp_level level)
 {
 	LIST_HEAD(batch);
@@ -200,8 +223,8 @@ static void lhp_freelist_add_bulk(struct lhp_pool *p, struct lhp_node *nodes,
 		nodes[i].state = LHP_FREE;
 		list_add_tail(&nodes[i].list, &batch);
 	}
-	list_splice_tail(&batch, &p->free_lists[level]);
-	p->nr_free[level] += count;
+	list_splice_tail(&batch, &rg->free_lists[level]);
+	rg->nr_free[level] += count;
 }
 
 /*
@@ -209,24 +232,25 @@ static void lhp_freelist_add_bulk(struct lhp_pool *p, struct lhp_node *nodes,
  * are contiguous (one allocation) so we just unlink each and drop the counter
  * once.  Unlinking is required because merge frees the backing array afterwards.
  */
-static void lhp_freelist_del_bulk(struct lhp_pool *p, struct lhp_node *nodes,
+static void lhp_freelist_del_bulk(struct lhp_region *rg, struct lhp_node *nodes,
 				  unsigned int count, enum lhp_level level)
 {
 	unsigned int i;
 
 	for (i = 0; i < count; i++)
 		list_del_init(&nodes[i].list);
-	p->nr_free[level] -= count;
+	rg->nr_free[level] -= count;
 }
 
 /* --------------------------------------------------------------------------
  * Child-array cache + prealloc reservoir
  *
- * kvcalloc() may sleep and even trigger reclaim, so we never call it under the
- * pool lock.  Instead lhp_alloc() pre-allocates enough arrays into a small
+ * kvzalloc() may sleep and even trigger reclaim, so we never call it under a
+ * region lock.  Instead lhp_alloc() pre-allocates enough arrays into a small
  * on-stack reservoir *before* taking the lock; the split path consumes from the
- * reservoir, and any leftovers are pushed into the pool's recycle cache (also
- * outside the lock).  Merge returns arrays to the cache instead of freeing them.
+ * reservoir, and any leftovers are pushed into the target region's recycle
+ * cache.  Merge returns arrays to the region cache instead of freeing them.
+ * The cache is now per-region, so recycling never crosses the region lock.
  * -------------------------------------------------------------------------- */
 
 /* A tiny stack-local stash of preallocated arrays handed into the locked path. */
@@ -240,32 +264,33 @@ static struct lhp_child_array *lhp_array_alloc(void)
 	return kvzalloc(sizeof(struct lhp_child_array), GFP_KERNEL);
 }
 
-/* Pop a recycled array from the cache (caller holds lock), or NULL if empty. */
-static struct lhp_child_array *lhp_cache_pop(struct lhp_pool *p)
+/* Pop a recycled array from the region cache (caller holds region lock). */
+static struct lhp_child_array *lhp_cache_pop(struct lhp_region *rg)
 {
 	struct lhp_child_array *a;
 
-	a = list_first_entry_or_null(&p->array_cache,
+	a = list_first_entry_or_null(&rg->array_cache,
 				     struct lhp_child_array, cache);
 	if (a) {
 		list_del(&a->cache);
-		p->nr_cached--;
+		rg->nr_cached--;
 	}
 	return a;
 }
 
-/* Push an array into the cache (caller holds lock). */
-static void lhp_cache_push(struct lhp_pool *p, struct lhp_child_array *a)
+/* Push an array into the region cache (caller holds region lock). */
+static void lhp_cache_push(struct lhp_region *rg, struct lhp_child_array *a)
 {
-	list_add(&a->cache, &p->array_cache);
-	p->nr_cached++;
+	list_add(&a->cache, &rg->array_cache);
+	rg->nr_cached++;
 }
 
 /*
- * Fill @r with @need freshly allocated arrays, outside the lock.  Returns 0 or
+ * Fill @r with @need freshly allocated arrays, outside any lock.  Returns 0 or
  * -ENOMEM (freeing anything it managed to grab).  We deliberately over-provision
- * from the allocator rather than peek at the cache, since the cache can only be
- * inspected under the lock; unused arrays are recycled into the cache later.
+ * from the allocator rather than peek at a cache, since caches can only be
+ * inspected under a region lock; unused arrays are recycled into a region cache
+ * later.
  */
 static int lhp_reservoir_fill(struct lhp_reservoir *r, unsigned int need)
 {
@@ -292,20 +317,23 @@ static struct lhp_child_array *lhp_reservoir_take(struct lhp_reservoir *r)
 }
 
 /*
- * Drain leftover reservoir arrays into the pool cache (caller holds lock).
- * Keeps the cache from growing without bound by capping it.
+ * Drain leftover reservoir arrays into a region cache (caller holds the region
+ * lock).  Stops once the per-region cache is full, leaving any remainder in the
+ * reservoir; the caller frees that remainder with lhp_reservoir_free() *after*
+ * dropping the lock, so kvfree() never runs under the region spinlock.
  */
 #define LHP_ARRAY_CACHE_MAX	64
-static void lhp_reservoir_drain(struct lhp_pool *p, struct lhp_reservoir *r)
+static void lhp_reservoir_drain(struct lhp_region *rg, struct lhp_reservoir *r)
 {
-	while (r->nr) {
-		struct lhp_child_array *a = r->arr[--r->nr];
+	while (r->nr && rg->nr_cached < LHP_ARRAY_CACHE_MAX)
+		lhp_cache_push(rg, r->arr[--r->nr]);
+}
 
-		if (p->nr_cached < LHP_ARRAY_CACHE_MAX)
-			lhp_cache_push(p, a);
-		else
-			kvfree(a);	/* rare: cache full, drop excess */
-	}
+/* Free any arrays still left in the reservoir.  Call with no lock held. */
+static void lhp_reservoir_free(struct lhp_reservoir *r)
+{
+	while (r->nr)
+		kvfree(r->arr[--r->nr]);
 }
 
 /*
@@ -323,11 +351,11 @@ static unsigned int lhp_splits_needed(enum lhp_level level)
 
 /*
  * Split a free node into LHP_FANOUT free children of the next level down.
- * The node moves FREE -> SPLIT.  The backing child array is taken from @res
- * (preallocated outside the lock) or, failing that, the pool recycle cache.
- * Returns 0 or -ENOMEM.  Caller holds the pool lock.
+ * The node moves FREE -> SPLIT.  The backing child array is taken from the
+ * region recycle cache, else from @res (preallocated outside the lock).
+ * Returns 0 or -ENOMEM.  Caller holds the region lock.
  */
-static int lhp_split_node(struct lhp_pool *p, struct lhp_node *node,
+static int lhp_split_node(struct lhp_region *rg, struct lhp_node *node,
 			  struct lhp_reservoir *res)
 {
 	enum lhp_level child_level = node->level - 1;
@@ -341,12 +369,12 @@ static int lhp_split_node(struct lhp_pool *p, struct lhp_node *node,
 		return -EINVAL;
 
 	/*
-	 * No allocation here: pull a recycled array from the cache, else one the
-	 * caller preallocated outside the lock.  This keeps the locked critical
-	 * section allocation-free (no sleeping, no reclaim) and reuses arrays
-	 * across split/merge cycles instead of kvcalloc/kvfree churn.
+	 * No allocation here: pull a recycled array from the region cache, else
+	 * one the caller preallocated outside the lock.  This keeps the locked
+	 * critical section allocation-free (no sleeping, no reclaim) and reuses
+	 * arrays across split/merge cycles instead of kvzalloc/kvfree churn.
 	 */
-	children = lhp_cache_pop(p);
+	children = lhp_cache_pop(rg);
 	if (!children)
 		children = lhp_reservoir_take(res);
 	if (!children)
@@ -357,13 +385,16 @@ static int lhp_split_node(struct lhp_pool *p, struct lhp_node *node,
 			      node->base + i * child_pages, child_level, node);
 
 	/* Commit: publish children and move parent to SPLIT. */
-	lhp_freelist_del(p, node);
+	if (node->level == LHP_LEVEL_1G)
+		rg->root_free = false;	/* root now subdivided, not a whole 1G */
+	else
+		lhp_freelist_del(rg, node);
 	node->children = children;
 	node->free_children = LHP_FANOUT;
 	node->state = LHP_SPLIT;
 
 	/* Batch-insert all LHP_FANOUT children in one splice + one counter add. */
-	lhp_freelist_add_bulk(p, children->nodes, LHP_FANOUT, child_level);
+	lhp_freelist_add_bulk(rg, children->nodes, LHP_FANOUT, child_level);
 
 	return 0;
 }
@@ -373,7 +404,7 @@ static int lhp_split_node(struct lhp_pool *p, struct lhp_node *node,
  * and return the node to its own freelist as FREE.  Recurses upward so a single
  * 4K free can bubble all the way to a reconstituted 1G.
  */
-static void lhp_try_merge(struct lhp_pool *p, struct lhp_node *node)
+static void lhp_try_merge(struct lhp_region *rg, struct lhp_node *node)
 {
 	while (node && node->state == LHP_SPLIT &&
 	       node->free_children == LHP_FANOUT) {
@@ -382,56 +413,90 @@ static void lhp_try_merge(struct lhp_pool *p, struct lhp_node *node)
 
 		/*
 		 * Batch-unlink the whole fan-out (one counter subtract) and
-		 * recycle the child array into the cache instead of kvfree()ing
-		 * it.  This avoids repeated alloc/free and, when the array lives
-		 * in vmalloc, the unmap + TLB flush that kvfree() would trigger.
+		 * recycle the child array into the region cache instead of
+		 * kvfree()ing it.  This avoids repeated alloc/free and, when the
+		 * array lives in vmalloc, the unmap + TLB flush kvfree() incurs.
 		 */
-		lhp_freelist_del_bulk(p, node->children->nodes, LHP_FANOUT,
+		lhp_freelist_del_bulk(rg, node->children->nodes, LHP_FANOUT,
 				      child_level);
-		lhp_cache_push(p, node->children);
+		lhp_cache_push(rg, node->children);
 		node->children = NULL;
 		node->free_children = 0;
+		node->state = LHP_FREE;
 
-		lhp_freelist_add(p, node);
-
-		if (parent) {
+		if (node->level == LHP_LEVEL_1G) {
+			/* Whole region merged back to a single free 1G. */
+			rg->root_free = true;
+			node = NULL;
+		} else {
+			lhp_freelist_add(rg, node);
 			/* node just became free again -> bump parent's counter */
 			parent->free_children++;
 			node = parent;
-		} else {
-			node = NULL;
 		}
 	}
 }
 
 /*
- * Obtain a free node of exactly @level, splitting a higher level if needed.
- * @res supplies preallocated child arrays for any splits.  Returns a node in
- * state LHP_FREE (still on its freelist) or NULL.  Caller holds the pool lock.
+ * Obtain a free node of exactly @level within region @rg, splitting a higher
+ * level if needed.  @res supplies preallocated child arrays for any splits.
+ * Returns a free node (root for 1G, or a node still on a freelist for 2M/4K)
+ * or NULL.  Caller holds the region lock.
  */
-static struct lhp_node *lhp_get_free(struct lhp_pool *p, enum lhp_level level,
+static struct lhp_node *lhp_get_free(struct lhp_region *rg, enum lhp_level level,
 				     struct lhp_reservoir *res)
 {
-	if (!list_empty(&p->free_lists[level]))
-		return list_first_entry(&p->free_lists[level],
-					struct lhp_node, list);
-
 	if (level == LHP_LEVEL_1G)
-		return NULL;	/* nothing bigger to split */
+		return rg->root_free ? rg->root : NULL;
+
+	if (!list_empty(&rg->free_lists[level]))
+		return list_first_entry(&rg->free_lists[level],
+					struct lhp_node, list);
 
 	/* Recursively make a parent, then split it. */
 	{
-		struct lhp_node *parent = lhp_get_free(p, level + 1, res);
+		struct lhp_node *parent = lhp_get_free(rg, level + 1, res);
 
 		if (!parent)
 			return NULL;
-		if (lhp_split_node(p, parent, res))
+		if (lhp_split_node(rg, parent, res))
 			return NULL;
 	}
 
-	if (list_empty(&p->free_lists[level]))
+	if (list_empty(&rg->free_lists[level]))
 		return NULL;
-	return list_first_entry(&p->free_lists[level], struct lhp_node, list);
+	return list_first_entry(&rg->free_lists[level], struct lhp_node, list);
+}
+
+/*
+ * Try to allocate one @level chunk from region @rg.  Returns the head page or
+ * NULL.  Handles both the whole-1G case and the sub-1G split case, plus the
+ * bookkeeping (state, parent free_children, per-region nr_alloc).
+ * Caller holds the region lock.
+ */
+static struct page *lhp_region_alloc(struct lhp_region *rg, enum lhp_level level,
+				     struct lhp_reservoir *res)
+{
+	struct lhp_node *n = lhp_get_free(rg, level, res);
+	struct lhp_node *parent;
+
+	if (!n)
+		return NULL;
+
+	if (level == LHP_LEVEL_1G) {
+		rg->root_free = false;
+		n->state = LHP_ALLOCATED;
+		rg->nr_alloc[level]++;
+		return n->base;
+	}
+
+	parent = n->parent;
+	lhp_freelist_del(rg, n);
+	n->state = LHP_ALLOCATED;
+	if (parent)
+		parent->free_children--;
+	rg->nr_alloc[level]++;
+	return n->base;
 }
 
 /* --------------------------------------------------------------------------
@@ -447,73 +512,87 @@ struct page *lhp_alloc(enum lhp_level level)
 {
 	struct lhp_pool *p = &lhp_pool;
 	struct lhp_reservoir res;
-	struct lhp_node *n;
 	struct page *page = NULL;
+	unsigned long i, start;
 
 	if (!lhp_pool_available() || level >= LHP_NR_LEVELS)
 		return NULL;
 
 	/*
-	 * Preallocate the worst-case number of child arrays *before* taking the
-	 * lock, so the locked path never allocates.  The recycle cache usually
-	 * satisfies splits, in which case these go straight back to the cache
-	 * via lhp_reservoir_drain() and no real allocation happened at all.
+	 * Preallocate the worst-case number of child arrays *before* taking any
+	 * region lock, so the locked path never allocates.  A region's recycle
+	 * cache usually satisfies splits, in which case these go straight into
+	 * that region's cache via lhp_reservoir_drain() and no real allocation
+	 * happened at all; the remainder is freed after unlocking.
 	 */
 	if (lhp_reservoir_fill(&res, lhp_splits_needed(level)))
 		return NULL;
 
-	mutex_lock(&p->lock);
-	n = lhp_get_free(p, level, &res);
-	if (n) {
-		struct lhp_node *parent = n->parent;
+	/*
+	 * Round-robin across regions from a shared cursor to spread contention,
+	 * then linear-probe.  Only one region lock is held at a time, so CPUs
+	 * hitting different regions never contend.
+	 */
+	start = (unsigned long)atomic_fetch_inc(&p->cursor);
+	for (i = 0; i < p->nr_regions; i++) {
+		struct lhp_region *rg = &p->regions[(start + i) % p->nr_regions];
 
-		lhp_freelist_del(p, n);
-		n->state = LHP_ALLOCATED;
-		if (parent)
-			parent->free_children--;
-		p->nr_alloc[level]++;
-		page = n->base;
+		spin_lock(&rg->lock);
+		page = lhp_region_alloc(rg, level, &res);
+		if (page)
+			lhp_reservoir_drain(rg, &res);
+		spin_unlock(&rg->lock);
+		if (page)
+			break;
 	}
-	lhp_reservoir_drain(p, &res);
-	mutex_unlock(&p->lock);
+
+	lhp_reservoir_free(&res);	/* free any undrained remainder */
 	return page;
 }
 EXPORT_SYMBOL_GPL(lhp_alloc);
 
 /*
- * Locate the allocated node backing @page at @level.  O(depth): walk from the
- * owning root down through SPLIT nodes by page offset.  Kept simple on purpose;
- * a production version would hash page->private or similar.
+ * Find the region owning @page.  The regions[] array is immutable after init,
+ * so this needs no lock.
  */
-static struct lhp_node *lhp_lookup(struct lhp_pool *p, struct page *page,
-				   enum lhp_level level)
+static struct lhp_region *lhp_find_region(struct lhp_pool *p, struct page *page)
 {
+	unsigned long root_pages = lhp_level_nr_pages(LHP_LEVEL_1G);
 	unsigned long i;
 
-	for (i = 0; i < p->nr_1g; i++) {
-		struct lhp_node *n = p->roots[i];
-		unsigned long root_pages = lhp_level_nr_pages(LHP_LEVEL_1G);
+	for (i = 0; i < p->nr_regions; i++) {
+		struct lhp_region *rg = &p->regions[i];
 
-		if (page < n->base || page >= n->base + root_pages)
-			continue;
+		if (page >= rg->base && page < rg->base + root_pages)
+			return rg;
+	}
+	return NULL;
+}
 
-		while (n) {
-			if (n->level == level && n->base == page)
-				return n;
-			if (n->state != LHP_SPLIT)
+/*
+ * Locate the allocated node backing @page at @level within region @rg.
+ * O(depth): walk from the root down through SPLIT nodes by page offset.
+ * Caller holds the region lock.
+ */
+static struct lhp_node *lhp_lookup(struct lhp_region *rg, struct page *page,
+				   enum lhp_level level)
+{
+	struct lhp_node *n = rg->root;
+
+	while (n) {
+		if (n->level == level && n->base == page)
+			return n;
+		if (n->state != LHP_SPLIT)
+			return NULL;
+		{
+			unsigned long child_pages =
+				lhp_level_nr_pages(n->level - 1);
+			unsigned long idx = (page - n->base) / child_pages;
+
+			if (idx >= LHP_FANOUT)
 				return NULL;
-			{
-				unsigned long child_pages =
-					lhp_level_nr_pages(n->level - 1);
-				unsigned long idx =
-					(page - n->base) / child_pages;
-
-				if (idx >= LHP_FANOUT)
-					return NULL;
-				n = &n->children->nodes[idx];
-			}
+			n = &n->children->nodes[idx];
 		}
-		return NULL;
 	}
 	return NULL;
 }
@@ -521,26 +600,38 @@ static struct lhp_node *lhp_lookup(struct lhp_pool *p, struct page *page,
 void lhp_free(struct page *page, enum lhp_level level)
 {
 	struct lhp_pool *p = &lhp_pool;
+	struct lhp_region *rg;
 	struct lhp_node *n;
 
 	if (!lhp_pool_available() || !page || level >= LHP_NR_LEVELS)
 		return;
 
-	mutex_lock(&p->lock);
-	n = lhp_lookup(p, page, level);
+	rg = lhp_find_region(p, page);
+	if (WARN_ONCE(!rg, "lhp_free: page %px not in any region\n", page))
+		return;
+
+	spin_lock(&rg->lock);
+	n = lhp_lookup(rg, page, level);
 	if (!n || n->state != LHP_ALLOCATED) {
 		WARN_ONCE(1, "lhp_free: bad page %px level %d\n", page, level);
 		goto out;
 	}
 
-	lhp_freelist_add(p, n);
-	p->nr_alloc[level]--;
-	if (n->parent) {
-		n->parent->free_children++;
-		lhp_try_merge(p, n->parent);
+	rg->nr_alloc[level]--;
+
+	if (level == LHP_LEVEL_1G) {
+		/* Whole-region free: root becomes an allocatable 1G again. */
+		n->state = LHP_FREE;
+		rg->root_free = true;
+	} else {
+		lhp_freelist_add(rg, n);
+		if (n->parent) {
+			n->parent->free_children++;
+			lhp_try_merge(rg, n->parent);
+		}
 	}
 out:
-	mutex_unlock(&p->lock);
+	spin_unlock(&rg->lock);
 }
 EXPORT_SYMBOL_GPL(lhp_free);
 
@@ -548,16 +639,26 @@ EXPORT_SYMBOL_GPL(lhp_free);
  * Pool init: pull 1G compound blocks out of the reserved CMA area
  * -------------------------------------------------------------------------- */
 
+static void lhp_region_init(struct lhp_region *rg, struct page *base,
+			    struct lhp_node *root)
+{
+	int level;
+
+	spin_lock_init(&rg->lock);
+	for (level = 0; level < LHP_NR_LEVELS; level++)
+		INIT_LIST_HEAD(&rg->free_lists[level]);
+	INIT_LIST_HEAD(&rg->array_cache);
+	rg->base = base;
+	rg->root = root;
+	rg->root_free = true;
+}
+
 static int __init lhp_pool_init(void)
 {
 	struct lhp_pool *p = &lhp_pool;
 	unsigned long nr_1g, i;
-	int level;
 
-	mutex_init(&p->lock);
-	for (level = 0; level < LHP_NR_LEVELS; level++)
-		INIT_LIST_HEAD(&p->free_lists[level]);
-	INIT_LIST_HEAD(&p->array_cache);
+	atomic_set(&p->cursor, 0);
 
 	if (!lhp_cma)
 		return 0;
@@ -566,8 +667,8 @@ static int __init lhp_pool_init(void)
 	if (!nr_1g)
 		return 0;
 
-	p->roots = kcalloc(nr_1g, sizeof(*p->roots), GFP_KERNEL);
-	if (!p->roots)
+	p->regions = kcalloc(nr_1g, sizeof(*p->regions), GFP_KERNEL);
+	if (!p->regions)
 		return -ENOMEM;
 
 	p->cma = lhp_cma;
@@ -590,19 +691,19 @@ static int __init lhp_pool_init(void)
 				    lhp_level_nr_pages(LHP_LEVEL_1G));
 			break;
 		}
-		p->roots[i] = root;
-		lhp_freelist_add(p, root);
+		lhp_region_init(&p->regions[i], base, root);
 	}
 
-	p->nr_1g = i;
-	if (!p->nr_1g) {
-		kfree(p->roots);
-		p->roots = NULL;
+	p->nr_regions = i;
+	if (!p->nr_regions) {
+		kfree(p->regions);
+		p->regions = NULL;
 		return 0;
 	}
 
 	WRITE_ONCE(p->ready, true);
-	pr_info("pool ready: %lu x 1G blocks\n", p->nr_1g);
+	pr_info("pool ready: %lu x 1G regions (per-region locking)\n",
+		p->nr_regions);
 	return 0;
 }
 /* After buddy/CMA are fully up. */
@@ -611,9 +712,10 @@ late_initcall(lhp_pool_init);
 /* --------------------------------------------------------------------------
  * debugfs: observe and drive the pool
  *
- *   /sys/kernel/debug/lhp/stats   - read counters
+ *   /sys/kernel/debug/lhp/stats   - read aggregated per-region counters
  *   /sys/kernel/debug/lhp/alloc   - write "0|1|2" (4K|2M|1G) to test-alloc
- *   /sys/kernel/debug/lhp/free    - write a pfn to free the chunk at that pfn
+ *   /sys/kernel/debug/lhp/bench   - write "<ops_per_thread> [threads]" to run
+ *                                   the (optionally concurrent) microbenchmark
  * -------------------------------------------------------------------------- */
 
 #ifdef CONFIG_DEBUG_FS
@@ -629,15 +731,38 @@ static const char *lhp_level_name(enum lhp_level l)
 static int lhp_stats_show(struct seq_file *m, void *v)
 {
 	struct lhp_pool *p = &lhp_pool;
+	unsigned long nr_free[LHP_NR_LEVELS] = {};
+	unsigned long nr_alloc[LHP_NR_LEVELS] = {};
+	unsigned long cached = 0, free_1g = 0, i;
 	int l;
 
-	mutex_lock(&p->lock);
-	seq_printf(m, "ready: %d\n1G roots: %lu\narray cache: %lu\n",
-		   p->ready, p->nr_1g, p->nr_cached);
+	if (!READ_ONCE(p->ready)) {
+		seq_puts(m, "ready: 0\n");
+		return 0;
+	}
+
+	/* Sum per-region counters, briefly locking each region in turn. */
+	for (i = 0; i < p->nr_regions; i++) {
+		struct lhp_region *rg = &p->regions[i];
+
+		spin_lock(&rg->lock);
+		if (rg->root_free)
+			free_1g++;
+		cached += rg->nr_cached;
+		for (l = 0; l < LHP_NR_LEVELS; l++) {
+			nr_free[l] += rg->nr_free[l];
+			nr_alloc[l] += rg->nr_alloc[l];
+		}
+		spin_unlock(&rg->lock);
+	}
+
+	seq_printf(m, "ready: %d\nregions: %lu\nfree 1G regions: %lu\narray cache: %lu\n",
+		   p->ready, p->nr_regions, free_1g, cached);
+	/* 1G "free" is the number of wholly-idle regions. */
+	nr_free[LHP_LEVEL_1G] = free_1g;
 	for (l = LHP_NR_LEVELS - 1; l >= 0; l--)
 		seq_printf(m, "%s: free=%lu alloc=%lu\n",
-			   lhp_level_name(l), p->nr_free[l], p->nr_alloc[l]);
-	mutex_unlock(&p->lock);
+			   lhp_level_name(l), nr_free[l], nr_alloc[l]);
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(lhp_stats);
@@ -671,69 +796,149 @@ static const struct file_operations lhp_alloc_fops = {
 };
 
 /*
- * Microbenchmark.  Writing "<n>" to lhp/bench allocates @n 4K chunks (which
- * forces the full 1G->2M->4K split chain and exercises the array cache) and
- * then frees them all (forcing merges back up), timing each phase.  The result
- * is stashed for reading back via the same file.
+ * Microbenchmark, with optional multi-threaded concurrency to measure lock
+ * contention.  Write "<ops_per_thread> [threads]" to lhp/bench.  Each thread
+ * repeatedly allocates then immediately frees a 4K chunk @ops_per_thread times,
+ * driving the full 1G->2M->4K split + merge machinery and the array cache.
+ * Running T threads on T CPUs exercises the per-region locking: with more
+ * regions than threads and round-robin region selection, threads mostly hit
+ * different regions and should scale close to linearly.
  *
- * This measures the pure metadata split/merge cost of plan B: no page data is
- * ever copied, so it isolates the effect of the bulk + array-cache changes.
+ * Because plan B never copies page data, this isolates the pure metadata cost
+ * and the lock-contention behaviour of split/merge.
  */
+#define LHP_BENCH_MAX_THREADS	64
+
+struct lhp_bench_thread {
+	struct task_struct	*task;
+	unsigned long		ops;		/* iterations to run */
+	unsigned long		done;		/* iterations completed */
+	u64			ns;		/* per-thread wall time */
+	struct completion	start;
+	struct completion	end;
+};
+
 struct lhp_bench_result {
-	unsigned long	n;
-	u64		alloc_ns;
-	u64		free_ns;
+	unsigned long	ops_per_thread;
+	unsigned int	threads;
+	unsigned long	total_ops;
+	u64		wall_ns;	/* max thread wall time (parallel) */
+	u64		sum_ns;		/* sum of thread times (total CPU) */
 	bool		valid;
 };
 static struct lhp_bench_result lhp_bench_last;
 
+static int lhp_bench_fn(void *arg)
+{
+	struct lhp_bench_thread *t = arg;
+	unsigned long i;
+	ktime_t t0, t1;
+
+	wait_for_completion(&t->start);
+
+	t0 = ktime_get();
+	for (i = 0; i < t->ops; i++) {
+		struct page *pg = lhp_alloc(LHP_LEVEL_4K);
+
+		if (!pg)
+			break;
+		lhp_free(pg, LHP_LEVEL_4K);
+	}
+	t1 = ktime_get();
+
+	t->done = i;
+	t->ns = ktime_to_ns(ktime_sub(t1, t0));
+	complete(&t->end);
+
+	/* Park until kthread_stop() so the task_struct stays valid. */
+	while (!kthread_should_stop())
+		schedule_timeout_interruptible(HZ / 10);
+	return 0;
+}
+
+static int lhp_bench_run(unsigned long ops_per_thread, unsigned int threads)
+{
+	struct lhp_bench_thread *t;
+	unsigned int i, launched = 0;
+	u64 wall = 0, sum = 0;
+	unsigned long total_done = 0;
+
+	t = kcalloc(threads, sizeof(*t), GFP_KERNEL);
+	if (!t)
+		return -ENOMEM;
+
+	for (i = 0; i < threads; i++) {
+		t[i].ops = ops_per_thread;
+		init_completion(&t[i].start);
+		init_completion(&t[i].end);
+		t[i].task = kthread_create(lhp_bench_fn, &t[i],
+					   "lhp_bench/%u", i);
+		if (IS_ERR(t[i].task))
+			break;
+		kthread_bind(t[i].task, i % num_online_cpus());
+		wake_up_process(t[i].task);
+		launched++;
+	}
+	if (!launched) {
+		kfree(t);
+		return -EAGAIN;
+	}
+
+	/* Release all threads as simultaneously as possible. */
+	for (i = 0; i < launched; i++)
+		complete(&t[i].start);
+
+	for (i = 0; i < launched; i++) {
+		wait_for_completion(&t[i].end);
+		wall = max(wall, t[i].ns);
+		sum += t[i].ns;
+		total_done += t[i].done;
+	}
+
+	for (i = 0; i < launched; i++)
+		kthread_stop(t[i].task);
+
+	lhp_bench_last.ops_per_thread = ops_per_thread;
+	lhp_bench_last.threads = launched;
+	lhp_bench_last.total_ops = total_done;
+	lhp_bench_last.wall_ns = wall;
+	lhp_bench_last.sum_ns = sum;
+	lhp_bench_last.valid = true;
+
+	pr_info("bench: %u thread(s) x %lu ops  wall=%llu ns  %llu ns/op (parallel)  %llu ns/op (per-cpu)\n",
+		launched, ops_per_thread, wall,
+		total_done ? wall * launched / total_done : 0,
+		total_done ? sum / total_done : 0);
+
+	kfree(t);
+	return 0;
+}
+
 static ssize_t lhp_bench_write(struct file *file, const char __user *ubuf,
 			       size_t count, loff_t *ppos)
 {
-	struct page **pages;
-	unsigned long n, i, done;
-	ktime_t t0, t1, t2;
+	char buf[64];
+	unsigned long ops;
+	unsigned int threads = 1;
 	int ret;
 
-	ret = kstrtoul_from_user(ubuf, count, 0, &n);
-	if (ret)
-		return ret;
-	if (!n || n > (1UL << 20))	/* cap at ~1M chunks */
+	if (count >= sizeof(buf))
+		return -EINVAL;
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+	buf[count] = '\0';
+
+	ret = sscanf(buf, "%lu %u", &ops, &threads);
+	if (ret < 1)
+		return -EINVAL;
+	if (!ops || ops > (1UL << 22))
+		return -EINVAL;
+	if (threads < 1 || threads > LHP_BENCH_MAX_THREADS)
 		return -EINVAL;
 
-	pages = kvcalloc(n, sizeof(*pages), GFP_KERNEL);
-	if (!pages)
-		return -ENOMEM;
-
-	/* Phase 1: allocate n x 4K, driving splits down to the leaf level. */
-	t0 = ktime_get();
-	for (i = 0; i < n; i++) {
-		pages[i] = lhp_alloc(LHP_LEVEL_4K);
-		if (!pages[i])
-			break;
-	}
-	t1 = ktime_get();
-	done = i;
-
-	/* Phase 2: free them all, driving merges back up towards 1G. */
-	for (i = 0; i < done; i++)
-		lhp_free(pages[i], LHP_LEVEL_4K);
-	t2 = ktime_get();
-
-	lhp_bench_last.n = done;
-	lhp_bench_last.alloc_ns = ktime_to_ns(ktime_sub(t1, t0));
-	lhp_bench_last.free_ns = ktime_to_ns(ktime_sub(t2, t1));
-	lhp_bench_last.valid = true;
-
-	pr_info("bench: %lu x 4K  alloc=%llu ns (%llu ns/op)  free=%llu ns (%llu ns/op)\n",
-		done, lhp_bench_last.alloc_ns,
-		done ? lhp_bench_last.alloc_ns / done : 0,
-		lhp_bench_last.free_ns,
-		done ? lhp_bench_last.free_ns / done : 0);
-
-	kvfree(pages);
-	if (done != n)
-		return -ENOSPC;		/* pool exhausted before finishing */
+	ret = lhp_bench_run(ops, threads);
+	if (ret)
+		return ret;
 	return count;
 }
 
@@ -742,14 +947,17 @@ static int lhp_bench_show(struct seq_file *m, void *v)
 	struct lhp_bench_result r = lhp_bench_last;
 
 	if (!r.valid) {
-		seq_puts(m, "no run yet; write an iteration count to run\n");
+		seq_puts(m, "no run yet; write \"<ops_per_thread> [threads]\"\n");
 		return 0;
 	}
-	seq_printf(m, "n:            %lu x 4K\n", r.n);
-	seq_printf(m, "alloc total:  %llu ns\n", r.alloc_ns);
-	seq_printf(m, "alloc /op:    %llu ns\n", r.n ? r.alloc_ns / r.n : 0);
-	seq_printf(m, "free total:   %llu ns\n", r.free_ns);
-	seq_printf(m, "free /op:     %llu ns\n", r.n ? r.free_ns / r.n : 0);
+	seq_printf(m, "threads:        %u\n", r.threads);
+	seq_printf(m, "ops/thread:     %lu\n", r.ops_per_thread);
+	seq_printf(m, "total ops done: %lu\n", r.total_ops);
+	seq_printf(m, "wall time:      %llu ns\n", r.wall_ns);
+	seq_printf(m, "parallel /op:   %llu ns\n",
+		   r.total_ops ? r.wall_ns * r.threads / r.total_ops : 0);
+	seq_printf(m, "per-cpu /op:    %llu ns\n",
+		   r.total_ops ? r.sum_ns / r.total_ops : 0);
 	return 0;
 }
 
