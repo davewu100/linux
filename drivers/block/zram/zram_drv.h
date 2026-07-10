@@ -50,6 +50,9 @@ enum zram_pageflags {
 	ZRAM_HUGE,	/* Incompressible page */
 	ZRAM_IDLE,	/* not accessed page since last idle marking */
 	ZRAM_INCOMPRESSIBLE, /* none of the algorithms could compress it */
+	ZRAM_NOCOMP,	/* stored uncompressed on a REQ_NOCOMPRESS hint, not
+			 * because it is genuinely incompressible
+			 */
 
 	ZRAM_COMP_PRIORITY_BIT1, /* First bit of comp priority index */
 	ZRAM_COMP_PRIORITY_BIT2, /* Second bit of comp priority index */
@@ -85,6 +88,11 @@ struct zram_stats {
 	atomic64_t same_pages;		/* no. of same element filled pages */
 	atomic64_t huge_pages;		/* no. of huge pages */
 	atomic64_t huge_pages_since;	/* no. of huge pages since zram set up */
+	atomic64_t nocomp_writes;	/* cumulative no. of pages stored without
+					 * compression on a REQ_NOCOMPRESS hint
+					 * (e.g. zswap writeback); never
+					 * decremented
+					 */
 	atomic64_t pages_stored;	/* no. of pages currently stored */
 	atomic_long_t max_used_pages;	/* no. of maximum pages stored */
 	atomic64_t miss_free;		/* no. of missed free */

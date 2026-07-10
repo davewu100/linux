@@ -295,7 +295,7 @@ int swap_writeout(struct folio *folio, struct swap_iocb **swap_plug)
 	}
 	rcu_read_unlock();
 
-	__swap_writepage(folio, swap_plug);
+	__swap_writepage(folio, swap_plug, false);
 	return 0;
 out_unlock:
 	folio_unlock(folio);
@@ -422,12 +422,16 @@ static void swap_writepage_fs(struct folio *folio, struct swap_iocb **swap_plug)
 }
 
 static void swap_writepage_bdev_sync(struct folio *folio,
-		struct swap_info_struct *sis)
+		struct swap_info_struct *sis, bool nocompress)
 {
 	struct bio_vec bv;
 	struct bio bio;
+	blk_opf_t opf = REQ_OP_WRITE | REQ_SWAP;
 
-	bio_init(&bio, sis->bdev, &bv, 1, REQ_OP_WRITE | REQ_SWAP);
+	if (nocompress)
+		opf |= REQ_NOCOMPRESS;
+
+	bio_init(&bio, sis->bdev, &bv, 1, opf);
 	bio.bi_iter.bi_sector = swap_folio_sector(folio);
 	bio_add_folio_nofail(&bio, folio, folio_size(folio), 0);
 
@@ -442,11 +446,15 @@ static void swap_writepage_bdev_sync(struct folio *folio,
 }
 
 static void swap_writepage_bdev_async(struct folio *folio,
-		struct swap_info_struct *sis)
+		struct swap_info_struct *sis, bool nocompress)
 {
 	struct bio *bio;
+	blk_opf_t opf = REQ_OP_WRITE | REQ_SWAP;
 
-	bio = bio_alloc(sis->bdev, 1, REQ_OP_WRITE | REQ_SWAP, GFP_NOIO);
+	if (nocompress)
+		opf |= REQ_NOCOMPRESS;
+
+	bio = bio_alloc(sis->bdev, 1, opf, GFP_NOIO);
 	bio->bi_iter.bi_sector = swap_folio_sector(folio);
 	bio->bi_end_io = end_swap_bio_write;
 	bio_add_folio_nofail(bio, folio, folio_size(folio), 0);
@@ -458,7 +466,8 @@ static void swap_writepage_bdev_async(struct folio *folio,
 	submit_bio(bio);
 }
 
-void __swap_writepage(struct folio *folio, struct swap_iocb **swap_plug)
+void __swap_writepage(struct folio *folio, struct swap_iocb **swap_plug,
+		bool nocompress)
 {
 	struct swap_info_struct *sis = __swap_entry_to_info(folio->swap);
 
@@ -476,9 +485,9 @@ void __swap_writepage(struct folio *folio, struct swap_iocb **swap_plug)
 	 * is safe.
 	 */
 	else if (data_race(sis->flags & SWP_SYNCHRONOUS_IO))
-		swap_writepage_bdev_sync(folio, sis);
+		swap_writepage_bdev_sync(folio, sis, nocompress);
 	else
-		swap_writepage_bdev_async(folio, sis);
+		swap_writepage_bdev_async(folio, sis, nocompress);
 }
 
 void swap_write_unplug(struct swap_iocb *sio)

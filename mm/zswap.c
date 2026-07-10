@@ -1048,8 +1048,13 @@ static int zswap_writeback_entry(struct zswap_entry *entry,
 	/* move it to the tail of the inactive list after end_writeback */
 	folio_set_reclaim(folio);
 
-	/* start writeback */
-	__swap_writepage(folio, NULL);
+	/*
+	 * Start writeback to the backing swap device.  This folio was just
+	 * decompressed out of the zswap pool, so it has already gone through
+	 * a compression tier.  Hint the backing device (e.g. zram) not to
+	 * compress it again, avoiding redundant compress/decompress cycles.
+	 */
+	__swap_writepage(folio, NULL, true);
 
 out:
 	if (ret) {
