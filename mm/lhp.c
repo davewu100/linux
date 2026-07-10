@@ -8,10 +8,10 @@
  * backing pages never return to the buddy allocator, so contiguity is retained
  * and merging back up to 1G is deterministic.
  *
- * This is an intentionally self-contained skeleton: it implements the data
- * structures and the split/merge state machine, exposes a debugfs interface to
- * drive and observe it, but does not (yet) wire itself into any real kernel
- * allocation path (e.g. page-table page allocation).  That is a follow-up.
+ * Layering (DPDK-style):
+ *   phys pool (split/merge) -> memzone -> obj pool -> buffer (kmalloc-like).
+ *
+ * SLUB integration is deferred; see lhp_slub_integration_notes below.
  */
 #define pr_fmt(fmt) "lhp: " fmt
 
@@ -31,6 +31,11 @@
 #include <linux/kthread.h>
 #include <linux/completion.h>
 #include <linux/sched.h>
+#include <linux/mutex.h>
+#include <linux/refcount.h>
+#include <linux/string.h>
+#include <linux/err.h>
+#include <linux/sysfs.h>
 
 /*
  * A node in the layered hierarchy.  One struct describes a single 1G, 2M or 4K
@@ -110,7 +115,7 @@ struct lhp_region {
  * The pool: an immutable-after-init array of regions plus a round-robin cursor
  * used to spread allocations across regions and reduce per-region contention.
  */
-struct lhp_pool {
+struct lhp_phys_pool {
 	struct cma		*cma;
 	unsigned long		nr_regions;
 	struct lhp_region	*regions;		/* [nr_regions] */
@@ -118,7 +123,7 @@ struct lhp_pool {
 	bool			ready;
 };
 
-static struct lhp_pool lhp_pool;
+static struct lhp_phys_pool lhp_phys_pool;
 
 /* Boot-time reservation state. */
 static phys_addr_t lhp_reserve_size __initdata;
@@ -534,12 +539,12 @@ int lhp_pool_available(void)
 	 * a caller that observes ready == true is guaranteed to also see the
 	 * fully initialised regions array.
 	 */
-	return smp_load_acquire(&lhp_pool.ready);
+	return smp_load_acquire(&lhp_phys_pool.ready);
 }
 
 struct page *lhp_alloc(enum lhp_level level, gfp_t gfp)
 {
-	struct lhp_pool *p = &lhp_pool;
+	struct lhp_phys_pool *p = &lhp_phys_pool;
 	struct lhp_reservoir res;
 	struct page *page = NULL;
 	unsigned long i, start;
@@ -587,7 +592,7 @@ EXPORT_SYMBOL_GPL(lhp_alloc);
  * Find the region owning @page.  The regions[] array is immutable after init,
  * so this needs no lock.
  */
-static struct lhp_region *lhp_find_region(struct lhp_pool *p, struct page *page)
+static struct lhp_region *lhp_find_region(struct lhp_phys_pool *p, struct page *page)
 {
 	unsigned long root_pages = lhp_level_nr_pages(LHP_LEVEL_1G);
 	unsigned long i;
@@ -631,7 +636,7 @@ static struct lhp_node *lhp_lookup(struct lhp_region *rg, struct page *page,
 
 void lhp_free(struct page *page, enum lhp_level level)
 {
-	struct lhp_pool *p = &lhp_pool;
+	struct lhp_phys_pool *p = &lhp_phys_pool;
 	struct lhp_region *rg;
 	struct lhp_node *n;
 
@@ -687,7 +692,7 @@ static void lhp_region_init(struct lhp_region *rg, struct page *base,
 
 static int __init lhp_pool_init(void)
 {
-	struct lhp_pool *p = &lhp_pool;
+	struct lhp_phys_pool *p = &lhp_phys_pool;
 	unsigned long nr_1g, i;
 
 	atomic_set(&p->cursor, 0);
@@ -746,6 +751,629 @@ static int __init lhp_pool_init(void)
 late_initcall(lhp_pool_init);
 
 /* --------------------------------------------------------------------------
+ * DPDK-style layering: memzone -> obj pool -> buffer
+ * -------------------------------------------------------------------------- */
+
+#define LHP_BUFFER_MAGIC	0x4c485042U	/* "LHPB" */
+
+enum lhp_buf_type {
+	LHP_BUF_POOL_OBJ = 0,
+	LHP_BUF_LARGE,
+};
+
+struct lhp_buffer_hdr {
+	u32			magic;
+	u32			user_size;
+	struct lhp_obj_pool	*pool;
+	u8			type;
+	u8			_pad[3];
+	union {
+		struct {
+			struct page	*page;
+			enum lhp_level	level;
+		} large;
+	};
+};
+
+#define LHP_HDR_SIZE		ALIGN(sizeof(struct lhp_buffer_hdr), 8)
+
+struct lhp_memzone_chunk {
+	struct list_head	list;
+	struct page		*base;
+	enum lhp_level		level;
+};
+
+struct lhp_memzone {
+	struct list_head	list;
+	char			name[LHP_NAME_MAX];
+	size_t			len;
+	size_t			align;
+	int			nid;
+	unsigned long		flags;
+	unsigned long		bytes_used;
+	struct list_head	chunks;
+	spinlock_t		lock;
+	refcount_t		refs;
+};
+
+struct lhp_obj_pool {
+	struct list_head	list;
+	char			name[LHP_NAME_MAX];
+	struct lhp_memzone	*zone;
+	unsigned int		obj_size;
+	unsigned int		obj_stride;
+	unsigned int		align;
+	unsigned long		flags;
+	void			*free_list;
+	unsigned long		nr_free;
+	unsigned long		nr_alloc;
+	struct page		*carve_page;
+	unsigned int		carve_offset;
+	spinlock_t		lock;
+};
+
+static LIST_HEAD(lhp_memzone_list);
+static LIST_HEAD(lhp_obj_pool_list);
+static DEFINE_MUTEX(lhp_registry_lock);
+
+static inline void *lhp_buffer_user_ptr(struct lhp_buffer_hdr *hdr)
+{
+	return (char *)hdr + LHP_HDR_SIZE;
+}
+
+static inline struct lhp_buffer_hdr *lhp_buffer_from_user(const void *ptr)
+{
+	return (struct lhp_buffer_hdr *)((char *)ptr - LHP_HDR_SIZE);
+}
+
+static bool lhp_virt_in_phys_pool(const void *addr)
+{
+	struct lhp_phys_pool *p = &lhp_phys_pool;
+	unsigned long root_pages = lhp_level_nr_pages(LHP_LEVEL_1G);
+	unsigned long i;
+
+	if (!lhp_pool_available() || !addr)
+		return false;
+
+	for (i = 0; i < p->nr_regions; i++) {
+		struct page *base = p->regions[i].base;
+		void *start = page_address(base);
+		void *end = start + root_pages * PAGE_SIZE;
+
+		if (addr >= start && addr < end)
+			return true;
+	}
+	return false;
+}
+
+static enum lhp_level lhp_bytes_to_level(size_t bytes)
+{
+	unsigned long pages = DIV_ROUND_UP(bytes, PAGE_SIZE);
+
+	if (pages <= lhp_level_nr_pages(LHP_LEVEL_4K))
+		return LHP_LEVEL_4K;
+	if (pages <= lhp_level_nr_pages(LHP_LEVEL_2M))
+		return LHP_LEVEL_2M;
+	return LHP_LEVEL_1G;
+}
+
+static unsigned long lhp_level_bytes(enum lhp_level level)
+{
+	return lhp_level_nr_pages(level) * PAGE_SIZE;
+}
+
+static int lhp_memzone_attach_chunk(struct lhp_memzone *mz,
+				    struct page *page, enum lhp_level level,
+				    gfp_t gfp)
+{
+	struct lhp_memzone_chunk *c;
+
+	c = kmalloc(sizeof(*c), gfp);
+	if (!c)
+		return -ENOMEM;
+
+	INIT_LIST_HEAD(&c->list);
+	c->base = page;
+	c->level = level;
+	list_add_tail(&c->list, &mz->chunks);
+	mz->bytes_used += lhp_level_bytes(level);
+	return 0;
+}
+
+static void lhp_memzone_detach_chunk(struct lhp_memzone *mz,
+				     struct lhp_memzone_chunk *c)
+{
+	list_del(&c->list);
+	mz->bytes_used -= lhp_level_bytes(c->level);
+	lhp_free(c->base, c->level);
+	kfree(c);
+}
+
+static struct lhp_memzone_chunk *lhp_memzone_find_chunk(struct lhp_memzone *mz,
+							struct page *page,
+							enum lhp_level level)
+{
+	struct lhp_memzone_chunk *c;
+
+	list_for_each_entry(c, &mz->chunks, list) {
+		if (c->base == page && c->level == level)
+			return c;
+	}
+	return NULL;
+}
+
+static int lhp_memzone_grow(struct lhp_memzone *mz, size_t need, gfp_t gfp)
+{
+	size_t remaining = need;
+	int ret;
+
+	while (remaining > 0) {
+		enum lhp_level level;
+		struct page *page;
+
+		if (remaining > lhp_level_bytes(LHP_LEVEL_1G))
+			level = LHP_LEVEL_1G;
+		else if (remaining > lhp_level_bytes(LHP_LEVEL_2M))
+			level = LHP_LEVEL_2M;
+		else
+			level = LHP_LEVEL_4K;
+
+		page = lhp_alloc(level, gfp);
+		if (!page)
+			return -ENOMEM;
+
+		ret = lhp_memzone_attach_chunk(mz, page, level, gfp);
+		if (ret) {
+			lhp_free(page, level);
+			return ret;
+		}
+
+		remaining = (remaining > lhp_level_bytes(level)) ?
+			remaining - lhp_level_bytes(level) : 0;
+	}
+	return 0;
+}
+
+static struct lhp_memzone *lhp_memzone_find_locked(const char *name)
+{
+	struct lhp_memzone *mz;
+
+	list_for_each_entry(mz, &lhp_memzone_list, list) {
+		if (!strcmp(mz->name, name))
+			return mz;
+	}
+	return NULL;
+}
+
+struct lhp_memzone *lhp_memzone_lookup(const char *name)
+{
+	struct lhp_memzone *mz;
+
+	if (!name)
+		return NULL;
+
+	mutex_lock(&lhp_registry_lock);
+	mz = lhp_memzone_find_locked(name);
+	mutex_unlock(&lhp_registry_lock);
+	return mz;
+}
+EXPORT_SYMBOL_GPL(lhp_memzone_lookup);
+
+struct lhp_memzone *lhp_memzone_reserve(const char *name, size_t len,
+					size_t align, int nid,
+					unsigned long flags)
+{
+	struct lhp_memzone *mz;
+	size_t reserve_len;
+	int ret;
+
+	if (!lhp_pool_available() || !name || !*name || !len)
+		return ERR_PTR(-EINVAL);
+	if (strnlen(name, LHP_NAME_MAX) >= LHP_NAME_MAX)
+		return ERR_PTR(-EINVAL);
+
+	if (!align)
+		align = PAGE_SIZE;
+	if (!is_power_of_2(align) || align < PAGE_SIZE)
+		return ERR_PTR(-EINVAL);
+
+	reserve_len = ALIGN(len, PAGE_SIZE);
+
+	mutex_lock(&lhp_registry_lock);
+	if (lhp_memzone_find_locked(name)) {
+		mutex_unlock(&lhp_registry_lock);
+		return ERR_PTR(-EEXIST);
+	}
+	mutex_unlock(&lhp_registry_lock);
+
+	mz = kzalloc(sizeof(*mz), GFP_KERNEL);
+	if (!mz)
+		return ERR_PTR(-ENOMEM);
+
+	strscpy(mz->name, name, LHP_NAME_MAX);
+	mz->len = reserve_len;
+	mz->align = align;
+	mz->nid = nid;
+	mz->flags = flags;
+	INIT_LIST_HEAD(&mz->chunks);
+	spin_lock_init(&mz->lock);
+	refcount_set(&mz->refs, 1);
+
+	ret = lhp_memzone_grow(mz, reserve_len, GFP_KERNEL);
+	if (ret) {
+		struct lhp_memzone_chunk *c, *tmp;
+
+		list_for_each_entry_safe(c, tmp, &mz->chunks, list)
+			lhp_memzone_detach_chunk(mz, c);
+		kfree(mz);
+		return ERR_PTR(ret);
+	}
+
+	mutex_lock(&lhp_registry_lock);
+	list_add_tail(&mz->list, &lhp_memzone_list);
+	mutex_unlock(&lhp_registry_lock);
+
+	pr_info("memzone %s: reserved %zu bytes (%lu chunks)\n",
+		mz->name, reserve_len, mz->bytes_used / PAGE_SIZE);
+	return mz;
+}
+EXPORT_SYMBOL_GPL(lhp_memzone_reserve);
+
+void lhp_memzone_free(struct lhp_memzone *zone)
+{
+	struct lhp_memzone_chunk *c, *tmp;
+
+	if (!zone)
+		return;
+
+	mutex_lock(&lhp_registry_lock);
+	if (!refcount_dec_and_test(&zone->refs)) {
+		mutex_unlock(&lhp_registry_lock);
+		return;
+	}
+	list_del(&zone->list);
+	mutex_unlock(&lhp_registry_lock);
+
+	spin_lock(&zone->lock);
+	list_for_each_entry_safe(c, tmp, &zone->chunks, list)
+		lhp_memzone_detach_chunk(zone, c);
+	spin_unlock(&zone->lock);
+
+	kfree(zone);
+}
+EXPORT_SYMBOL_GPL(lhp_memzone_free);
+
+static struct lhp_obj_pool *lhp_obj_pool_find_locked(const char *name)
+{
+	struct lhp_obj_pool *pool;
+
+	list_for_each_entry(pool, &lhp_obj_pool_list, list) {
+		if (!strcmp(pool->name, name))
+			return pool;
+	}
+	return NULL;
+}
+
+struct lhp_obj_pool *lhp_pool_lookup(const char *name)
+{
+	struct lhp_obj_pool *pool;
+
+	if (!name)
+		return NULL;
+
+	mutex_lock(&lhp_registry_lock);
+	pool = lhp_obj_pool_find_locked(name);
+	mutex_unlock(&lhp_registry_lock);
+	return pool;
+}
+EXPORT_SYMBOL_GPL(lhp_pool_lookup);
+
+struct lhp_obj_pool *lhp_pool_create(const char *name,
+				     struct lhp_memzone *zone,
+				     unsigned int obj_size,
+				     unsigned int align,
+				     unsigned long flags)
+{
+	struct lhp_obj_pool *pool;
+	unsigned int stride;
+
+	if (!lhp_pool_available() || !name || !*name || !zone || !obj_size)
+		return ERR_PTR(-EINVAL);
+	if (strnlen(name, LHP_NAME_MAX) >= LHP_NAME_MAX)
+		return ERR_PTR(-EINVAL);
+
+	if (!align)
+		align = 8;
+	if (!is_power_of_2(align))
+		return ERR_PTR(-EINVAL);
+
+	if (obj_size > zone->len)
+		return ERR_PTR(-EINVAL);
+
+	stride = LHP_HDR_SIZE + ALIGN(obj_size, align);
+	if (stride > PAGE_SIZE)
+		return ERR_PTR(-E2BIG);
+
+	mutex_lock(&lhp_registry_lock);
+	if (lhp_obj_pool_find_locked(name)) {
+		mutex_unlock(&lhp_registry_lock);
+		return ERR_PTR(-EEXIST);
+	}
+	mutex_unlock(&lhp_registry_lock);
+
+	pool = kzalloc(sizeof(*pool), GFP_KERNEL);
+	if (!pool)
+		return ERR_PTR(-ENOMEM);
+
+	strscpy(pool->name, name, LHP_NAME_MAX);
+	pool->zone = zone;
+	pool->obj_size = obj_size;
+	pool->obj_stride = stride;
+	pool->align = align;
+	pool->flags = flags;
+	spin_lock_init(&pool->lock);
+	refcount_inc(&zone->refs);
+
+	mutex_lock(&lhp_registry_lock);
+	list_add_tail(&pool->list, &lhp_obj_pool_list);
+	mutex_unlock(&lhp_registry_lock);
+
+	pr_info("pool %s: obj_size=%u stride=%u zone=%s\n",
+		pool->name, obj_size, stride, zone->name);
+	return pool;
+}
+EXPORT_SYMBOL_GPL(lhp_pool_create);
+
+void lhp_pool_destroy(struct lhp_obj_pool *pool)
+{
+	if (!pool)
+		return;
+
+	mutex_lock(&lhp_registry_lock);
+	list_del(&pool->list);
+	mutex_unlock(&lhp_registry_lock);
+
+	if (pool->nr_alloc)
+		WARN_ONCE(1, "lhp_pool_destroy: %s has %lu outstanding objects\n",
+			  pool->name, pool->nr_alloc);
+
+	refcount_dec(&pool->zone->refs);
+	kfree(pool);
+}
+EXPORT_SYMBOL_GPL(lhp_pool_destroy);
+
+static int lhp_pool_new_carve_page(struct lhp_obj_pool *pool, gfp_t gfp)
+{
+	struct page *page;
+	int ret;
+
+	page = lhp_alloc(LHP_LEVEL_4K, gfp);
+	if (!page)
+		return -ENOMEM;
+
+	ret = lhp_memzone_attach_chunk(pool->zone, page, LHP_LEVEL_4K, gfp);
+	if (ret) {
+		lhp_free(page, LHP_LEVEL_4K);
+		return ret;
+	}
+
+	pool->carve_page = page;
+	pool->carve_offset = 0;
+	return 0;
+}
+
+static void lhp_buffer_init(struct lhp_buffer_hdr *hdr,
+			    struct lhp_obj_pool *pool,
+			    enum lhp_buf_type type, u32 user_size)
+{
+	hdr->magic = LHP_BUFFER_MAGIC;
+	hdr->user_size = user_size;
+	hdr->pool = pool;
+	hdr->type = type;
+}
+
+static void *lhp_pool_alloc_locked(struct lhp_obj_pool *pool, gfp_t gfp)
+{
+	struct lhp_buffer_hdr *hdr;
+	void *obj;
+
+	if (pool->free_list) {
+		obj = pool->free_list;
+		pool->free_list = *(void **)obj;
+		pool->nr_free--;
+		pool->nr_alloc++;
+		return obj;
+	}
+
+	if (!pool->carve_page ||
+	    pool->carve_offset + pool->obj_stride > PAGE_SIZE) {
+		if (lhp_pool_new_carve_page(pool, gfp))
+			return NULL;
+	}
+
+	hdr = page_address(pool->carve_page) + pool->carve_offset;
+	pool->carve_offset += pool->obj_stride;
+	lhp_buffer_init(hdr, pool, LHP_BUF_POOL_OBJ, pool->obj_size);
+
+	pool->nr_alloc++;
+	return lhp_buffer_user_ptr(hdr);
+}
+
+void *lhp_pool_alloc(struct lhp_obj_pool *pool, gfp_t gfp)
+{
+	void *ptr;
+
+	if (!pool)
+		return NULL;
+
+	spin_lock(&pool->lock);
+	ptr = lhp_pool_alloc_locked(pool, gfp);
+	spin_unlock(&pool->lock);
+
+	if (ptr && (gfp & __GFP_ZERO))
+		memset(ptr, 0, pool->obj_size);
+
+	return ptr;
+}
+EXPORT_SYMBOL_GPL(lhp_pool_alloc);
+
+void lhp_pool_free(struct lhp_obj_pool *pool, void *ptr)
+{
+	struct lhp_buffer_hdr *hdr;
+
+	if (!pool || !ptr)
+		return;
+
+	if (!lhp_virt_in_phys_pool(ptr))
+		goto bad;
+
+	hdr = lhp_buffer_from_user(ptr);
+	if (hdr->magic != LHP_BUFFER_MAGIC || hdr->pool != pool ||
+	    hdr->type != LHP_BUF_POOL_OBJ)
+		goto bad;
+
+	spin_lock(&pool->lock);
+	*(void **)ptr = pool->free_list;
+	pool->free_list = ptr;
+	pool->nr_free++;
+	pool->nr_alloc--;
+	spin_unlock(&pool->lock);
+	return;
+
+bad:
+	WARN_ONCE(1, "lhp_pool_free: bad ptr %px for pool %s\n", ptr, pool->name);
+}
+EXPORT_SYMBOL_GPL(lhp_pool_free);
+
+static void *lhp_kmalloc_large(struct lhp_obj_pool *pool, size_t size, gfp_t gfp)
+{
+	struct lhp_memzone *mz = pool->zone;
+	enum lhp_level level = lhp_bytes_to_level(size + LHP_HDR_SIZE);
+	struct lhp_buffer_hdr *hdr;
+	struct page *page;
+	int ret;
+
+	page = lhp_alloc(level, gfp);
+	if (!page)
+		return NULL;
+
+	ret = lhp_memzone_attach_chunk(mz, page, level, gfp);
+	if (ret) {
+		lhp_free(page, level);
+		return NULL;
+	}
+
+	hdr = page_address(page);
+	lhp_buffer_init(hdr, pool, LHP_BUF_LARGE, size);
+	hdr->large.page = page;
+	hdr->large.level = level;
+
+	if (gfp & __GFP_ZERO)
+		memset(lhp_buffer_user_ptr(hdr), 0, size);
+
+	return lhp_buffer_user_ptr(hdr);
+}
+
+void *lhp_kmalloc(struct lhp_obj_pool *pool, size_t size, gfp_t gfp)
+{
+	void *ptr;
+
+	if (!pool)
+		return NULL;
+	if (!size)
+		return ZERO_SIZE_PTR;
+	if (size > pool->zone->len)
+		return NULL;
+
+	if (size <= pool->obj_size)
+		ptr = lhp_pool_alloc(pool, gfp);
+	else
+		ptr = lhp_kmalloc_large(pool, size, gfp);
+
+	if (ptr && size <= pool->obj_size) {
+		struct lhp_buffer_hdr *hdr = lhp_buffer_from_user(ptr);
+
+		hdr->user_size = size;
+	}
+
+	return ptr;
+}
+EXPORT_SYMBOL_GPL(lhp_kmalloc);
+
+void lhp_kfree(const void *ptr)
+{
+	struct lhp_buffer_hdr *hdr;
+	struct lhp_obj_pool *pool;
+	struct lhp_memzone *mz;
+	struct lhp_memzone_chunk *c;
+
+	if (unlikely(ZERO_OR_NULL_PTR(ptr)))
+		return;
+
+	if (!lhp_virt_in_phys_pool(ptr)) {
+		WARN_ONCE(1, "lhp_kfree: %px not in LHP phys pool\n", ptr);
+		return;
+	}
+
+	hdr = lhp_buffer_from_user(ptr);
+	if (hdr->magic != LHP_BUFFER_MAGIC) {
+		WARN_ONCE(1, "lhp_kfree: %px is not an LHP buffer (use kfree?)\n",
+			  ptr);
+		return;
+	}
+
+	pool = hdr->pool;
+	if (!pool)
+		return;
+
+	if (hdr->type == LHP_BUF_POOL_OBJ) {
+		lhp_pool_free(pool, (void *)ptr);
+		return;
+	}
+
+	mz = pool->zone;
+	spin_lock(&mz->lock);
+	c = lhp_memzone_find_chunk(mz, hdr->large.page, hdr->large.level);
+	if (c)
+		lhp_memzone_detach_chunk(mz, c);
+	spin_unlock(&mz->lock);
+}
+EXPORT_SYMBOL_GPL(lhp_kfree);
+
+bool lhp_ptr_is_owned(const void *ptr)
+{
+	const struct lhp_buffer_hdr *hdr;
+
+	if (unlikely(ZERO_OR_NULL_PTR(ptr)) || !lhp_virt_in_phys_pool(ptr))
+		return false;
+
+	hdr = lhp_buffer_from_user(ptr);
+	return hdr->magic == LHP_BUFFER_MAGIC;
+}
+EXPORT_SYMBOL_GPL(lhp_ptr_is_owned);
+
+/*
+ * SLUB integration evaluation (phase 4, not implemented).
+ *
+ * To back a kmem_cache with LHP:
+ *   1. Add struct lhp_obj_pool *lhp_backing to struct kmem_cache (or a flag).
+ *   2. In alloc_slab_page(), if cache->lhp_backing, call
+ *      lhp_alloc() at oo_order instead of alloc_frozen_pages().
+ *   3. Mark slab pages with a new page type or page->lhp_pool pointer.
+ *   4. In __free_slab(), route to lhp_free() instead of free_frozen_pages().
+ *   5. memcg/KASAN/kmemleak hooks must mirror the buddy path.
+ *
+ * Until then, subsystem code should use lhp_pool_create() +
+ * kmem_cache-like lhp_pool_alloc() explicitly.
+ */
+struct lhp_obj_pool *
+lhp_pool_for_slub_cache(const struct kmem_cache *s)
+{
+	return NULL;
+}
+EXPORT_SYMBOL_GPL(lhp_pool_for_slub_cache);
+
+/* --------------------------------------------------------------------------
  * debugfs: observe and drive the pool
  *
  *   /sys/kernel/debug/lhp/stats   - read aggregated per-region counters
@@ -766,10 +1394,12 @@ static const char *lhp_level_name(enum lhp_level l)
 
 static int lhp_stats_show(struct seq_file *m, void *v)
 {
-	struct lhp_pool *p = &lhp_pool;
+	struct lhp_phys_pool *p = &lhp_phys_pool;
 	unsigned long nr_free[LHP_NR_LEVELS] = {};
 	unsigned long nr_alloc[LHP_NR_LEVELS] = {};
 	unsigned long cached = 0, free_1g = 0, i;
+	struct lhp_memzone *mz;
+	struct lhp_obj_pool *pool;
 	int l;
 
 	if (!smp_load_acquire(&p->ready)) {
@@ -797,8 +1427,25 @@ static int lhp_stats_show(struct seq_file *m, void *v)
 	/* 1G "free" is the number of wholly-idle regions. */
 	nr_free[LHP_LEVEL_1G] = free_1g;
 	for (l = LHP_NR_LEVELS - 1; l >= 0; l--)
-		seq_printf(m, "%s: free=%lu alloc=%lu\n",
+		seq_printf(m, "phys %s: free=%lu alloc=%lu\n",
 			   lhp_level_name(l), nr_free[l], nr_alloc[l]);
+
+	mutex_lock(&lhp_registry_lock);
+	seq_puts(m, "\nmemzones:\n");
+	list_for_each_entry(mz, &lhp_memzone_list, list) {
+		seq_printf(m, "  %s: len=%zu used=%lu chunks=%u refs=%d\n",
+			   mz->name, mz->len, mz->bytes_used,
+			   (unsigned int)list_count_nodes(&mz->chunks),
+			   refcount_read(&mz->refs));
+	}
+	seq_puts(m, "pools:\n");
+	list_for_each_entry(pool, &lhp_obj_pool_list, list) {
+		seq_printf(m, "  %s: zone=%s obj_size=%u free=%lu alloc=%lu\n",
+			   pool->name, pool->zone->name, pool->obj_size,
+			   pool->nr_free, pool->nr_alloc);
+	}
+	mutex_unlock(&lhp_registry_lock);
+
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(lhp_stats);
@@ -1017,6 +1664,99 @@ static const struct file_operations lhp_bench_fops = {
 	.release = single_release,
 };
 
+/*
+ * Layer self-test via debugfs.  Write "run" to exercise memzone -> pool ->
+ * buffer alloc/free and merge.
+ */
+static int lhp_layer_test_run(void)
+{
+	struct lhp_memzone *mz;
+	struct lhp_obj_pool *pool;
+	void *small[8], *large = NULL;
+	unsigned int i, n_small = 0;
+	int err = 0;
+
+	mz = lhp_memzone_lookup("dbgtest");
+	if (mz)
+		lhp_memzone_free(mz);
+	pool = lhp_pool_lookup("dbgpool");
+	if (pool)
+		lhp_pool_destroy(pool);
+
+	mz = lhp_memzone_reserve("dbgtest", 2 * SZ_2M, PAGE_SIZE,
+				   NUMA_NO_NODE, LHP_MEMZONE_F_NONE);
+	if (IS_ERR(mz)) {
+		pr_err("layer_test: memzone_reserve failed %ld\n", PTR_ERR(mz));
+		return PTR_ERR(mz);
+	}
+
+	pool = lhp_pool_create("dbgpool", mz, 64, 8, LHP_POOL_F_NONE);
+	if (IS_ERR(pool)) {
+		pr_err("layer_test: pool_create failed %ld\n", PTR_ERR(pool));
+		lhp_memzone_free(mz);
+		return PTR_ERR(pool);
+	}
+
+	for (i = 0; i < ARRAY_SIZE(small); i++) {
+		small[i] = lhp_kmalloc(pool, 32, GFP_KERNEL);
+		if (!small[i]) {
+			err = -ENOMEM;
+			n_small = i;
+			goto out;
+		}
+		if (!lhp_ptr_is_owned(small[i])) {
+			err = -EFAULT;
+			n_small = i + 1;
+			goto out;
+		}
+	}
+	n_small = ARRAY_SIZE(small);
+
+	large = lhp_kmalloc(pool, 8192, GFP_KERNEL);
+	if (!large) {
+		err = -ENOMEM;
+		goto out;
+	}
+
+	if (!err)
+		pr_info("layer_test: memzone/pool/kmalloc cycle ok\n");
+
+out:
+	for (i = 0; i < n_small; i++)
+		lhp_kfree(small[i]);
+	if (large)
+		lhp_kfree(large);
+	lhp_pool_destroy(pool);
+	lhp_memzone_free(mz);
+	return err;
+}
+
+static ssize_t lhp_layer_test_write(struct file *file, const char __user *ubuf,
+				    size_t count, loff_t *ppos)
+{
+	char buf[16];
+	int ret;
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+	buf[count] = '\0';
+
+	if (sysfs_streq(buf, "run")) {
+		ret = lhp_layer_test_run();
+		if (ret)
+			return ret;
+	}
+	return count;
+}
+
+static const struct file_operations lhp_layer_test_fops = {
+	.write = lhp_layer_test_write,
+	.open = simple_open,
+	.llseek = default_llseek,
+};
+
 static int __init lhp_debugfs_init(void)
 {
 	struct dentry *dir;
@@ -1025,6 +1765,7 @@ static int __init lhp_debugfs_init(void)
 	debugfs_create_file("stats", 0400, dir, NULL, &lhp_stats_fops);
 	debugfs_create_file("alloc", 0200, dir, NULL, &lhp_alloc_fops);
 	debugfs_create_file("bench", 0600, dir, NULL, &lhp_bench_fops);
+	debugfs_create_file("layer_test", 0200, dir, NULL, &lhp_layer_test_fops);
 	return 0;
 }
 late_initcall(lhp_debugfs_init);
