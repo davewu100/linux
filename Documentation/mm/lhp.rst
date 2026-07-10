@@ -214,6 +214,16 @@ Configuration
     Build the ``rte_malloc``-style heap layer on top of the pool.
 
 ``CONFIG_LHP_BENCH``
-    Build a standalone, loadable microbenchmark module that drives the 2M chunk
-    allocator through its public API and reports ns/op (optionally with
-    concurrent threads) via ``/sys/kernel/debug/lhp_bench``.
+    Build a standalone, loadable microbenchmark module (depends on
+    ``CONFIG_LHP_HEAP``) that drives the allocator through its public API and
+    compares it against the equivalent standard-kernel allocator.  Write
+    ``<ops> [threads] [lhp|std] [64|4k|2m]`` to ``/sys/kernel/debug/lhp_bench``
+    and read it back for ns/op figures (parallel and per-cpu).  The backends
+    are paired for a fair comparison:
+
+    ==========  ==========================  ==========================
+    size        ``lhp`` backend             ``std`` backend
+    ==========  ==========================  ==========================
+    64B / 4K    ``lhp_malloc()`` on a heap  ``kmalloc()``
+    2M          ``lhp_alloc_2m()``          ``alloc_pages(order 9)``
+    ==========  ==========================  ==========================

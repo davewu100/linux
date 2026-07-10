@@ -1142,15 +1142,18 @@ config LHP_HEAP
 	  If unsure, say "n".
 
 config LHP_BENCH
-	tristate "Microbenchmark for the LHP 2M chunk allocator"
-	depends on LHP && DEBUG_FS
+	tristate "Microbenchmark for the LHP allocator"
+	depends on LHP && LHP_HEAP && DEBUG_FS
 	help
-	  Build a standalone module that benchmarks the LHP 2M chunk
-	  allocator via its public lhp_alloc_2m()/lhp_free_2m() API.  On load
-	  it creates /sys/kernel/debug/lhp_bench; write "<ops_per_thread>
-	  [threads]" to run an optionally concurrent alloc/free loop and read
-	  it back for the last run's ns/op figures.  Intended as a consistent
-	  way to measure the performance impact of allocator changes.
+	  Build a standalone module that benchmarks the LHP allocator through
+	  its public API and compares it against the equivalent standard-kernel
+	  allocator: lhp_malloc() vs kmalloc() for 64B/4K objects, and
+	  lhp_alloc_2m() vs alloc_pages(order 9) for 2M blocks.  On load it
+	  creates /sys/kernel/debug/lhp_bench; write
+	  "<ops> [threads] [lhp|std] [64|4k|2m]" to run an optionally concurrent
+	  alloc/free loop and read it back for the last run's ns/op figures.
+	  Intended as a consistent way to measure the performance impact of
+	  allocator changes and to compare against the standard allocators.
 
 	  Say "m" if you want to build it as a loadable module, or "n".
 
