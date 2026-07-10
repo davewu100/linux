@@ -60,6 +60,7 @@ documentation, or deleted if it has served its purpose.
    hwpoison
    hugetlbfs_reserv
    ksm
+   lhp
    memory-model
    memfd_preservation
    mmu_notifier

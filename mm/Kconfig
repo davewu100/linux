@@ -1104,6 +1104,56 @@ config CMA_AREAS
 
 	  If unsure, leave the default value "8" in UMA and "20" in NUMA.
 
+config LHP
+	bool "Large HugePage pool (static 2M memzones)"
+	depends on CMA && CONTIG_ALLOC && 64BIT
+	help
+	  Reserve a physically contiguous pool at boot, carve it into 1G
+	  regions and hand out fixed 2M chunks from them.  2M is the only
+	  allocation granularity: chunks are never split or merged, so a region
+	  never changes shape.  Because the pool never returns its pages to the
+	  buddy allocator, physical contiguity within a region is preserved.
+	  Named memzones (rte_memzone-style) are carved from these chunks for
+	  static, DPDK-like users that reserve their backing memory up front.
+
+	  Enable with "lhp=<size>" on the kernel command line (rounded up to a
+	  1G multiple).  Optionally add "lhp_1g=<n>" to dedicate N regions
+	  exclusively to whole-1G allocation so they are never fragmented by 2M
+	  requests.  A debugfs interface under /sys/kernel/debug/lhp is provided
+	  to observe and drive the pool.
+
+	  If unsure, say "n".
+
+config LHP_HEAP
+	bool "rte_malloc-style variable-size heap over LHP memzones"
+	depends on LHP
+	help
+	  Build a variable-size heap allocator on top of the LHP pool,
+	  analogous to DPDK's rte_malloc.  A heap manages its backing memory as
+	  first-fit arenas with coalescing free lists, so multiple variable-size
+	  allocations share memory instead of each rounding up to a chunk.
+
+	  Two backings are provided: lhp_heap_create() spreads over a memzone's
+	  discontiguous 2M chunks (per-chunk arenas, single allocation up to
+	  ~2M), while lhp_heap_create_1g() consumes one whole 1G region as a
+	  single contiguous arena (single allocation up to ~1G).  Both expose
+	  lhp_malloc()/lhp_free().
+
+	  If unsure, say "n".
+
+config LHP_BENCH
+	tristate "Microbenchmark for the LHP 2M chunk allocator"
+	depends on LHP && DEBUG_FS
+	help
+	  Build a standalone module that benchmarks the LHP 2M chunk
+	  allocator via its public lhp_alloc_2m()/lhp_free_2m() API.  On load
+	  it creates /sys/kernel/debug/lhp_bench; write "<ops_per_thread>
+	  [threads]" to run an optionally concurrent alloc/free loop and read
+	  it back for the last run's ns/op figures.  Intended as a consistent
+	  way to measure the performance impact of allocator changes.
+
+	  Say "m" if you want to build it as a loadable module, or "n".
+
 #
 # Select this config option from the architecture Kconfig, if available, to set
 # the max page order for physically contiguous allocations.
