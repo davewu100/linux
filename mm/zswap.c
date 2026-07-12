@@ -969,20 +969,64 @@ static bool zswap_decompress(struct zswap_entry *entry, struct folio *folio)
 	return false;
 }
 
+/*
+ * Copy the entry's stored bytes into @folio verbatim, without any
+ * decompression.  Works for both genuinely compressed entries (the blob is
+ * copied as-is for passthrough) and entries stored uncompressed (length ==
+ * PAGE_SIZE, i.e. the raw page).
+ */
+static void zswap_copy_stored_to_folio(struct zswap_entry *entry,
+				       struct folio *folio)
+{
+	struct zswap_pool *pool = entry->pool;
+	struct scatterlist input[2]; /* zsmalloc returns an SG list 1-2 entries */
+	void *dst;
+
+	zs_obj_read_sg_begin(pool->zs_pool, entry->handle, input, entry->length);
+	dst = kmap_local_folio(folio, 0);
+	memcpy_from_sglist(dst, input, 0, entry->length);
+	kunmap_local(dst);
+	zs_obj_read_sg_end(pool->zs_pool, entry->handle);
+}
+
+/*
+ * Compressed-passthrough writeback: hand the entry's already-compressed blob
+ * to the backing swap device (zram) as-is, skipping the decompress+recompress
+ * cycle.  The caller must have verified that the backing device accepts
+ * passthrough (REQ_COMPRESSED) and shares our compression algorithm, and that
+ * the entry is genuinely compressed (0 < length < PAGE_SIZE).
+ *
+ * On success the blob is durably stored on the backing device and @folio holds
+ * the compressed bytes (NOT the raw page), so it must be dropped from the swap
+ * cache by the caller rather than marked uptodate.  Returns false on I/O error,
+ * leaving the entry untouched.
+ */
+static bool zswap_writeback_passthrough(struct zswap_entry *entry,
+					struct folio *folio)
+{
+	zswap_copy_stored_to_folio(entry, folio);
+
+	return swap_writepage_entry_compressed(folio, entry->length) == 0;
+}
+
 /*********************************
 * writeback code
 **********************************/
 /*
- * Attempts to free an entry by adding a folio to the swap cache,
- * decompressing the entry data into the folio, and issuing a
+ * Attempts to free an entry by adding a folio to the swap cache and issuing a
  * bio write to write the folio back to the swap device.
  *
- * This can be thought of as a "resumed writeback" of the folio
- * to the swap device.  We are basically resuming the same swap
- * writeback path that was intercepted with the zswap_store()
- * in the first place.  After the folio has been decompressed into
- * the swap cache, the compressed version stored by zswap can be
- * freed.
+ * This can be thought of as a "resumed writeback" of the folio to the swap
+ * device.  We are basically resuming the same swap writeback path that was
+ * intercepted with the zswap_store() in the first place.
+ *
+ * Writeback never decompresses: zswap already holds the page in a compact
+ * form, so the exact stored bytes are handed to the backing device (zram) to
+ * save both CPU and memory.  Genuinely compressed entries are stored verbatim
+ * via REQ_COMPRESSED (requires a passthrough-capable backing sharing our
+ * compressor); entries stored uncompressed (length == PAGE_SIZE) are copied
+ * out as the raw page and written normally, letting the backing device store
+ * them in its own compact representation.
  */
 static int zswap_writeback_entry(struct zswap_entry *entry,
 				 swp_entry_t swpentry)
@@ -992,12 +1036,21 @@ static int zswap_writeback_entry(struct zswap_entry *entry,
 	struct folio *folio;
 	struct mempolicy *mpol;
 	struct swap_info_struct *si;
+	bool passthrough_cap;
 	int ret = 0;
 
 	/* try to allocate swap cache folio */
 	si = get_swap_device(swpentry);
 	if (!si)
 		return -EEXIST;
+
+	/*
+	 * Passthrough capability and algorithm are fixed at swapon.  Note
+	 * whether this backing device can store our compressed blob directly,
+	 * so we can skip the decompress/recompress cycle below.
+	 */
+	passthrough_cap = si->swp_compress_passthrough &&
+			  !strcmp(si->swp_compress_algo, entry->pool->tfm_name);
 
 	mpol = get_task_policy(current);
 	folio = swap_cache_alloc_folio(swpentry, GFP_KERNEL, BIT(0), NULL, mpol,
@@ -1029,10 +1082,49 @@ static int zswap_writeback_entry(struct zswap_entry *entry,
 		goto out;
 	}
 
-	if (!zswap_decompress(entry, folio)) {
-		ret = -EIO;
-		goto out;
+	/*
+	 * Genuinely compressed entries are handed to the backing device
+	 * verbatim, without decompressing.  This requires a passthrough-capable
+	 * backing (zram) that shares our compressor; if none is available we
+	 * keep the entry in zswap rather than paying for a decompress/recompress
+	 * cycle.  (length == PAGE_SIZE means zswap stored the page raw, so it is
+	 * handled by the normal-write path below.)
+	 */
+	if (entry->length < PAGE_SIZE) {
+		if (!passthrough_cap || folio_test_large(folio) ||
+		    entry->length == 0) {
+			ret = -EOPNOTSUPP;
+			goto out;
+		}
+		if (!zswap_writeback_passthrough(entry, folio)) {
+			ret = -EIO;
+			goto out;
+		}
+		/*
+		 * The blob is now stored on the backing device.  Free the
+		 * zswap entry and drop the swap cache folio: it holds
+		 * compressed bytes, not the raw page, so it must not be left
+		 * uptodate.  A later swapin reads the blob back and
+		 * decompresses it via the backing device.
+		 */
+		xa_erase(tree, offset);
+		count_vm_event(ZSWPWB);
+		if (entry->objcg)
+			count_objcg_events(entry->objcg, ZSWPWB, 1);
+		zswap_entry_free(entry);
+		swap_cache_del_folio(folio);
+		folio_unlock(folio);
+		folio_put(folio);
+		return 0;
 	}
+
+	/*
+	 * Entry stored uncompressed: the stored bytes are the raw page.  Copy
+	 * them into the folio (no decompression) and write it back normally,
+	 * letting the backing device store it compactly with its own algorithm.
+	 */
+	zswap_copy_stored_to_folio(entry, folio);
+	flush_dcache_folio(folio);
 
 	xa_erase(tree, offset);
 

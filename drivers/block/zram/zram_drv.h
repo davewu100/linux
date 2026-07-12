@@ -57,6 +57,12 @@ enum zram_pageflags {
 	__NR_ZRAM_PAGEFLAGS,
 };
 
+/* Payload type carried by a zram write bvec. */
+enum zram_write_payload {
+	ZRAM_WRITE_RAW_PAGE = 0,
+	ZRAM_WRITE_PRECOMPRESSED,
+};
+
 /*
  * Allocated for each disk page.  We use bit-lock (ZRAM_ENTRY_LOCK bit
  * of flags) to save memory.  There can be plenty of entries and standard
