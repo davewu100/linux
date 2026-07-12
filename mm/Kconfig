@@ -56,6 +56,28 @@ config ZSWAP_SHRINKER_DEFAULT_ON
 	  reducing the chance that cold pages will reside in the zswap pool
 	  and consume memory indefinitely.
 
+config SWAP_COMPRESSED_WRITEBACK
+	bool "Compressed writeback for zswap (ghost-swap aligned) [EXPERIMENTAL]"
+	depends on ZSWAP && 64BIT
+	default n
+	help
+	  Skeleton support for writing zswap's already-compressed pages back to
+	  the backing swap device without decompressing them, and decompressing
+	  them with zswap's own codec on swapin.
+
+	  This is the core-swap alternative to routing zswap's compressed data
+	  through a compressing ramdisk (zram) with a block-layer flag: the
+	  compressed bytes are produced and consumed only by zswap, so there is
+	  no cross-component on-disk format contract and no new REQ_* flag.
+
+	  The per-slot metadata is currently kept in a standalone store; it is
+	  designed to move onto the ghost/virtual swap layer's virtual_table
+	  (swap table phase IV / virtual swap space) once that is available.
+
+	  This option only builds the descriptor store and its interface; no
+	  writeback or swapin path uses it yet.  Say N unless developing this
+	  feature.
+
 choice
 	prompt "Default compressor"
 	depends on ZSWAP

@@ -4,6 +4,7 @@
 
 #include <linux/atomic.h> /* for atomic_long_t */
 #include <linux/mm.h> /* for PAGE_SHIFT */
+#include "swap_compressed.h"
 struct mempolicy;
 struct swap_iocb;
 struct swap_memcg_table;
