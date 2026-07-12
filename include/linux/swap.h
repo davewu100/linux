@@ -263,6 +263,10 @@ struct swap_info_struct {
 	struct block_device *bdev;	/* swap device or bdev of swap file */
 	struct file *swap_file;		/* seldom referenced */
 	struct completion comp;		/* seldom referenced */
+	bool swp_compress_passthrough;	/* backing dev accepts precompressed
+					 * swap writes (REQ_COMPRESSED) */
+	char swp_compress_algo[24];	/* backing dev's compression algorithm,
+					 * valid if swp_compress_passthrough */
 	spinlock_t lock;		/*
 					 * protect map scan related fields like
 					 * inuse_pages and all cluster lists.

@@ -4107,6 +4107,22 @@ SYSCALL_DEFINE2(swapon, const char __user *, specialfile, int, swap_flags)
 		if (si->bdev && bdev_synchronous(si->bdev))
 			si->flags |= SWP_SYNCHRONOUS_IO;
 
+		/*
+		 * Probe whether the backing device can store precompressed data
+		 * as-is (see REQ_COMPRESSED).  Only meaningful for the
+		 * synchronous bdev path, which is the one that carries the hint.
+		 */
+		si->swp_compress_passthrough = false;
+		if (si->bdev && (si->flags & SWP_SYNCHRONOUS_IO)) {
+			const struct block_device_operations *ops =
+				si->bdev->bd_disk->fops;
+
+			if (ops->swap_comp_algo &&
+			    ops->swap_comp_algo(si->bdev, si->swp_compress_algo,
+						sizeof(si->swp_compress_algo)) == 0)
+				si->swp_compress_passthrough = true;
+		}
+
 		if (si->bdev && !bdev_rot(si->bdev)) {
 			si->flags |= SWP_SOLIDSTATE;
 		} else {
