@@ -19,6 +19,9 @@
 #include "backend_zstd.h"
 #include "backend_deflate.h"
 #include "backend_842.h"
+#if IS_ENABLED(CONFIG_ZRAM_BACKEND_ACOMP)
+#include "backend_acomp.h"
+#endif
 
 static const struct zcomp_ops *backends[] = {
 #if IS_ENABLED(CONFIG_ZRAM_BACKEND_LZO)
@@ -39,6 +42,9 @@ static const struct zcomp_ops *backends[] = {
 #endif
 #if IS_ENABLED(CONFIG_ZRAM_BACKEND_842)
 	&backend_842,
+#endif
+#if IS_ENABLED(CONFIG_ZRAM_BACKEND_ACOMP)
+	&backend_acomp_deflate,
 #endif
 	NULL
 };
