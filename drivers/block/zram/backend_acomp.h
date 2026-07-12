@@ -7,6 +7,7 @@
 #include "zcomp.h"
 
 extern const struct zcomp_ops backend_acomp_deflate;
+extern const struct zcomp_ops backend_acomp_zstd;
 
 const char *zcomp_acomp_crypto_name(struct zcomp *comp);
 bool zcomp_acomp_async_decompress(struct zcomp *comp);

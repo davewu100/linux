@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 /*
- * zcomp backend using the kernel crypto acompress API.
+ * zcomp backends using the kernel crypto acompress API.
  *
  * Allows zram to offload (de)compression to hardware accelerators such as
- * Intel QAT when a matching crypto acompress driver is present.  The zcomp
- * user-visible algorithm name is "deflate-hw"; the underlying crypto
- * transform is "deflate".
+ * Intel QAT when a matching crypto acompress driver is present:
+ *
+ *   "deflate-hw" -> crypto "deflate" (QAT Gen2+)
+ *   "zstd-hw"    -> crypto "zstd"    (QAT Gen4+ compress; Gen6 decompress)
  */
 
 #include <linux/crypto.h>
@@ -37,11 +38,16 @@ static struct acomp_stream *acomp_stream(struct zcomp_ctx *ctx)
 	return ctx->context;
 }
 
+static bool zcomp_ops_is_acomp(const struct zcomp_ops *ops)
+{
+	return ops == &backend_acomp_deflate || ops == &backend_acomp_zstd;
+}
+
 const char *zcomp_acomp_crypto_name(struct zcomp *comp)
 {
 	struct acomp_drv *drv;
 
-	if (!comp || comp->ops != &backend_acomp_deflate)
+	if (!comp || !zcomp_ops_is_acomp(comp->ops))
 		return NULL;
 
 	drv = acomp_drv(comp->params);
@@ -52,7 +58,7 @@ bool zcomp_acomp_async_decompress(struct zcomp *comp)
 {
 	struct acomp_drv *drv;
 
-	if (!comp || comp->ops != &backend_acomp_deflate)
+	if (!comp || !zcomp_ops_is_acomp(comp->ops))
 		return false;
 
 	drv = acomp_drv(comp->params);
@@ -65,7 +71,7 @@ static void acomp_release_params(struct zcomp_params *params)
 	params->drv_data = NULL;
 }
 
-static int acomp_setup_params(struct zcomp_params *params)
+static int acomp_setup_params(struct zcomp_params *params, const char *crypto_name)
 {
 	struct acomp_drv *drv;
 
@@ -73,9 +79,19 @@ static int acomp_setup_params(struct zcomp_params *params)
 	if (!drv)
 		return -ENOMEM;
 
-	strscpy(drv->crypto_name, "deflate", sizeof(drv->crypto_name));
+	strscpy(drv->crypto_name, crypto_name, sizeof(drv->crypto_name));
 	params->drv_data = drv;
 	return 0;
+}
+
+static int acomp_deflate_setup_params(struct zcomp_params *params)
+{
+	return acomp_setup_params(params, "deflate");
+}
+
+static int acomp_zstd_setup_params(struct zcomp_params *params)
+{
+	return acomp_setup_params(params, "zstd");
 }
 
 static void acomp_destroy_ctx(struct zcomp_ctx *ctx)
@@ -102,8 +118,8 @@ static int acomp_create_ctx(struct zcomp_params *params, struct zcomp_ctx *ctx)
 		return -ENOMEM;
 
 	/*
-	 * Prefer an async driver (e.g. qat_deflate) when present; fall back to
-	 * the synchronous generic implementation otherwise.
+	 * Prefer an async driver (e.g. qat_deflate / qat_zstd) when present;
+	 * fall back to the synchronous generic implementation otherwise.
 	 */
 	stream->acomp = crypto_alloc_acomp(drv->crypto_name, 0, CRYPTO_ALG_ASYNC);
 	if (IS_ERR(stream->acomp)) {
@@ -196,7 +212,17 @@ const struct zcomp_ops backend_acomp_deflate = {
 	.decompress	= acomp_decompress,
 	.create_ctx	= acomp_create_ctx,
 	.destroy_ctx	= acomp_destroy_ctx,
-	.setup_params	= acomp_setup_params,
+	.setup_params	= acomp_deflate_setup_params,
 	.release_params	= acomp_release_params,
 	.name		= "deflate-hw",
+};
+
+const struct zcomp_ops backend_acomp_zstd = {
+	.compress	= acomp_compress,
+	.decompress	= acomp_decompress,
+	.create_ctx	= acomp_create_ctx,
+	.destroy_ctx	= acomp_destroy_ctx,
+	.setup_params	= acomp_zstd_setup_params,
+	.release_params	= acomp_release_params,
+	.name		= "zstd-hw",
 };

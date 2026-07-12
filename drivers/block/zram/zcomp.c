@@ -45,6 +45,7 @@ static const struct zcomp_ops *backends[] = {
 #endif
 #if IS_ENABLED(CONFIG_ZRAM_BACKEND_ACOMP)
 	&backend_acomp_deflate,
+	&backend_acomp_zstd,
 #endif
 	NULL
 };

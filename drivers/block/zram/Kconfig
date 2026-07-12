@@ -51,8 +51,9 @@ config ZRAM_BACKEND_ACOMP
 	help
 	  Use the kernel crypto acompress API for compression and
 	  decompression, allowing hardware acceleration (e.g. Intel QAT)
-	  when a matching driver is present.  Exposes a "deflate-hw"
-	  algorithm backed by the crypto "deflate" transform.
+	  when a matching driver is present.  Exposes "deflate-hw" and
+	  "zstd-hw" algorithms backed by the crypto "deflate" and "zstd"
+	  transforms respectively.
 
 config ZRAM_BACKEND_FORCE_LZO
 	depends on ZRAM
@@ -104,6 +105,10 @@ config ZRAM_DEF_COMP_DEFLATE_HW
 	bool "deflate-hw"
 	depends on ZRAM_BACKEND_ACOMP
 
+config ZRAM_DEF_COMP_ZSTD_HW
+	bool "zstd-hw"
+	depends on ZRAM_BACKEND_ACOMP
+
 endchoice
 
 config ZRAM_DEF_COMP
@@ -116,6 +121,7 @@ config ZRAM_DEF_COMP
 	default "zstd" if ZRAM_DEF_COMP_ZSTD
 	default "deflate" if ZRAM_DEF_COMP_DEFLATE
 	default "deflate-hw" if ZRAM_DEF_COMP_DEFLATE_HW
+	default "zstd-hw" if ZRAM_DEF_COMP_ZSTD_HW
 	default "842" if ZRAM_DEF_COMP_842
 	default "unset-value"
 
