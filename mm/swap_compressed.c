@@ -15,13 +15,60 @@
  */
 
 #include <linux/build_bug.h>
+#include <linux/cleanup.h>
 #include <linux/gfp.h>
+#include <linux/mutex.h>
+#include <linux/slab.h>
+#include <linux/string.h>
 #include <linux/swap.h>
 #include <linux/xarray.h>
 
 #include "swap_compressed.h"
 
 static DEFINE_XARRAY(swap_compressed_store);
+
+/*
+ * Codec name registry.  A descriptor only has room for a small id, so codec
+ * names are interned here and resolved back on swapin.  Entries are never
+ * removed (the set of active compressors is tiny and bounded by the id space),
+ * so a resolved name is valid for the lifetime of the kernel without a lock.
+ */
+static DEFINE_MUTEX(swap_compressed_algo_lock);
+static const char *swap_compressed_algos[SWP_COMP_ALGO_MAX + 1];
+static unsigned int swap_compressed_nr_algos;
+
+int swap_compressed_algo_id(const char *tfm_name)
+{
+	unsigned int i;
+	char *dup;
+	int ret;
+
+	guard(mutex)(&swap_compressed_algo_lock);
+
+	for (i = 0; i < swap_compressed_nr_algos; i++)
+		if (!strcmp(swap_compressed_algos[i], tfm_name))
+			return i;
+
+	if (swap_compressed_nr_algos > SWP_COMP_ALGO_MAX)
+		return -ENOSPC;
+
+	dup = kstrdup(tfm_name, GFP_KERNEL);
+	if (!dup)
+		return -ENOMEM;
+
+	ret = swap_compressed_nr_algos;
+	swap_compressed_algos[swap_compressed_nr_algos++] = dup;
+	return ret;
+}
+
+const char *swap_compressed_algo_name(u16 algo_id)
+{
+	guard(mutex)(&swap_compressed_algo_lock);
+
+	if (algo_id < swap_compressed_nr_algos)
+		return swap_compressed_algos[algo_id];
+	return NULL;
+}
 
 #define SWP_COMP_FLAG_MASK	((1u << SWP_COMP_FLAG_BITS) - 1)
 #define SWP_COMP_ALGO_SHIFT	SWP_COMP_FLAG_BITS

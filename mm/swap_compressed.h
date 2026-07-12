@@ -56,6 +56,16 @@ struct swp_compressed_desc {
 /* Whether compressed writeback may be used (per-tier gating lands later). */
 bool swap_compressed_writeback_enabled(void);
 
+/*
+ * Intern a zswap codec name and return a stable small id in [0, algo max], or
+ * a negative errno.  The id is what a descriptor stores; the name is resolved
+ * back on swapin to pick the decompressor.
+ */
+int swap_compressed_algo_id(const char *tfm_name);
+
+/* Resolve an id previously returned by swap_compressed_algo_id(). */
+const char *swap_compressed_algo_name(u16 algo_id);
+
 /* Record @desc for the physical slot @phys.  Returns 0 or a negative errno. */
 int swap_compressed_record(swp_entry_t phys,
 			   const struct swp_compressed_desc *desc);
@@ -72,6 +82,16 @@ void swap_compressed_erase(swp_entry_t phys);
 static inline bool swap_compressed_writeback_enabled(void)
 {
 	return false;
+}
+
+static inline int swap_compressed_algo_id(const char *tfm_name)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline const char *swap_compressed_algo_name(u16 algo_id)
+{
+	return NULL;
 }
 
 static inline int swap_compressed_record(swp_entry_t phys,

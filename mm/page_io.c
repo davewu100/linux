@@ -621,6 +621,32 @@ static void swap_read_folio_fs(struct folio *folio, struct swap_iocb **plug)
 		*plug = sio;
 }
 
+#ifdef CONFIG_SWAP_COMPRESSED_WRITEBACK
+/*
+ * Synchronously write @folio, which holds a zswap-compressed blob (not the raw
+ * page), to its backing swap slot.  Used by compressed writeback: the folio is
+ * dropped from the swap cache by the caller afterwards, so this must complete
+ * before returning (no async writeback machinery references the folio).
+ *
+ * Only block-backed devices are supported for now; this is the physical-slot
+ * stand-in for what the ghost/virtual swap layer would allocate on demand.
+ */
+int swap_writepage_compressed(struct folio *folio)
+{
+	struct swap_info_struct *sis = __swap_entry_to_info(folio->swap);
+	struct bio_vec bv;
+	struct bio bio;
+
+	if (!(sis->flags & SWP_BLKDEV))
+		return -EOPNOTSUPP;
+
+	bio_init(&bio, sis->bdev, &bv, 1, REQ_OP_WRITE);
+	bio.bi_iter.bi_sector = swap_folio_sector(folio);
+	bio_add_folio_nofail(&bio, folio, folio_size(folio), 0);
+	return submit_bio_wait(&bio);
+}
+#endif /* CONFIG_SWAP_COMPRESSED_WRITEBACK */
+
 static void swap_read_folio_bdev_sync(struct folio *folio,
 		struct swap_info_struct *sis)
 {

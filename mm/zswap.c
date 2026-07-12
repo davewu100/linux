@@ -969,6 +969,65 @@ static bool zswap_decompress(struct zswap_entry *entry, struct folio *folio)
 	return false;
 }
 
+#ifdef CONFIG_SWAP_COMPRESSED_WRITEBACK
+/*
+ * Copy the entry's stored compressed bytes verbatim into @folio and zero the
+ * remainder of the page, so the folio can be written to the backing slot as an
+ * opaque blob (no decompression).  A later swapin reads it back and
+ * decompresses it with the same codec.
+ */
+static void zswap_store_blob_to_folio(struct zswap_entry *entry,
+				      struct folio *folio)
+{
+	struct zswap_pool *pool = entry->pool;
+	struct scatterlist input[2]; /* zsmalloc returns an SG list 1-2 entries */
+	void *dst;
+
+	zs_obj_read_sg_begin(pool->zs_pool, entry->handle, input, entry->length);
+	dst = kmap_local_folio(folio, 0);
+	memcpy_from_sglist(dst, input, 0, entry->length);
+	memset(dst + entry->length, 0, PAGE_SIZE - entry->length);
+	kunmap_local(dst);
+	zs_obj_read_sg_end(pool->zs_pool, entry->handle);
+	flush_dcache_folio(folio);
+}
+
+/*
+ * Try to write @entry's compressed blob to @swpentry's backing slot without
+ * decompressing, recording the metadata needed to read it back.  On success
+ * @folio holds the blob (not the raw page) and has been written to the device;
+ * the caller drops it from the swap cache.  On failure @entry is untouched and
+ * the caller falls back to the decompress path.
+ */
+static bool zswap_writeback_store_compressed(struct zswap_entry *entry,
+					     struct folio *folio,
+					     swp_entry_t swpentry)
+{
+	struct swp_compressed_desc desc;
+	int algo_id;
+
+	algo_id = swap_compressed_algo_id(entry->pool->tfm_name);
+	if (algo_id < 0)
+		return false;
+
+	desc.clen = entry->length;
+	desc.algo_id = algo_id;
+	desc.flags = SWP_COMP_F_NONE;
+
+	/* Record before the write so a swapin never sees a blob without metadata. */
+	if (swap_compressed_record(swpentry, &desc))
+		return false;
+
+	zswap_store_blob_to_folio(entry, folio);
+
+	if (swap_writepage_compressed(folio)) {
+		swap_compressed_erase(swpentry);
+		return false;
+	}
+	return true;
+}
+#endif /* CONFIG_SWAP_COMPRESSED_WRITEBACK */
+
 /*********************************
 * writeback code
 **********************************/
@@ -1028,6 +1087,37 @@ static int zswap_writeback_entry(struct zswap_entry *entry,
 		ret = -ENOMEM;
 		goto out;
 	}
+
+#ifdef CONFIG_SWAP_COMPRESSED_WRITEBACK
+	/*
+	 * Compressed writeback: hand the compressed blob to the backing device
+	 * verbatim instead of decompressing.  Only genuinely compressed,
+	 * order-0 entries are eligible; anything else (or any failure) falls
+	 * through to the decompress path below.
+	 */
+	if (swap_compressed_writeback_enabled() && !folio_test_large(folio) &&
+	    entry->length && entry->length < PAGE_SIZE &&
+	    zswap_writeback_store_compressed(entry, folio, swpentry)) {
+		xa_erase(tree, offset);
+
+		count_vm_event(ZSWPWB);
+		if (entry->objcg)
+			count_objcg_events(entry->objcg, ZSWPWB, 1);
+
+		zswap_entry_free(entry);
+
+		/*
+		 * The folio holds compressed bytes, not the raw page, and the
+		 * blob is already on the backing device.  Drop it from the swap
+		 * cache rather than marking it uptodate; a later swapin reads
+		 * the blob back and decompresses it.
+		 */
+		swap_cache_del_folio(folio);
+		folio_unlock(folio);
+		folio_put(folio);
+		return 0;
+	}
+#endif /* CONFIG_SWAP_COMPRESSED_WRITEBACK */
 
 	if (!zswap_decompress(entry, folio)) {
 		ret = -EIO;

@@ -1314,8 +1314,15 @@ static void swap_range_free(struct swap_info_struct *si, unsigned long offset,
 	void (*swap_slot_free_notify)(struct block_device *, unsigned long);
 	unsigned int i;
 
-	for (i = 0; i < nr_entries; i++)
+	for (i = 0; i < nr_entries; i++) {
 		zswap_invalidate(swp_entry(si->type, offset + i));
+		/*
+		 * A compressed-writeback descriptor is tied to the physical
+		 * slot; drop it here so a recycled slot is never misread as a
+		 * compressed blob.
+		 */
+		swap_compressed_erase(swp_entry(si->type, offset + i));
+	}
 
 	if (si->flags & SWP_BLKDEV)
 		swap_slot_free_notify =
