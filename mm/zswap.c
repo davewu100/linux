@@ -1020,13 +1020,12 @@ static bool zswap_writeback_passthrough(struct zswap_entry *entry,
  * device.  We are basically resuming the same swap writeback path that was
  * intercepted with the zswap_store() in the first place.
  *
- * Writeback never decompresses: zswap already holds the page in a compact
- * form, so the exact stored bytes are handed to the backing device (zram) to
- * save both CPU and memory.  Genuinely compressed entries are stored verbatim
- * via REQ_COMPRESSED (requires a passthrough-capable backing sharing our
- * compressor); entries stored uncompressed (length == PAGE_SIZE) are copied
- * out as the raw page and written normally, letting the backing device store
- * them in its own compact representation.
+ * A genuinely compressed entry is handed to the backing device verbatim via
+ * REQ_COMPRESSED when the backing is passthrough-capable (zram sharing our
+ * compressor), skipping the decompress+recompress cycle.  Otherwise (e.g. an
+ * SSD/file backing, a mismatched compressor, an uncompressed or large entry)
+ * we resume the normal path: the raw page is restored into the folio and
+ * written back, letting the backing device store it with its own algorithm.
  */
 static int zswap_writeback_entry(struct zswap_entry *entry,
 				 swp_entry_t swpentry)
@@ -1083,19 +1082,12 @@ static int zswap_writeback_entry(struct zswap_entry *entry,
 	}
 
 	/*
-	 * Genuinely compressed entries are handed to the backing device
-	 * verbatim, without decompressing.  This requires a passthrough-capable
-	 * backing (zram) that shares our compressor; if none is available we
-	 * keep the entry in zswap rather than paying for a decompress/recompress
-	 * cycle.  (length == PAGE_SIZE means zswap stored the page raw, so it is
-	 * handled by the normal-write path below.)
+	 * Passthrough fast path: a genuinely compressed entry can be handed to
+	 * a passthrough-capable backing (zram sharing our compressor) verbatim,
+	 * skipping the decompress+recompress cycle.
 	 */
-	if (entry->length < PAGE_SIZE) {
-		if (!passthrough_cap || folio_test_large(folio) ||
-		    entry->length == 0) {
-			ret = -EOPNOTSUPP;
-			goto out;
-		}
+	if (entry->length && entry->length < PAGE_SIZE &&
+	    passthrough_cap && !folio_test_large(folio)) {
 		if (!zswap_writeback_passthrough(entry, folio)) {
 			ret = -EIO;
 			goto out;
@@ -1119,12 +1111,16 @@ static int zswap_writeback_entry(struct zswap_entry *entry,
 	}
 
 	/*
-	 * Entry stored uncompressed: the stored bytes are the raw page.  Copy
-	 * them into the folio (no decompression) and write it back normally,
-	 * letting the backing device store it compactly with its own algorithm.
+	 * Fallback: no passthrough backing (e.g. SSD/file, a mismatched
+	 * compressor, or an uncompressed/large entry).  Restore the raw page
+	 * into the folio and write it back normally.  zswap_decompress() copies
+	 * uncompressed entries (length == PAGE_SIZE) as-is and decompresses
+	 * genuinely compressed ones.
 	 */
-	zswap_copy_stored_to_folio(entry, folio);
-	flush_dcache_folio(folio);
+	if (!zswap_decompress(entry, folio)) {
+		ret = -EIO;
+		goto out;
+	}
 
 	xa_erase(tree, offset);
 
