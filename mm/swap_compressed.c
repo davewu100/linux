@@ -17,11 +17,16 @@
 #include <linux/build_bug.h>
 #include <linux/cleanup.h>
 #include <linux/gfp.h>
+#include <linux/highmem.h>
+#include <linux/mm.h>
 #include <linux/mutex.h>
+#include <linux/scatterlist.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/swap.h>
 #include <linux/xarray.h>
+
+#include <crypto/acompress.h>
 
 #include "swap_compressed.h"
 
@@ -137,4 +142,65 @@ bool swap_compressed_lookup(swp_entry_t phys, struct swp_compressed_desc *desc)
 void swap_compressed_erase(swp_entry_t phys)
 {
 	xa_erase(&swap_compressed_store, phys.val);
+}
+
+bool swap_compressed_decompress_folio(struct folio *folio,
+				      const struct swp_compressed_desc *desc)
+{
+	const char *name = swap_compressed_algo_name(desc->algo_id);
+	struct crypto_acomp *acomp;
+	struct acomp_req *req;
+	struct scatterlist ssg, dsg;
+	struct crypto_wait wait;
+	struct page *scratch;
+	bool ok = false;
+	int ret;
+
+	if (!name || !desc->clen || desc->clen >= PAGE_SIZE)
+		return false;
+
+	/*
+	 * Decompress into a scratch page and copy back, since @folio is both
+	 * the compressed source and the raw destination.  Allocating a
+	 * transient acomp per swapin is deliberately simple for the prototype;
+	 * a real implementation would reuse a per-CPU codec context.
+	 */
+	scratch = alloc_page(GFP_KERNEL);
+	if (!scratch)
+		return false;
+
+	acomp = crypto_alloc_acomp(name, 0, 0);
+	if (IS_ERR(acomp))
+		goto out_page;
+
+	req = acomp_request_alloc(acomp);
+	if (!req)
+		goto out_acomp;
+
+	crypto_init_wait(&wait);
+	acomp_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG,
+				   crypto_req_done, &wait);
+
+	sg_init_table(&ssg, 1);
+	sg_set_folio(&ssg, folio, desc->clen, 0);
+	sg_init_table(&dsg, 1);
+	sg_set_page(&dsg, scratch, PAGE_SIZE, 0);
+	acomp_request_set_params(req, &ssg, &dsg, desc->clen, PAGE_SIZE);
+
+	ret = crypto_wait_req(crypto_acomp_decompress(req), &wait);
+	if (!ret && req->dlen == PAGE_SIZE) {
+		void *s = kmap_local_page(scratch);
+
+		memcpy_to_folio(folio, 0, s, PAGE_SIZE);
+		kunmap_local(s);
+		flush_dcache_folio(folio);
+		ok = true;
+	}
+
+	acomp_request_free(req);
+out_acomp:
+	crypto_free_acomp(acomp);
+out_page:
+	__free_page(scratch);
+	return ok;
 }

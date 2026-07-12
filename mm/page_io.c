@@ -669,6 +669,49 @@ static void swap_read_folio_bdev_sync(struct folio *folio,
 	put_task_struct(current);
 }
 
+#ifdef CONFIG_SWAP_COMPRESSED_WRITEBACK
+/*
+ * If @folio's slot holds a compressed-writeback blob, read it back
+ * synchronously and decompress it in place with zswap's codec.  Runs in
+ * process (fault/readahead) context, so it may sleep.
+ *
+ * Returns true if the slot was a compressed blob and has been handled: on
+ * success the folio is uptodate and unlocked; on error it is unlocked and left
+ * not-uptodate.  Returns false to fall through to the normal read path.
+ */
+static bool swap_read_folio_compressed(struct folio *folio,
+				       struct swap_info_struct *sis)
+{
+	struct swp_compressed_desc desc;
+	struct bio_vec bv;
+	struct bio bio;
+
+	if (!swap_compressed_writeback_enabled() || !(sis->flags & SWP_BLKDEV))
+		return false;
+	if (!swap_compressed_lookup(folio->swap, &desc))
+		return false;
+
+	/* Read the opaque blob into the folio, then decompress it in place. */
+	bio_init(&bio, sis->bdev, &bv, 1, REQ_OP_READ);
+	bio.bi_iter.bi_sector = swap_folio_sector(folio);
+	bio_add_folio_nofail(&bio, folio, folio_size(folio), 0);
+	count_vm_events(PSWPIN, folio_nr_pages(folio));
+	if (submit_bio_wait(&bio)) {
+		folio_unlock(folio);
+		return true;
+	}
+
+	if (!swap_compressed_decompress_folio(folio, &desc)) {
+		folio_unlock(folio);
+		return true;
+	}
+
+	folio_mark_uptodate(folio);
+	folio_unlock(folio);
+	return true;
+}
+#endif /* CONFIG_SWAP_COMPRESSED_WRITEBACK */
+
 static void swap_read_folio_bdev_async(struct folio *folio,
 		struct swap_info_struct *sis)
 {
@@ -714,6 +757,11 @@ void swap_read_folio(struct folio *folio, struct swap_iocb **plug)
 
 	if (zswap_load(folio) != -ENOENT)
 		goto finish;
+
+#ifdef CONFIG_SWAP_COMPRESSED_WRITEBACK
+	if (swap_read_folio_compressed(folio, sis))
+		goto finish;
+#endif
 
 	/* We have to read from slower devices. Increase zswap protection. */
 	zswap_folio_swapin(folio);

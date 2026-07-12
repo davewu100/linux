@@ -6,6 +6,8 @@
 #include <linux/mm_types.h>	/* swp_entry_t */
 #include <linux/types.h>
 
+struct folio;
+
 /*
  * Compressed writeback: record that a genuinely compressed zswap blob was
  * written to a physical swap slot verbatim (without decompression), so a later
@@ -77,6 +79,14 @@ bool swap_compressed_lookup(swp_entry_t phys,
 /* Drop any descriptor recorded for @phys. */
 void swap_compressed_erase(swp_entry_t phys);
 
+/*
+ * Decompress @folio in place: it must currently hold @desc's blob in its first
+ * @desc->clen bytes.  Uses the codec named by @desc->algo_id.  Returns true on
+ * success (folio now holds the raw page), false on error.
+ */
+bool swap_compressed_decompress_folio(struct folio *folio,
+				      const struct swp_compressed_desc *desc);
+
 #else /* !CONFIG_SWAP_COMPRESSED_WRITEBACK */
 
 static inline bool swap_compressed_writeback_enabled(void)
@@ -108,6 +118,12 @@ static inline bool swap_compressed_lookup(swp_entry_t phys,
 
 static inline void swap_compressed_erase(swp_entry_t phys)
 {
+}
+
+static inline bool swap_compressed_decompress_folio(struct folio *folio,
+					const struct swp_compressed_desc *desc)
+{
+	return false;
 }
 
 #endif /* CONFIG_SWAP_COMPRESSED_WRITEBACK */
