@@ -2331,6 +2331,60 @@ static int zram_write_page(struct zram *zram, struct page *page, u32 index)
 }
 
 /*
+ * Store data that arrived already compressed (REQ_COMPRESSED, e.g. a zswap
+ * writeback passthrough) as a regular compressed slot, skipping zcomp_compress.
+ *
+ * @page holds @comp_len bytes of a blob produced by the *same* algorithm as our
+ * primary compressor (negotiated via ->swap_comp_algo), so it is stored at
+ * priority ZRAM_PRIMARY_COMP and the read path decompresses it unchanged.  It
+ * is a plain compressed slot: no ZRAM_HUGE / ZRAM_INCOMPRESSIBLE.
+ *
+ * Kept noinline so the passthrough path stays observable (e.g. via a kprobe)
+ * for testing; it is a cold writeback path with no fast-path impact.
+ */
+static noinline int zram_write_precompressed(struct zram *zram,
+					     struct page *page, u32 index,
+					     unsigned int comp_len)
+{
+	unsigned long handle;
+	void *src;
+
+	/*
+	 * A full-page blob would be indistinguishable from an uncompressed
+	 * (huge) slot on read; the caller only sends genuinely compressed data.
+	 */
+	if (!comp_len || comp_len >= PAGE_SIZE)
+		return -EINVAL;
+
+	handle = zs_malloc(zram->mem_pool, comp_len,
+			   GFP_NOIO | __GFP_NOWARN |
+			   __GFP_HIGHMEM | __GFP_MOVABLE, page_to_nid(page));
+	if (IS_ERR_VALUE(handle))
+		return PTR_ERR((void *)handle);
+
+	if (!zram_can_store_page(zram)) {
+		zs_free(zram->mem_pool, handle);
+		return -ENOMEM;
+	}
+
+	src = kmap_local_page(page);
+	zs_obj_write(zram->mem_pool, handle, src, comp_len);
+	kunmap_local(src);
+
+	slot_lock(zram, index);
+	slot_free(zram, index);
+	set_slot_handle(zram, index, handle);
+	set_slot_size(zram, index, comp_len);
+	set_slot_comp_priority(zram, index, ZRAM_PRIMARY_COMP);
+	slot_unlock(zram, index);
+
+	atomic64_inc(&zram->stats.pages_stored);
+	atomic64_add(comp_len, &zram->stats.compr_data_size);
+
+	return 0;
+}
+
+/*
  * This is a partial IO. Read the full page before writing the changes.
  */
 static int zram_bvec_write_partial(struct zram *zram, struct bio_vec *bvec,
@@ -2352,8 +2406,16 @@ static int zram_bvec_write_partial(struct zram *zram, struct bio_vec *bvec,
 }
 
 static int zram_bvec_write(struct zram *zram, struct bio_vec *bvec,
-			   u32 index, int offset)
+			   u32 index, int offset, bool compressed)
 {
+	/*
+	 * Precompressed passthrough: the bvec carries exactly comp_len bytes of
+	 * an already-compressed blob (< PAGE_SIZE), so it is never a partial IO
+	 * of a raw page.  Store it directly instead of compressing again.
+	 */
+	if (compressed)
+		return zram_write_precompressed(zram, bvec->bv_page, index,
+						bvec->bv_len);
 	if (is_partial_io(bvec))
 		return zram_bvec_write_partial(zram, bvec, index, offset);
 	return zram_write_page(zram, bvec->bv_page, index);
@@ -2743,6 +2805,7 @@ static void zram_bio_write(struct zram *zram, struct bio *bio)
 {
 	unsigned long start_time = bio_start_io_acct(bio);
 	struct bvec_iter iter = bio->bi_iter;
+	bool compressed = !!(bio->bi_opf & REQ_COMPRESSED);
 
 	do {
 		u32 index = iter.bi_sector >> SECTORS_PER_PAGE_SHIFT;
@@ -2752,7 +2815,7 @@ static void zram_bio_write(struct zram *zram, struct bio *bio)
 
 		bv.bv_len = min_t(u32, bv.bv_len, PAGE_SIZE - offset);
 
-		if (zram_bvec_write(zram, &bv, index, offset) < 0) {
+		if (zram_bvec_write(zram, &bv, index, offset, compressed) < 0) {
 			atomic64_inc(&zram->stats.failed_writes);
 			bio->bi_status = BLK_STS_IOERR;
 			break;
@@ -2958,10 +3021,36 @@ static int zram_open(struct gendisk *disk, blk_mode_t mode)
 	return 0;
 }
 
+/*
+ * Report the primary compression algorithm so an upper swap tier (zswap) can
+ * decide whether it may hand us precompressed data via REQ_COMPRESSED.  We
+ * expose the primary compressor only: passthrough writes are stored at
+ * priority ZRAM_PRIMARY_COMP and read back with the same algorithm.
+ */
+static int zram_swap_comp_algo(struct block_device *bdev, char *name,
+			       size_t len)
+{
+	struct zram *zram = bdev->bd_disk->private_data;
+	int ret = -ENODEV;
+
+	if (!zram)
+		return -ENODEV;
+
+	down_read(&zram->dev_lock);
+	if (init_done(zram) && zram->comp_algs[ZRAM_PRIMARY_COMP]) {
+		strscpy(name, zram->comp_algs[ZRAM_PRIMARY_COMP], len);
+		ret = 0;
+	}
+	up_read(&zram->dev_lock);
+
+	return ret;
+}
+
 static const struct block_device_operations zram_devops = {
 	.open = zram_open,
 	.submit_bio = zram_submit_bio,
 	.swap_slot_free_notify = zram_slot_free_notify,
+	.swap_comp_algo = zram_swap_comp_algo,
 	.owner = THIS_MODULE
 };
 
