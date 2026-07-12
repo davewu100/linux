@@ -1671,6 +1671,14 @@ struct block_device_operations {
 	void (*free_disk)(struct gendisk *disk);
 	/* this callback is with swap_lock and sometimes page table lock held */
 	void (*swap_slot_free_notify) (struct block_device *, unsigned long);
+	/*
+	 * Report the compression algorithm this device applies to swap writes,
+	 * so an upper tier (e.g. zswap) can pass already-compressed data
+	 * through with REQ_COMPRESSED instead of decompress+recompress.  Fills
+	 * @name (NUL-terminated, up to @len bytes) and returns 0 on success, or
+	 * a negative errno if compressed-swap passthrough is unsupported.
+	 */
+	int (*swap_comp_algo)(struct block_device *bdev, char *name, size_t len);
 	int (*report_zones)(struct gendisk *, sector_t sector,
 			    unsigned int nr_zones,
 			    struct blk_report_zones_args *args);

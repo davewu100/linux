@@ -250,8 +250,8 @@ static inline void swap_read_unplug(struct swap_iocb *plug)
 }
 void swap_write_unplug(struct swap_iocb *sio);
 int swap_writeout(struct folio *folio, struct swap_iocb **swap_plug);
-void __swap_writepage(struct folio *folio, struct swap_iocb **swap_plug,
-		bool nocompress);
+void __swap_writepage(struct folio *folio, struct swap_iocb **swap_plug);
+int swap_writepage_entry_compressed(struct folio *folio, unsigned int comp_len);
 
 /* linux/mm/swap_state.c */
 extern struct address_space swap_space __read_mostly;

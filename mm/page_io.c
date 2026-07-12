@@ -295,7 +295,7 @@ int swap_writeout(struct folio *folio, struct swap_iocb **swap_plug)
 	}
 	rcu_read_unlock();
 
-	__swap_writepage(folio, swap_plug, false);
+	__swap_writepage(folio, swap_plug);
 	return 0;
 out_unlock:
 	folio_unlock(folio);
@@ -422,16 +422,12 @@ static void swap_writepage_fs(struct folio *folio, struct swap_iocb **swap_plug)
 }
 
 static void swap_writepage_bdev_sync(struct folio *folio,
-		struct swap_info_struct *sis, bool nocompress)
+		struct swap_info_struct *sis)
 {
 	struct bio_vec bv;
 	struct bio bio;
-	blk_opf_t opf = REQ_OP_WRITE | REQ_SWAP;
 
-	if (nocompress)
-		opf |= REQ_NOCOMPRESS;
-
-	bio_init(&bio, sis->bdev, &bv, 1, opf);
+	bio_init(&bio, sis->bdev, &bv, 1, REQ_OP_WRITE | REQ_SWAP);
 	bio.bi_iter.bi_sector = swap_folio_sector(folio);
 	bio_add_folio_nofail(&bio, folio, folio_size(folio), 0);
 
@@ -446,15 +442,11 @@ static void swap_writepage_bdev_sync(struct folio *folio,
 }
 
 static void swap_writepage_bdev_async(struct folio *folio,
-		struct swap_info_struct *sis, bool nocompress)
+		struct swap_info_struct *sis)
 {
 	struct bio *bio;
-	blk_opf_t opf = REQ_OP_WRITE | REQ_SWAP;
 
-	if (nocompress)
-		opf |= REQ_NOCOMPRESS;
-
-	bio = bio_alloc(sis->bdev, 1, opf, GFP_NOIO);
+	bio = bio_alloc(sis->bdev, 1, REQ_OP_WRITE | REQ_SWAP, GFP_NOIO);
 	bio->bi_iter.bi_sector = swap_folio_sector(folio);
 	bio->bi_end_io = end_swap_bio_write;
 	bio_add_folio_nofail(bio, folio, folio_size(folio), 0);
@@ -466,8 +458,7 @@ static void swap_writepage_bdev_async(struct folio *folio,
 	submit_bio(bio);
 }
 
-void __swap_writepage(struct folio *folio, struct swap_iocb **swap_plug,
-		bool nocompress)
+void __swap_writepage(struct folio *folio, struct swap_iocb **swap_plug)
 {
 	struct swap_info_struct *sis = __swap_entry_to_info(folio->swap);
 
@@ -485,9 +476,47 @@ void __swap_writepage(struct folio *folio, struct swap_iocb **swap_plug,
 	 * is safe.
 	 */
 	else if (data_race(sis->flags & SWP_SYNCHRONOUS_IO))
-		swap_writepage_bdev_sync(folio, sis, nocompress);
+		swap_writepage_bdev_sync(folio, sis);
 	else
-		swap_writepage_bdev_async(folio, sis, nocompress);
+		swap_writepage_bdev_async(folio, sis);
+}
+
+/*
+ * Write a precompressed blob straight to the backing swap device.
+ *
+ * @folio holds @comp_len bytes of already-compressed data at offset 0 (e.g. a
+ * zswap entry handed off without decompression).  We tag the bio with
+ * REQ_COMPRESSED and size it to exactly @comp_len so the backing device (zram)
+ * stores it as-is instead of running it through its compressor again.
+ *
+ * Unlike __swap_writepage(), this does NOT unlock @folio or touch its
+ * writeback/uptodate state: the folio contains compressed bytes, not the raw
+ * page, so the caller must drop it from the swap cache after a successful
+ * write (a later swapin then reads the blob back and decompresses it).
+ *
+ * PoC restriction: synchronous bdev backing only.  Returns 0 on success or a
+ * negative errno; on failure the caller can still fall back to the normal
+ * decompress-then-write path.
+ */
+int swap_writepage_entry_compressed(struct folio *folio, unsigned int comp_len)
+{
+	struct swap_info_struct *sis = __swap_entry_to_info(folio->swap);
+	struct bio_vec bv;
+	struct bio bio;
+
+	if (!comp_len || comp_len > folio_size(folio))
+		return -EINVAL;
+	/* PoC: only the synchronous bdev path carries the compressed hint. */
+	if (data_race(sis->flags & (SWP_FS_OPS | SWP_SYNCHRONOUS_IO)) !=
+	    SWP_SYNCHRONOUS_IO)
+		return -EOPNOTSUPP;
+
+	bio_init(&bio, sis->bdev, &bv, 1,
+		 REQ_OP_WRITE | REQ_SWAP | REQ_COMPRESSED);
+	bio.bi_iter.bi_sector = swap_folio_sector(folio);
+	bio_add_folio_nofail(&bio, folio, comp_len, 0);
+
+	return submit_bio_wait(&bio);
 }
 
 void swap_write_unplug(struct swap_iocb *sio)

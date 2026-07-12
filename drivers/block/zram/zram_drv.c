@@ -1223,14 +1223,8 @@ static void scan_slots_for_writeback(struct zram *zram, u32 mode,
 		if (mode & IDLE_WRITEBACK &&
 		    !test_slot_flag(zram, index, ZRAM_IDLE))
 			goto next;
-		/*
-		 * A ZRAM_NOCOMP page is stored via the ZRAM_HUGE path but is
-		 * not a genuinely incompressible ("huge") page, so exclude it
-		 * from huge-page writeback selection.
-		 */
 		if (mode & HUGE_WRITEBACK &&
-		    (!test_slot_flag(zram, index, ZRAM_HUGE) ||
-		     test_slot_flag(zram, index, ZRAM_NOCOMP)))
+		    !test_slot_flag(zram, index, ZRAM_HUGE))
 			goto next;
 		if (mode & INCOMPRESSIBLE_WRITEBACK &&
 		    !test_slot_flag(zram, index, ZRAM_INCOMPRESSIBLE))
@@ -1575,7 +1569,7 @@ static ssize_t read_block_state(struct file *file, char __user *buf,
 			goto next;
 
 		copied = snprintf(kbuf + written, count,
-			"%12zd %12u.%06d %c%c%c%c%c%c%c\n",
+			"%12zd %12u.%06d %c%c%c%c%c%c\n",
 			index, zram->table[index].attr.ac_time, 0,
 			test_slot_flag(zram, index, ZRAM_SAME) ? 's' : '.',
 			test_slot_flag(zram, index, ZRAM_WB) ? 'w' : '.',
@@ -1583,8 +1577,7 @@ static ssize_t read_block_state(struct file *file, char __user *buf,
 			test_slot_flag(zram, index, ZRAM_IDLE) ? 'i' : '.',
 			get_slot_comp_priority(zram, index) ? 'r' : '.',
 			test_slot_flag(zram, index,
-				       ZRAM_INCOMPRESSIBLE) ? 'n' : '.',
-			test_slot_flag(zram, index, ZRAM_NOCOMP) ? 'c' : '.');
+				       ZRAM_INCOMPRESSIBLE) ? 'n' : '.');
 
 		if (count <= copied) {
 			slot_unlock(zram, index);
@@ -1942,7 +1935,7 @@ static ssize_t mm_stat_show(struct device *dev, struct device_attribute *attr,
 	max_used = atomic_long_read(&zram->stats.max_used_pages);
 
 	ret = sysfs_emit(buf,
-			"%8llu %8llu %8llu %8lu %8ld %8llu %8lu %8llu %8llu %8llu\n",
+			"%8llu %8llu %8llu %8lu %8ld %8llu %8lu %8llu %8llu\n",
 			orig_size << PAGE_SHIFT,
 			(u64)atomic64_read(&zram->stats.compr_data_size),
 			mem_used << PAGE_SHIFT,
@@ -1951,8 +1944,7 @@ static ssize_t mm_stat_show(struct device *dev, struct device_attribute *attr,
 			(u64)atomic64_read(&zram->stats.same_pages),
 			atomic_long_read(&pool_stats.pages_compacted),
 			(u64)atomic64_read(&zram->stats.huge_pages),
-			(u64)atomic64_read(&zram->stats.huge_pages_since),
-			(u64)atomic64_read(&zram->stats.nocomp_writes));
+			(u64)atomic64_read(&zram->stats.huge_pages_since));
 
 	return ret;
 }
@@ -2030,19 +2022,13 @@ static void slot_free(struct zram *zram, u32 index)
 
 	if (test_slot_flag(zram, index, ZRAM_HUGE)) {
 		/*
-		 * A ZRAM_NOCOMP page shares the ZRAM_HUGE storage path but was
-		 * never counted in ->huge_pages (only in the cumulative
-		 * ->nocomp_writes), so it must not decrement ->huge_pages here.
-		 *
 		 * Writeback completion decrements ->huge_pages but keeps
 		 * ZRAM_HUGE flag for deferred decompression path.
 		 */
-		if (!test_slot_flag(zram, index, ZRAM_WB) &&
-		    !test_slot_flag(zram, index, ZRAM_NOCOMP))
+		if (!test_slot_flag(zram, index, ZRAM_WB))
 			atomic64_dec(&zram->stats.huge_pages);
 		clear_slot_flag(zram, index, ZRAM_HUGE);
 	}
-	clear_slot_flag(zram, index, ZRAM_NOCOMP);
 
 	if (test_slot_flag(zram, index, ZRAM_WB)) {
 		clear_slot_flag(zram, index, ZRAM_WB);
@@ -2240,23 +2226,8 @@ static int write_same_filled_page(struct zram *zram, unsigned long fill,
 	return 0;
 }
 
-/*
- * Store @page uncompressed, occupying a full page in the pool.  This backs
- * two cases that share the same on-disk representation (and thus the same
- * ZRAM_HUGE read path) but differ in intent:
- *
- *   - genuinely incompressible pages (@nocompress == false), and
- *   - pages the submitter told us are already compressed via a
- *     REQ_NOCOMPRESS hint (@nocompress == true), e.g. zswap writeback.
- *
- * The latter are additionally tagged ZRAM_NOCOMP so that huge-page
- * writeback/recompression selection can skip them and so that they are
- * accounted separately from truly incompressible pages.  They are also
- * marked ZRAM_INCOMPRESSIBLE to keep recompression from trying to compress
- * data that is already compressed.
- */
 static int write_incompressible_page(struct zram *zram, struct page *page,
-				     u32 index, bool nocompress)
+				     u32 index)
 {
 	unsigned long handle;
 	void *src;
@@ -2284,28 +2255,19 @@ static int write_incompressible_page(struct zram *zram, struct page *page,
 	slot_lock(zram, index);
 	slot_free(zram, index);
 	set_slot_flag(zram, index, ZRAM_HUGE);
-	if (nocompress) {
-		set_slot_flag(zram, index, ZRAM_NOCOMP);
-		set_slot_flag(zram, index, ZRAM_INCOMPRESSIBLE);
-	}
 	set_slot_handle(zram, index, handle);
 	set_slot_size(zram, index, PAGE_SIZE);
 	slot_unlock(zram, index);
 
 	atomic64_add(PAGE_SIZE, &zram->stats.compr_data_size);
-	if (nocompress) {
-		atomic64_inc(&zram->stats.nocomp_writes);
-	} else {
-		atomic64_inc(&zram->stats.huge_pages);
-		atomic64_inc(&zram->stats.huge_pages_since);
-	}
+	atomic64_inc(&zram->stats.huge_pages);
+	atomic64_inc(&zram->stats.huge_pages_since);
 	atomic64_inc(&zram->stats.pages_stored);
 
 	return 0;
 }
 
-static int zram_write_page(struct zram *zram, struct page *page, u32 index,
-			   bool nocompress)
+static int zram_write_page(struct zram *zram, struct page *page, u32 index)
 {
 	int ret = 0;
 	unsigned long handle;
@@ -2321,15 +2283,6 @@ static int zram_write_page(struct zram *zram, struct page *page, u32 index,
 	if (same_filled)
 		return write_same_filled_page(zram, element, index);
 
-	/*
-	 * The submitter told us the data is already compressed (e.g. a zswap
-	 * writeback of a folio that was just decompressed out of the zswap
-	 * pool).  Skip compression and store the page as-is to avoid a
-	 * redundant compress/decompress cycle.
-	 */
-	if (nocompress)
-		return write_incompressible_page(zram, page, index, true);
-
 	zstrm = zcomp_stream_get(zram->comps[ZRAM_PRIMARY_COMP]);
 	mem = kmap_local_page(page);
 	ret = zcomp_compress(zram->comps[ZRAM_PRIMARY_COMP], zstrm,
@@ -2344,7 +2297,7 @@ static int zram_write_page(struct zram *zram, struct page *page, u32 index,
 
 	if (comp_len >= huge_class_size) {
 		zcomp_stream_put(zstrm);
-		return write_incompressible_page(zram, page, index, false);
+		return write_incompressible_page(zram, page, index);
 	}
 
 	handle = zs_malloc(zram->mem_pool, comp_len,
@@ -2378,6 +2331,60 @@ static int zram_write_page(struct zram *zram, struct page *page, u32 index,
 }
 
 /*
+ * Store data that arrived already compressed (REQ_COMPRESSED, e.g. a zswap
+ * writeback passthrough) as a regular compressed slot, skipping zcomp_compress.
+ *
+ * @page holds @comp_len bytes of a blob produced by the *same* algorithm as our
+ * primary compressor (negotiated via ->swap_comp_algo), so it is stored at
+ * priority ZRAM_PRIMARY_COMP and the read path decompresses it unchanged.  It
+ * is a plain compressed slot: no ZRAM_HUGE / ZRAM_INCOMPRESSIBLE.
+ *
+ * Kept noinline so the passthrough path stays observable (e.g. via a kprobe)
+ * for testing; it is a cold writeback path with no fast-path impact.
+ */
+static noinline int zram_write_precompressed(struct zram *zram,
+					     struct page *page, u32 index,
+					     unsigned int comp_len)
+{
+	unsigned long handle;
+	void *src;
+
+	/*
+	 * A full-page blob would be indistinguishable from an uncompressed
+	 * (huge) slot on read; the caller only sends genuinely compressed data.
+	 */
+	if (!comp_len || comp_len >= PAGE_SIZE)
+		return -EINVAL;
+
+	handle = zs_malloc(zram->mem_pool, comp_len,
+			   GFP_NOIO | __GFP_NOWARN |
+			   __GFP_HIGHMEM | __GFP_MOVABLE, page_to_nid(page));
+	if (IS_ERR_VALUE(handle))
+		return PTR_ERR((void *)handle);
+
+	if (!zram_can_store_page(zram)) {
+		zs_free(zram->mem_pool, handle);
+		return -ENOMEM;
+	}
+
+	src = kmap_local_page(page);
+	zs_obj_write(zram->mem_pool, handle, src, comp_len);
+	kunmap_local(src);
+
+	slot_lock(zram, index);
+	slot_free(zram, index);
+	set_slot_handle(zram, index, handle);
+	set_slot_size(zram, index, comp_len);
+	set_slot_comp_priority(zram, index, ZRAM_PRIMARY_COMP);
+	slot_unlock(zram, index);
+
+	atomic64_inc(&zram->stats.pages_stored);
+	atomic64_add(comp_len, &zram->stats.compr_data_size);
+
+	return 0;
+}
+
+/*
  * This is a partial IO. Read the full page before writing the changes.
  */
 static int zram_bvec_write_partial(struct zram *zram, struct bio_vec *bvec,
@@ -2392,23 +2399,26 @@ static int zram_bvec_write_partial(struct zram *zram, struct bio_vec *bvec,
 	ret = zram_read_page(zram, page, index, NULL);
 	if (!ret) {
 		memcpy_from_bvec(page_address(page) + offset, bvec);
-		/*
-		 * A partial write merges new data into an existing page, so the
-		 * "already compressed" hint no longer applies to the merged
-		 * result; always compress it normally.
-		 */
-		ret = zram_write_page(zram, page, index, false);
+		ret = zram_write_page(zram, page, index);
 	}
 	__free_page(page);
 	return ret;
 }
 
 static int zram_bvec_write(struct zram *zram, struct bio_vec *bvec,
-			   u32 index, int offset, bool nocompress)
+			   u32 index, int offset, bool compressed)
 {
+	/*
+	 * Precompressed passthrough: the bvec carries exactly comp_len bytes of
+	 * an already-compressed blob (< PAGE_SIZE), so it is never a partial IO
+	 * of a raw page.  Store it directly instead of compressing again.
+	 */
+	if (compressed)
+		return zram_write_precompressed(zram, bvec->bv_page, index,
+						bvec->bv_len);
 	if (is_partial_io(bvec))
 		return zram_bvec_write_partial(zram, bvec, index, offset);
-	return zram_write_page(zram, bvec->bv_page, index, nocompress);
+	return zram_write_page(zram, bvec->bv_page, index);
 }
 
 #ifdef CONFIG_ZRAM_MULTI_COMP
@@ -2448,11 +2458,6 @@ static void scan_slots_for_recompress(struct zram *zram, u32 mode, u32 prio,
 		    !test_slot_flag(zram, index, ZRAM_HUGE))
 			goto next;
 
-		/*
-		 * ZRAM_NOCOMP pages carry ZRAM_INCOMPRESSIBLE, so they are
-		 * excluded here: their data is already compressed and must not
-		 * be run through the compressor again.
-		 */
 		if (test_slot_flag(zram, index, ZRAM_WB) ||
 		    test_slot_flag(zram, index, ZRAM_SAME) ||
 		    test_slot_flag(zram, index, ZRAM_INCOMPRESSIBLE))
@@ -2800,7 +2805,7 @@ static void zram_bio_write(struct zram *zram, struct bio *bio)
 {
 	unsigned long start_time = bio_start_io_acct(bio);
 	struct bvec_iter iter = bio->bi_iter;
-	bool nocompress = !!(bio->bi_opf & REQ_NOCOMPRESS);
+	bool compressed = !!(bio->bi_opf & REQ_COMPRESSED);
 
 	do {
 		u32 index = iter.bi_sector >> SECTORS_PER_PAGE_SHIFT;
@@ -2810,7 +2815,7 @@ static void zram_bio_write(struct zram *zram, struct bio *bio)
 
 		bv.bv_len = min_t(u32, bv.bv_len, PAGE_SIZE - offset);
 
-		if (zram_bvec_write(zram, &bv, index, offset, nocompress) < 0) {
+		if (zram_bvec_write(zram, &bv, index, offset, compressed) < 0) {
 			atomic64_inc(&zram->stats.failed_writes);
 			bio->bi_status = BLK_STS_IOERR;
 			break;
@@ -3016,10 +3021,36 @@ static int zram_open(struct gendisk *disk, blk_mode_t mode)
 	return 0;
 }
 
+/*
+ * Report the primary compression algorithm so an upper swap tier (zswap) can
+ * decide whether it may hand us precompressed data via REQ_COMPRESSED.  We
+ * expose the primary compressor only: passthrough writes are stored at
+ * priority ZRAM_PRIMARY_COMP and read back with the same algorithm.
+ */
+static int zram_swap_comp_algo(struct block_device *bdev, char *name,
+			       size_t len)
+{
+	struct zram *zram = bdev->bd_disk->private_data;
+	int ret = -ENODEV;
+
+	if (!zram)
+		return -ENODEV;
+
+	down_read(&zram->dev_lock);
+	if (init_done(zram) && zram->comp_algs[ZRAM_PRIMARY_COMP]) {
+		strscpy(name, zram->comp_algs[ZRAM_PRIMARY_COMP], len);
+		ret = 0;
+	}
+	up_read(&zram->dev_lock);
+
+	return ret;
+}
+
 static const struct block_device_operations zram_devops = {
 	.open = zram_open,
 	.submit_bio = zram_submit_bio,
 	.swap_slot_free_notify = zram_slot_free_notify,
+	.swap_comp_algo = zram_swap_comp_algo,
 	.owner = THIS_MODULE
 };
 

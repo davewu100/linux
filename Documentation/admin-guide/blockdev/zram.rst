@@ -280,11 +280,6 @@ line of text and contains the following stats separated by whitespace:
  pages_compacted  the number of pages freed during compaction
  huge_pages	  the number of incompressible pages
  huge_pages_since the number of incompressible pages since zram set up
- nocomp_writes	  the number of pages stored without compression because the
-		  writer passed a REQ_NOCOMPRESS hint (e.g. zswap writeback);
-		  cumulative since zram set up, never decremented.  Such pages
-		  are counted here only, not in huge_pages/huge_pages_since,
-		  so the two are mutually exclusive
  ================ =============================================================
 
 File /sys/block/zram<id>/bd_stat
@@ -538,42 +533,6 @@ unexpected results when the same algorithm is configured with different
 priorities (e.g. different parameters).  `priority` is the only way to
 guarantee that the expected algorithm will be used.
 
-skipping compression for already-compressed data
-=================================================
-
-When zram is used as a backing swap device below zswap, pages that zswap
-evicts (writes back) have already been through a compression tier.  zswap
-decompresses such a page back into its raw form before writing it out, and
-without any hint zram would compress it a second time, wasting CPU on a
-redundant compress/decompress cycle.
-
-To avoid this, the swap write path can tag a write with the ``REQ_NOCOMPRESS``
-bio flag, telling the backing block device that the data should not be
-compressed again.  zswap sets this flag on its writeback path automatically;
-no user configuration is required.  When zram receives a write carrying
-``REQ_NOCOMPRESS`` it stores the page as-is (the same on-disk representation
-used for incompressible/huge pages) and skips compression entirely.
-
-Note that a page stored this way occupies a full page in the zsmalloc pool,
-just like an incompressible page, so this trades a small increase in zram
-memory usage for reduced CPU overhead.  Same-element-filled pages are still
-detected and stored specially, and partial writes (which merge new data into
-an existing page) are always compressed normally since the "already
-compressed" property no longer holds for the merged result.
-
-Although such a page shares the on-disk representation of an incompressible
-("huge") page, it is tracked separately (internally via a dedicated flag) so
-that it is not confused with a genuinely incompressible page.  As a result it
-is not selected by huge-page writeback (``echo huge > .../writeback``) and is
-not picked up by huge-page recompression (``type=huge``): its data is already
-compressed and must not be run through the compressor again.
-
-The number of pages stored this way is exported as the ``nocomp_writes``
-column of ``/sys/block/zramX/mm_stat`` (see above), allowing these pages to be
-distinguished from pages stored huge because they are genuinely
-incompressible.  In the ``block_state`` debug file (see below) they are marked
-with a ``c`` flag.
-
 memory tracking
 ===============
 
@@ -584,12 +543,11 @@ pages of the process with*pagemap.
 If you enable the feature, you could see block state via
 /sys/kernel/debug/zram/zram0/block_state". The output is as follows::
 
-	  300    75.033841 .wh....
-	  301    63.806904 s......
-	  302    63.806919 ..hi...
-	  303    62.801919 ....r..
-	  304   146.781902 ..hi.n.
-	  305   146.781902 ..h..nc
+	  300    75.033841 .wh...
+	  301    63.806904 s.....
+	  302    63.806919 ..hi..
+	  303    62.801919 ....r.
+	  304   146.781902 ..hi.n
 
 First column
 	zram's block index.
@@ -610,9 +568,6 @@ Third column
 		recompressed page (secondary compression algorithm)
 	n:
 		none (including secondary) of algorithms could compress it
-	c:
-		stored uncompressed on a REQ_NOCOMPRESS hint (e.g. zswap
-		writeback), not because it is genuinely incompressible
 
 First line of above example says 300th block is accessed at 75.033841sec
 and the block's state is huge so it is written back to the backing
