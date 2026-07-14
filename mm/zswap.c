@@ -1048,6 +1048,24 @@ static int zswap_writeback_entry(struct zswap_entry *entry,
 	/* move it to the tail of the inactive list after end_writeback */
 	folio_set_reclaim(folio);
 
+#ifdef CONFIG_SWAP_GHOST
+	/*
+	 * If this entry lives on a ghost swap area it has no physical home to
+	 * be written to.  Spill it to a real device: folio_realloc_swap()
+	 * allocates a backing slot, records a reverse map from it to the ghost
+	 * slot (which keeps the metadata), and repoints folio->swap at the
+	 * physical slot for the write below.  If no real device has room, keep
+	 * the folio in memory.
+	 */
+	if (__swap_entry_to_info(swpentry)->flags & SWP_GHOST) {
+		ret = folio_realloc_swap(folio);
+		if (ret) {
+			folio_clear_reclaim(folio);
+			goto out;
+		}
+	}
+#endif
+
 	/* start writeback */
 	__swap_writepage(folio, NULL);
 

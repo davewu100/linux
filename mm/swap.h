@@ -264,6 +264,13 @@ int folio_alloc_swap(struct folio *folio);
 int folio_dup_swap(struct folio *folio, struct page *page);
 void folio_put_swap(struct folio *folio, struct page *page);
 
+#ifdef CONFIG_SWAP_GHOST
+int folio_realloc_swap(struct folio *folio);
+int swap_ghost_record_backing(swp_entry_t phys, swp_entry_t ghost);
+swp_entry_t swap_ghost_lookup_backing(swp_entry_t phys);
+void swap_ghost_erase_backing(swp_entry_t phys);
+#endif
+
 /* For internal use */
 extern void __swap_cluster_free_entries(struct swap_info_struct *si,
 					struct swap_cluster_info *ci,

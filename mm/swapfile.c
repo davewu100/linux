@@ -1344,6 +1344,17 @@ static void swap_range_free(struct swap_info_struct *si, unsigned long offset,
 	for (i = 0; i < nr_entries; i++)
 		zswap_invalidate(swp_entry(si->type, offset + i));
 
+#ifdef CONFIG_SWAP_GHOST
+	/*
+	 * Drop any ghost reverse map for these physical slots so a recycled
+	 * slot is never misread as still backing a ghost slot.
+	 */
+	if (!(si->flags & SWP_GHOST))
+		for (i = 0; i < nr_entries; i++)
+			swap_ghost_erase_backing(swp_entry(si->type,
+							   offset + i));
+#endif
+
 	if (si->flags & SWP_BLKDEV)
 		swap_slot_free_notify =
 			si->bdev->bd_disk->fops->swap_slot_free_notify;
@@ -1413,6 +1424,109 @@ static bool swap_alloc_fast(struct folio *folio)
 	put_swap_device(si);
 	return folio_test_swapcache(folio);
 }
+
+#ifdef CONFIG_SWAP_GHOST
+static int __swap_cluster_dup_entry(struct swap_cluster_info *ci,
+				   unsigned int ci_off);
+static void __swap_cluster_put_entry(struct swap_cluster_info *ci,
+				     unsigned int ci_off);
+
+/*
+ * Allocate a single order-0 slot on a real (non-ghost) swap device and return
+ * it, or a zero entry if none is available.  Unlike folio_alloc_swap() this
+ * does not bind the slot to a folio's swap cache: the slot is a bare physical
+ * home used to spill a ghost slot's data, with the folio metadata staying on
+ * the ghost side and a reverse map linking the two.
+ *
+ * The slot is returned with swap count 0, pinned only by the reverse map the
+ * caller is expected to install immediately.
+ */
+static swp_entry_t swap_alloc_real_backing(void)
+{
+	struct swap_info_struct *si, *next;
+	swp_entry_t entry = { .val = 0 };
+	unsigned long offset;
+	struct swap_cluster_info *ci;
+
+	spin_lock(&swap_avail_lock);
+start_over:
+	plist_for_each_entry_safe(si, next, &swap_avail_head, avail_list) {
+		plist_requeue(&si->avail_list, &swap_avail_head);
+		spin_unlock(&swap_avail_lock);
+
+		if (!(si->flags & SWP_GHOST) && get_swap_device_info(si)) {
+			offset = cluster_alloc_swap_entry(si, NULL);
+			if (offset) {
+				ci = swap_cluster_lock(si, offset);
+				/*
+				 * cluster_alloc_swap_entry() leaves a slot with
+				 * count 0 not pinned by a swap cache folio; give
+				 * it an initial count so it is not treated as
+				 * free until the caller installs the reverse map
+				 * and, later, frees it explicitly.
+				 */
+				__swap_cluster_dup_entry(ci, offset % SWAPFILE_CLUSTER);
+				swap_cluster_unlock(ci);
+				entry = swp_entry(si->type, offset);
+				put_swap_device(si);
+				return entry;
+			}
+			put_swap_device(si);
+		}
+
+		spin_lock(&swap_avail_lock);
+		if (plist_node_empty(&next->avail_list))
+			goto start_over;
+	}
+	spin_unlock(&swap_avail_lock);
+	return entry;
+}
+
+/*
+ * folio_realloc_swap - spill a ghost-backed folio to a real swap device.
+ * @folio: folio currently occupying a ghost swap slot, locked and in cache.
+ *
+ * Allocate a physical backing slot on a real device and record a reverse map
+ * from it to the folio's current (ghost) swap entry, so a later swapin or
+ * swapoff can find the ghost-side metadata.  On success folio->swap is set to
+ * the physical slot (where the caller writes the data); the reverse map keeps
+ * the link back to the ghost slot that still owns the metadata.
+ *
+ * Return: 0 on success; -ENOSPC if no real device has room; other -errno on
+ * failure.
+ */
+int folio_realloc_swap(struct folio *folio)
+{
+	swp_entry_t ghost = folio->swap;
+	swp_entry_t phys;
+	int err;
+
+	VM_WARN_ON_FOLIO(!folio_test_locked(folio), folio);
+	VM_WARN_ON_ONCE(!(__swap_entry_to_info(ghost)->flags & SWP_GHOST));
+
+	if (folio_order(folio))
+		return -EINVAL;	/* order-0 only for now */
+
+	phys = swap_alloc_real_backing();
+	if (!phys.val)
+		return -ENOSPC;
+
+	err = swap_ghost_record_backing(phys, ghost);
+	if (err) {
+		struct swap_info_struct *psi = __swap_entry_to_info(phys);
+		struct swap_cluster_info *ci;
+
+		ci = swap_cluster_lock(psi, swp_offset(phys));
+		__swap_cluster_put_entry(ci, swp_offset(phys) % SWAPFILE_CLUSTER);
+		swap_cluster_unlock(ci);
+		return err;
+	}
+
+	/* Stash the physical target for the caller via the folio's private? */
+	folio->swap = phys;
+	return 0;
+}
+#endif /* CONFIG_SWAP_GHOST */
 
 /* Rotate the device and switch to a new cluster */
 static void swap_alloc_slow(struct folio *folio)
@@ -4102,6 +4216,60 @@ bool swap_has_real_swapfile(void)
 {
 	return READ_ONCE(nr_real_swapfiles) > 0;
 }
+
+#ifdef CONFIG_SWAP_GHOST
+/*
+ * Reverse map for ghost writeback.
+ *
+ * When a ghost slot is spilled to a real swap device, the folio's swap entry
+ * changes from the ghost slot to the freshly allocated physical slot, but all
+ * of the slot metadata (swap count, memcg, shadow) stays on the ghost side.
+ * The lower (physical) tier therefore only needs to remember which ghost slot
+ * a physical slot stands in for.  That mapping is the reverse map.
+ *
+ * It is kept in a standalone xarray keyed by the physical entry value, holding
+ * the ghost entry value.  In the full virtual-swap design this lives in the
+ * physical cluster's swap table; the standalone store is an interim that keeps
+ * the callers unchanged when it is later moved.
+ */
+static DEFINE_XARRAY(swap_ghost_revmap);
+
+/*
+ * Record that physical slot @phys now backs ghost slot @ghost.
+ * Must be called before the data is written so a swapin can never observe a
+ * physical slot without its reverse map.
+ */
+int swap_ghost_record_backing(swp_entry_t phys, swp_entry_t ghost)
+{
+	void *old;
+
+	old = xa_store(&swap_ghost_revmap, phys.val,
+		       xa_mk_value(ghost.val), GFP_KERNEL);
+	if (xa_is_err(old))
+		return xa_err(old);
+	return 0;
+}
+
+/*
+ * Return the ghost slot backed by physical slot @phys, or a zero entry if
+ * @phys does not stand in for a ghost slot.
+ */
+swp_entry_t swap_ghost_lookup_backing(swp_entry_t phys)
+{
+	void *val = xa_load(&swap_ghost_revmap, phys.val);
+	swp_entry_t ghost = { .val = 0 };
+
+	if (val)
+		ghost.val = xa_to_value(val);
+	return ghost;
+}
+
+/* Drop the reverse map for @phys when its slot is freed or recycled. */
+void swap_ghost_erase_backing(swp_entry_t phys)
+{
+	xa_erase(&swap_ghost_revmap, phys.val);
+}
+#endif /* CONFIG_SWAP_GHOST */
 
 /*
  * swap_dup_entry_direct() - Increase reference count of a swap entry by one.
