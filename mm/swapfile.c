@@ -408,6 +408,16 @@ static inline bool cluster_is_usable(struct swap_cluster_info *ci, int order)
 static inline unsigned int cluster_index(struct swap_info_struct *si,
 					 struct swap_cluster_info *ci)
 {
+#ifdef CONFIG_SWAP_GHOST
+	/*
+	 * Ghost clusters are not part of the flat cluster_info[] array, so
+	 * their index cannot be derived by pointer arithmetic; it is stored
+	 * in the dynamic wrapper (ci is its first member).
+	 */
+	if (si->flags & SWP_GHOST)
+		return container_of(ci, struct swap_cluster_info_dynamic,
+				    ci)->index;
+#endif
 	return ci - si->cluster_info;
 }
 
@@ -1096,12 +1106,22 @@ static void swap_reclaim_work(struct work_struct *work)
  * Try to allocate swap entries with specified order and try set a new
  * cluster for current CPU too.
  */
+#ifdef CONFIG_SWAP_GHOST
+static unsigned long alloc_swap_scan_dynamic(struct swap_info_struct *si,
+					     struct folio *folio);
+#endif
+
 static unsigned long cluster_alloc_swap_entry(struct swap_info_struct *si,
 					      struct folio *folio)
 {
 	struct swap_cluster_info *ci;
 	unsigned int order = likely(folio) ? folio_order(folio) : 0;
 	unsigned int offset = SWAP_ENTRY_INVALID, found = SWAP_ENTRY_INVALID;
+
+#ifdef CONFIG_SWAP_GHOST
+	if (si->flags & SWP_GHOST)
+		return alloc_swap_scan_dynamic(si, folio);
+#endif
 
 	/*
 	 * Swapfile is not block device so unable
@@ -3060,6 +3080,166 @@ static void free_swap_cluster_info(struct swap_cluster_info *cluster_info,
 	kvfree(cluster_info);
 }
 
+#ifdef CONFIG_SWAP_GHOST
+/*
+ * Ghost swap dynamic cluster support.
+ *
+ * A ghost swap area does not reserve a cluster_info[] array up front.  Each
+ * cluster is allocated on demand the first time an offset in it is used, and
+ * kept in si->cluster_info_pool, an xarray keyed by cluster index.  This gives
+ * a ghost area a virtually large capacity (si->max is just a number) while only
+ * consuming memory for clusters that actually hold data.
+ */
+
+static void swap_ghost_free_cluster_rcu_cb(struct rcu_head *head)
+{
+	struct swap_cluster_info_dynamic *cid =
+		container_of(head, struct swap_cluster_info_dynamic, rcu);
+
+	kfree(cid);
+}
+
+/*
+ * Look up the cluster for @offset, or NULL if it has not been allocated yet.
+ * Called on the swap hot path (under RCU or the caller's device pin).
+ */
+struct swap_cluster_info *swap_ghost_offset_to_cluster(
+		struct swap_info_struct *si, pgoff_t offset)
+{
+	struct swap_cluster_info_dynamic *cid;
+	unsigned long index = offset / SWAPFILE_CLUSTER;
+
+	cid = xa_load(&si->cluster_info_pool, index);
+	return cid ? &cid->ci : NULL;
+}
+
+/*
+ * Allocate (or fetch the existing) dynamic cluster for @index and return it
+ * with its lock held, mirroring the state a fresh cluster from the free list
+ * would have.  Returns NULL on allocation failure.
+ */
+static struct swap_cluster_info *swap_ghost_get_cluster(
+		struct swap_info_struct *si, unsigned long index, gfp_t gfp)
+{
+	struct swap_cluster_info_dynamic *cid, *old;
+	struct swap_cluster_info *ci;
+
+	cid = xa_load(&si->cluster_info_pool, index);
+	if (cid)
+		return &cid->ci;
+
+	cid = kzalloc(sizeof(*cid), gfp);
+	if (!cid)
+		return NULL;
+
+	cid->index = index;
+	ci = &cid->ci;
+	spin_lock_init(&ci->lock);
+	INIT_LIST_HEAD(&ci->list);
+
+	if (swap_cluster_alloc_table(ci, gfp)) {
+		kfree(cid);
+		return NULL;
+	}
+
+	/*
+	 * Publish the cluster.  A racing allocator may have installed one for
+	 * the same index in the meantime; if so, drop ours and use theirs.
+	 */
+	old = xa_cmpxchg(&si->cluster_info_pool, index, NULL, cid, gfp);
+	if (old) {
+		if (xa_is_err(old)) {
+			swap_cluster_free_table(ci);
+			kfree(cid);
+			return NULL;
+		}
+		swap_cluster_free_table(ci);
+		kfree(cid);
+		return &old->ci;
+	}
+
+	return ci;
+}
+
+/*
+ * Ghost counterpart of cluster_alloc_swap_entry(): find or create a dynamic
+ * cluster with a free slot and allocate from it.  Ghost areas are always
+ * treated as solid-state, so there is no global_cluster serialization.
+ */
+static unsigned long alloc_swap_scan_dynamic(struct swap_info_struct *si,
+					     struct folio *folio)
+{
+	unsigned int order = likely(folio) ? folio_order(folio) : 0;
+	unsigned long found = SWAP_ENTRY_INVALID;
+	struct swap_cluster_info *ci;
+	unsigned long index;
+
+	/*
+	 * Grow the virtual address space one cluster at a time.  si->max is a
+	 * soft ceiling; walk the index space looking for a cluster that either
+	 * does not exist yet (freshly allocated, guaranteed usable) or has a
+	 * free slot of the requested order.
+	 */
+	for (index = 0; index < DIV_ROUND_UP(si->max, SWAPFILE_CLUSTER);
+	     index++) {
+		bool fresh = !xa_load(&si->cluster_info_pool, index);
+
+		ci = swap_ghost_get_cluster(si, index, GFP_KERNEL);
+		if (!ci)
+			return SWAP_ENTRY_INVALID;
+
+		spin_lock(&ci->lock);
+		if (fresh) {
+			/* A brand new cluster is empty and always usable. */
+			ci->flags = CLUSTER_FLAG_FREE;
+			found = alloc_swap_scan_cluster(si, ci,
+					folio, index * SWAPFILE_CLUSTER);
+		} else if (cluster_is_usable(ci, order)) {
+			found = alloc_swap_scan_cluster(si, ci,
+					folio, index * SWAPFILE_CLUSTER);
+		} else {
+			spin_unlock(&ci->lock);
+			continue;
+		}
+		if (found)
+			return found;
+	}
+
+	return SWAP_ENTRY_INVALID;
+}
+
+static int setup_ghost_clusters_info(struct swap_info_struct *si)
+{
+	xa_init(&si->cluster_info_pool);
+	INIT_LIST_HEAD(&si->free_clusters);
+	INIT_LIST_HEAD(&si->full_clusters);
+	INIT_LIST_HEAD(&si->discard_clusters);
+	for (int i = 0; i < SWAP_NR_ORDERS; i++) {
+		INIT_LIST_HEAD(&si->nonfull_clusters[i]);
+		INIT_LIST_HEAD(&si->frag_clusters[i]);
+	}
+	/* Ghost areas have no flat array; keep cluster_info NULL. */
+	si->cluster_info = NULL;
+	return 0;
+}
+
+static void free_ghost_clusters_info(struct swap_info_struct *si)
+{
+	struct swap_cluster_info_dynamic *cid;
+	unsigned long index;
+
+	xa_for_each(&si->cluster_info_pool, index, cid) {
+		xa_erase(&si->cluster_info_pool, index);
+		spin_lock(&cid->ci.lock);
+		if (cluster_table_is_alloced(&cid->ci))
+			swap_cluster_free_table(&cid->ci);
+		spin_unlock(&cid->ci.lock);
+		call_rcu(&cid->rcu, swap_ghost_free_cluster_rcu_cb);
+	}
+	xa_destroy(&si->cluster_info_pool);
+}
+#endif /* CONFIG_SWAP_GHOST */
+
 /*
  * Called after swap device's reference count is dead, so
  * neither scan nor allocation will use it.
@@ -3194,7 +3374,12 @@ SYSCALL_DEFINE1(swapoff, const char __user *, specialfile)
 	mutex_unlock(&swapon_mutex);
 	kfree(p->global_cluster);
 	p->global_cluster = NULL;
-	free_swap_cluster_info(cluster_info, maxpages);
+#ifdef CONFIG_SWAP_GHOST
+	if (p->flags & SWP_GHOST)
+		free_ghost_clusters_info(p);
+	else
+#endif
+		free_swap_cluster_info(cluster_info, maxpages);
 
 	inode = mapping->host;
 
@@ -3555,6 +3740,11 @@ static int setup_swap_clusters_info(struct swap_info_struct *si,
 	int err = -ENOMEM;
 	unsigned long i;
 
+#ifdef CONFIG_SWAP_GHOST
+	if (si->flags & SWP_GHOST)
+		return setup_ghost_clusters_info(si);
+#endif
+
 	cluster_info = kvzalloc_objs(*cluster_info, nr_clusters);
 	if (!cluster_info)
 		goto err;
@@ -3859,7 +4049,12 @@ bad_swap:
 	si->global_cluster = NULL;
 	inode = NULL;
 	destroy_swap_extents(si, swap_file);
-	free_swap_cluster_info(si->cluster_info, si->max);
+#ifdef CONFIG_SWAP_GHOST
+	if (si->flags & SWP_GHOST)
+		free_ghost_clusters_info(si);
+	else
+#endif
+		free_swap_cluster_info(si->cluster_info, si->max);
 	si->cluster_info = NULL;
 	/*
 	 * Clear the SWP_USED flag after all resources are freed so

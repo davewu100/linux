@@ -63,6 +63,26 @@ struct swap_cluster_info {
 	struct list_head list;
 };
 
+#ifdef CONFIG_SWAP_GHOST
+/*
+ * A dynamically allocated cluster for ghost swap.  Ghost swap has no static
+ * cluster_info[] array; each cluster is allocated on demand and stored in
+ * si->cluster_info_pool (an xarray keyed by cluster index).  The embedded
+ * swap_cluster_info must be the first member so a pointer to it can be used
+ * interchangeably with a normal cluster pointer on the shared paths.
+ *
+ * virtual_table is reserved for the compressed-writeback / PHYS_COMPRESSED
+ * backend payload (see the virtual swap space design); it is not populated
+ * yet.
+ */
+struct swap_cluster_info_dynamic {
+	struct swap_cluster_info ci;
+	unsigned int index;
+	struct rcu_head rcu;
+	unsigned long *virtual_table;	/* reserved, see above */
+};
+#endif /* CONFIG_SWAP_GHOST */
+
 /* All on-list cluster must have a non-zero flag. */
 enum swap_cluster_flags {
 	CLUSTER_FLAG_NONE = 0, /* For temporary off-list cluster */
@@ -103,10 +123,23 @@ static inline struct swap_info_struct *__swap_entry_to_info(swp_entry_t entry)
 	return __swap_type_to_info(swp_type(entry));
 }
 
+#ifdef CONFIG_SWAP_GHOST
+struct swap_cluster_info *swap_ghost_offset_to_cluster(
+		struct swap_info_struct *si, pgoff_t offset);
+#endif
+
 static inline struct swap_cluster_info *__swap_offset_to_cluster(
 		struct swap_info_struct *si, pgoff_t offset)
 {
 	VM_WARN_ON_ONCE(percpu_ref_is_zero(&si->users)); /* race with swapoff */
+#ifdef CONFIG_SWAP_GHOST
+	/*
+	 * Ghost swap has no flat cluster_info[] array: clusters live in an
+	 * xarray keyed by cluster index and are looked up dynamically.
+	 */
+	if (si->flags & SWP_GHOST)
+		return swap_ghost_offset_to_cluster(si, offset);
+#endif
 	VM_WARN_ON_ONCE(offset >= roundup(si->max, SWAPFILE_CLUSTER));
 	return &si->cluster_info[offset / SWAPFILE_CLUSTER];
 }

@@ -277,6 +277,16 @@ struct swap_info_struct {
 	struct work_struct reclaim_work; /* reclaim worker */
 	struct list_head discard_clusters; /* discard clusters list */
 	struct plist_node avail_list;   /* entry in swap_avail_head */
+#ifdef CONFIG_SWAP_GHOST
+	struct xarray cluster_info_pool; /*
+					  * Dynamically allocated clusters for
+					  * ghost swap, keyed by cluster index.
+					  * Only used when SWP_GHOST is set; a
+					  * normal swap area uses the flat
+					  * cluster_info[] array with no extra
+					  * per-slot overhead.
+					  */
+#endif
 };
 
 static inline swp_entry_t page_swap_entry(struct page *page)
