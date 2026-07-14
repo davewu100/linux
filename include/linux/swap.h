@@ -208,6 +208,7 @@ enum {
 	SWP_STABLE_WRITES = (1 << 11),	/* no overwrite PG_writeback pages */
 	SWP_SYNCHRONOUS_IO = (1 << 12),	/* synchronous IO is efficient */
 	SWP_HIBERNATION = (1 << 13),	/* pinned for hibernation */
+	SWP_GHOST	= (1 << 14),	/* virtual swap, not backed by anything */
 					/* add others here before... */
 };
 

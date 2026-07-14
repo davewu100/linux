@@ -19,6 +19,19 @@ menuconfig SWAP
 	  used to provide more virtual memory than the actual RAM present
 	  in your computer.  If unsure say Y.
 
+config SWAP_GHOST
+	bool "Ghost (virtual) swapfile support"
+	depends on SWAP && 64BIT
+	help
+	  A ghost swapfile is a swap area that has only a header page and no
+	  backing data section: its slots are allocated dynamically and hold
+	  their metadata in memory rather than on a physical device.  It gives
+	  zswap/zram a virtual swap address space without reserving physical
+	  swap slots, and serves as the top tier of a layered swap setup.
+
+	  This is experimental infrastructure (swap table phase IV / virtual
+	  swap space).  If unsure, say N.
+
 config ZSWAP
 	bool "Compressed cache for swap pages"
 	depends on SWAP

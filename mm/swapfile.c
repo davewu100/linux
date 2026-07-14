@@ -65,6 +65,13 @@ static void move_cluster(struct swap_info_struct *si,
  */
 static DEFINE_SPINLOCK(swap_lock);
 static unsigned int nr_swapfiles;
+/*
+ * Number of swap devices that are backed by real storage (i.e. not ghost).
+ * Protected with swap_lock.  zswap writeback is only meaningful while at least
+ * one real swapfile exists; a system with ghost-only swap has nowhere to write
+ * back to and must keep everything in the compressed pool.
+ */
+static unsigned int nr_real_swapfiles;
 atomic_long_t nr_swap_pages;
 /*
  * Some modules use swappable objects and may try to swap them out under
@@ -2946,6 +2953,16 @@ static int setup_swap_extents(struct swap_info_struct *sis,
 	struct inode *inode = mapping->host;
 	int ret;
 
+	/*
+	 * Ghost swap has no data section and therefore no physical extents:
+	 * its slots are backed by dynamically allocated in-memory metadata,
+	 * not disk blocks.  Report an empty span and skip extent setup.
+	 */
+	if (sis->flags & SWP_GHOST) {
+		*span = 0;
+		return 1;
+	}
+
 	if (S_ISBLK(inode->i_mode)) {
 		ret = add_swap_extent(sis, 0, sis->max, 0);
 		*span = sis->pages;
@@ -3160,6 +3177,9 @@ SYSCALL_DEFINE1(swapoff, const char __user *, specialfile)
 	spin_lock(&swap_lock);
 	spin_lock(&p->lock);
 	drain_mmlist();
+
+	if (!(p->flags & SWP_GHOST))
+		nr_real_swapfiles--;
 
 	swap_file = p->swap_file;
 	p->swap_file = NULL;
@@ -3504,7 +3524,17 @@ static unsigned long read_swap_header(struct swap_info_struct *si,
 	if (!maxpages)
 		return 0;
 	swapfilepages = i_size_read(inode) >> PAGE_SHIFT;
-	if (swapfilepages && maxpages > swapfilepages) {
+	/*
+	 * A ghost swapfile has only a header page on disk (i_size == PAGE_SIZE)
+	 * but advertises a much larger logical capacity via last_page.  Its
+	 * slots are allocated dynamically and never touch the backing file, so
+	 * the "area shorter than signature indicates" check does not apply.
+	 */
+	if (IS_ENABLED(CONFIG_SWAP_GHOST) && swapfilepages == 1 && maxpages > 1) {
+		si->flags |= SWP_GHOST;
+		pr_info("Ghost swapfile detected: %lu logical pages, no data section\n",
+			maxpages);
+	} else if (swapfilepages && maxpages > swapfilepages) {
 		pr_warn("Swap area shorter than signature indicates\n");
 		return 0;
 	}
@@ -3685,6 +3715,16 @@ SYSCALL_DEFINE2(swapon, const char __user *, specialfile, int, swap_flags)
 		goto bad_swap_unlock_inode;
 	}
 
+	/*
+	 * A ghost swap area is not backed by any device.  Drop the bdev that
+	 * claim_swapfile() may have derived from the containing filesystem so
+	 * that the IO paths never try to submit bios against it.
+	 */
+	if (si->flags & SWP_GHOST) {
+		si->bdev = NULL;
+		si->flags &= ~SWP_BLKDEV;
+	}
+
 	si->max = maxpages;
 	si->pages = maxpages - 1;
 	nr_extents = setup_swap_extents(si, swap_file, &span);
@@ -3705,17 +3745,26 @@ SYSCALL_DEFINE2(swapon, const char __user *, specialfile, int, swap_flags)
 	if (error)
 		goto bad_swap_unlock_inode;
 
-	if (si->bdev && bdev_stable_writes(si->bdev))
-		si->flags |= SWP_STABLE_WRITES;
-
-	if (si->bdev && bdev_synchronous(si->bdev))
-		si->flags |= SWP_SYNCHRONOUS_IO;
-
-	if (si->bdev && !bdev_rot(si->bdev)) {
-		si->flags |= SWP_SOLIDSTATE;
+	/*
+	 * A ghost swap area has no backing device: it is never rotational,
+	 * never issues IO, and behaves like an infinitely fast solid-state
+	 * area for allocation purposes.  Skip all bdev-derived flags.
+	 */
+	if (si->flags & SWP_GHOST) {
+		si->flags |= SWP_SOLIDSTATE | SWP_SYNCHRONOUS_IO;
 	} else {
-		atomic_inc(&nr_rotate_swap);
-		inced_nr_rotate_swap = true;
+		if (si->bdev && bdev_stable_writes(si->bdev))
+			si->flags |= SWP_STABLE_WRITES;
+
+		if (si->bdev && bdev_synchronous(si->bdev))
+			si->flags |= SWP_SYNCHRONOUS_IO;
+
+		if (si->bdev && !bdev_rot(si->bdev)) {
+			si->flags |= SWP_SOLIDSTATE;
+		} else {
+			atomic_inc(&nr_rotate_swap);
+			inced_nr_rotate_swap = true;
+		}
 	}
 
 	if ((swap_flags & SWAP_FLAG_DISCARD) &&
@@ -3780,6 +3829,12 @@ SYSCALL_DEFINE2(swapon, const char __user *, specialfile, int, swap_flags)
 
 	/* Sets SWP_WRITEOK, resurrect the percpu ref, expose the swap device */
 	enable_swap_info(si);
+
+	if (!(si->flags & SWP_GHOST)) {
+		spin_lock(&swap_lock);
+		nr_real_swapfiles++;
+		spin_unlock(&swap_lock);
+	}
 
 	pr_info("Adding %uk swap on %s.  Priority:%d extents:%d across:%lluk %s%s%s%s\n",
 		K(si->pages), name->name, si->prio, nr_extents,
