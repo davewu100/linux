@@ -1345,14 +1345,43 @@ static void swap_range_free(struct swap_info_struct *si, unsigned long offset,
 		zswap_invalidate(swp_entry(si->type, offset + i));
 
 #ifdef CONFIG_SWAP_GHOST
-	/*
-	 * Drop any ghost reverse map for these physical slots so a recycled
-	 * slot is never misread as still backing a ghost slot.
-	 */
-	if (!(si->flags & SWP_GHOST))
+	if (!(si->flags & SWP_GHOST)) {
+		/*
+		 * Freeing physical slots: drop any ghost reverse map so a
+		 * recycled slot is never misread as still backing a ghost slot.
+		 */
 		for (i = 0; i < nr_entries; i++)
 			swap_ghost_erase_backing(swp_entry(si->type,
 							   offset + i));
+	} else {
+		/*
+		 * Freeing ghost slots: if a slot was spilled to a real device,
+		 * release the physical backing slot and both map directions.
+		 * The physical slot lives on a different device/cluster than the
+		 * ghost cluster locked by our caller, so locking it here does
+		 * not nest a lock on itself.
+		 */
+		for (i = 0; i < nr_entries; i++) {
+			swp_entry_t ghost = swp_entry(si->type, offset + i);
+			swp_entry_t phys = swap_ghost_lookup_physical(ghost);
+			struct swap_info_struct *psi;
+			struct swap_cluster_info *pci;
+			unsigned long poff;
+
+			if (!phys.val)
+				continue;
+
+			swap_ghost_erase_physical(ghost);
+			swap_ghost_erase_backing(phys);
+
+			psi = __swap_entry_to_info(phys);
+			poff = swp_offset(phys);
+			pci = swap_cluster_lock(psi, poff);
+			__swap_cluster_free_entries(psi, pci,
+						    poff % SWAPFILE_CLUSTER, 1);
+			swap_cluster_unlock(pci);
+		}
+	}
 #endif
 
 	if (si->flags & SWP_BLKDEV)
@@ -1428,8 +1457,6 @@ static bool swap_alloc_fast(struct folio *folio)
 #ifdef CONFIG_SWAP_GHOST
 static int __swap_cluster_dup_entry(struct swap_cluster_info *ci,
 				   unsigned int ci_off);
-static void __swap_cluster_put_entry(struct swap_cluster_info *ci,
-				     unsigned int ci_off);
 
 /*
  * Allocate a single order-0 slot on a real (non-ghost) swap device and return
@@ -1517,12 +1544,14 @@ int folio_realloc_swap(struct folio *folio)
 		struct swap_cluster_info *ci;
 
 		ci = swap_cluster_lock(psi, swp_offset(phys));
-		__swap_cluster_put_entry(ci, swp_offset(phys) % SWAPFILE_CLUSTER);
+		__swap_cluster_free_entries(psi, ci,
+					    swp_offset(phys) % SWAPFILE_CLUSTER,
+					    1);
 		swap_cluster_unlock(ci);
 		return err;
 	}
 
-	/* Stash the physical target for the caller via the folio's private? */
+	/* Repoint the folio at its new physical home for the write. */
 	folio->swap = phys;
 	return 0;
 }
@@ -4235,6 +4264,13 @@ bool swap_has_real_swapfile(void)
 static DEFINE_XARRAY(swap_ghost_revmap);
 
 /*
+ * Forward map: ghost entry -> physical entry that currently holds its data.
+ * Consulted on swapin/swapoff of a ghost slot to find where the data was
+ * spilled.  Kept in sync with the reverse map.
+ */
+static DEFINE_XARRAY(swap_ghost_fwdmap);
+
+/*
  * Record that physical slot @phys now backs ghost slot @ghost.
  * Must be called before the data is written so a swapin can never observe a
  * physical slot without its reverse map.
@@ -4247,7 +4283,34 @@ int swap_ghost_record_backing(swp_entry_t phys, swp_entry_t ghost)
 		       xa_mk_value(ghost.val), GFP_KERNEL);
 	if (xa_is_err(old))
 		return xa_err(old);
+
+	old = xa_store(&swap_ghost_fwdmap, ghost.val,
+		       xa_mk_value(phys.val), GFP_KERNEL);
+	if (xa_is_err(old)) {
+		xa_erase(&swap_ghost_revmap, phys.val);
+		return xa_err(old);
+	}
 	return 0;
+}
+
+/*
+ * Return the physical slot currently backing ghost slot @ghost, or a zero
+ * entry if the ghost slot has not been spilled to a real device.
+ */
+swp_entry_t swap_ghost_lookup_physical(swp_entry_t ghost)
+{
+	void *val = xa_load(&swap_ghost_fwdmap, ghost.val);
+	swp_entry_t phys = { .val = 0 };
+
+	if (val)
+		phys.val = xa_to_value(val);
+	return phys;
+}
+
+/* Drop the forward map for @ghost when the ghost slot is freed. */
+void swap_ghost_erase_physical(swp_entry_t ghost)
+{
+	xa_erase(&swap_ghost_fwdmap, ghost.val);
 }
 
 /*
@@ -4267,6 +4330,13 @@ swp_entry_t swap_ghost_lookup_backing(swp_entry_t phys)
 /* Drop the reverse map for @phys when its slot is freed or recycled. */
 void swap_ghost_erase_backing(swp_entry_t phys)
 {
+	void *val = xa_load(&swap_ghost_revmap, phys.val);
+
+	if (val) {
+		swp_entry_t ghost = { .val = xa_to_value(val) };
+
+		xa_erase(&swap_ghost_fwdmap, ghost.val);
+	}
 	xa_erase(&swap_ghost_revmap, phys.val);
 }
 #endif /* CONFIG_SWAP_GHOST */

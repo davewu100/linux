@@ -701,13 +701,36 @@ void swap_read_folio(struct folio *folio, struct swap_iocb **plug)
 		goto finish;
 
 	/*
-	 * A ghost swap area has no backing store.  If the folio was not served
-	 * by zswap (or the zeromap) above, there is nothing on disk to read:
-	 * the slot only ever lived in the compressed pool.  Mark it up to date
-	 * and unlock; a later milestone adds compressed-writeback readback for
-	 * ghost slots that were spilled to a physical device.
+	 * A ghost swap area has no backing store of its own.  If the folio was
+	 * not served by zswap (or the zeromap) above, either its data was
+	 * spilled to a real device (M4) -- in which case the forward map points
+	 * at the physical slot and we read from there -- or it never had any
+	 * on-disk data and we can mark it uptodate.
 	 */
 	if (sis->flags & SWP_GHOST) {
+#ifdef CONFIG_SWAP_GHOST
+		swp_entry_t phys = swap_ghost_lookup_physical(folio->swap);
+
+		if (phys.val) {
+			struct swap_info_struct *psi =
+				__swap_entry_to_info(phys);
+
+			/*
+			 * Point the folio at the physical slot for the read.
+			 * The folio is off the swap cache during writeback
+			 * spill, so retargeting it here is safe; the ghost
+			 * entry keeps owning the metadata via the reverse map.
+			 */
+			folio->swap = phys;
+			if (data_race(psi->flags & SWP_FS_OPS))
+				swap_read_folio_fs(folio, plug);
+			else if (psi->flags & SWP_SYNCHRONOUS_IO)
+				swap_read_folio_bdev_sync(folio, psi);
+			else
+				swap_read_folio_bdev_async(folio, psi);
+			goto finish;
+		}
+#endif
 		folio_mark_uptodate(folio);
 		folio_unlock(folio);
 		goto finish;

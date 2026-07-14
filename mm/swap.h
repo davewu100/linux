@@ -269,6 +269,8 @@ int folio_realloc_swap(struct folio *folio);
 int swap_ghost_record_backing(swp_entry_t phys, swp_entry_t ghost);
 swp_entry_t swap_ghost_lookup_backing(swp_entry_t phys);
 void swap_ghost_erase_backing(swp_entry_t phys);
+swp_entry_t swap_ghost_lookup_physical(swp_entry_t ghost);
+void swap_ghost_erase_physical(swp_entry_t ghost);
 #endif
 
 /* For internal use */
