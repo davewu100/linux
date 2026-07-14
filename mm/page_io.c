@@ -287,6 +287,17 @@ int swap_writeout(struct folio *folio, struct swap_iocb **swap_plug)
 		goto out_unlock;
 	}
 
+	/*
+	 * A ghost swap area has no backing store to write to.  If zswap did not
+	 * take the folio (disabled or store failed), there is nowhere to put
+	 * it: keep it in memory by activating it, exactly as we do when zswap
+	 * writeback is disabled for the memcg.
+	 */
+	if (__swap_entry_to_info(folio->swap)->flags & SWP_GHOST) {
+		folio_mark_dirty(folio);
+		return AOP_WRITEPAGE_ACTIVATE;
+	}
+
 	rcu_read_lock();
 	if (!mem_cgroup_zswap_writeback_enabled(folio_memcg(folio))) {
 		rcu_read_unlock();
@@ -688,6 +699,19 @@ void swap_read_folio(struct folio *folio, struct swap_iocb **plug)
 
 	if (zswap_load(folio) != -ENOENT)
 		goto finish;
+
+	/*
+	 * A ghost swap area has no backing store.  If the folio was not served
+	 * by zswap (or the zeromap) above, there is nothing on disk to read:
+	 * the slot only ever lived in the compressed pool.  Mark it up to date
+	 * and unlock; a later milestone adds compressed-writeback readback for
+	 * ghost slots that were spilled to a physical device.
+	 */
+	if (sis->flags & SWP_GHOST) {
+		folio_mark_uptodate(folio);
+		folio_unlock(folio);
+		goto finish;
+	}
 
 	/* We have to read from slower devices. Increase zswap protection. */
 	zswap_folio_swapin(folio);

@@ -1172,7 +1172,7 @@ static unsigned long zswap_shrinker_scan(struct shrinker *shrinker,
 	unsigned long shrink_ret;
 	bool encountered_page_in_swapcache = false;
 
-	if (!zswap_shrinker_enabled ||
+	if (!zswap_shrinker_enabled || !swap_has_real_swapfile() ||
 			!mem_cgroup_zswap_writeback_enabled(sc->memcg)) {
 		sc->nr_scanned = 0;
 		return SHRINK_STOP;
@@ -1197,7 +1197,8 @@ static unsigned long zswap_shrinker_count(struct shrinker *shrinker,
 	unsigned long nr_backing, nr_stored, nr_freeable, nr_disk_swapins_cur,
 		nr_remain;
 
-	if (!zswap_shrinker_enabled || !mem_cgroup_zswap_writeback_enabled(memcg))
+	if (!zswap_shrinker_enabled || !swap_has_real_swapfile() ||
+	    !mem_cgroup_zswap_writeback_enabled(memcg))
 		return 0;
 
 	/*
@@ -1278,6 +1279,9 @@ static struct shrinker *zswap_alloc_shrinker(void)
 static int shrink_memcg(struct mem_cgroup *memcg)
 {
 	int nid, shrunk = 0, scanned = 0;
+
+	if (!swap_has_real_swapfile())
+		return -ENOENT;
 
 	if (!mem_cgroup_zswap_writeback_enabled(memcg))
 		return -ENOENT;

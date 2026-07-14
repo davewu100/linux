@@ -376,6 +376,7 @@ static inline long get_nr_swap_pages(void)
 }
 
 extern void si_swapinfo(struct sysinfo *);
+extern bool swap_has_real_swapfile(void);
 extern int pin_hibernation_swap_type(dev_t device, sector_t offset);
 extern void unpin_hibernation_swap_type(int type);
 extern int find_hibernation_swap_type(dev_t device, sector_t offset);
@@ -430,6 +431,11 @@ static inline void put_swap_device(struct swap_info_struct *si)
 #define total_swap_pages			0L
 #define total_swapcache_pages()			0UL
 #define vm_swap_full()				0
+
+static inline bool swap_has_real_swapfile(void)
+{
+	return false;
+}
 
 #define si_swapinfo(val) \
 	do { (val)->freeswap = (val)->totalswap = 0; } while (0)

@@ -4093,6 +4093,17 @@ void si_swapinfo(struct sysinfo *val)
 }
 
 /*
+ * Whether any swap area backed by real storage is active.  When only ghost
+ * (virtual) swap exists there is nowhere to write zswap entries back to, so
+ * zswap writeback must be suppressed and everything kept in the compressed
+ * pool.
+ */
+bool swap_has_real_swapfile(void)
+{
+	return READ_ONCE(nr_real_swapfiles) > 0;
+}
+
+/*
  * swap_dup_entry_direct() - Increase reference count of a swap entry by one.
  * @entry: first swap entry from which we want to increase the refcount.
  *
