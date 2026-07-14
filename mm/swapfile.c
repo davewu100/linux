@@ -1368,6 +1368,19 @@ static void swap_range_free(struct swap_info_struct *si, unsigned long offset,
 			struct swap_cluster_info *pci;
 			unsigned long poff;
 
+			/*
+			 * The ghost cluster lock is already held by our caller
+			 * (this is &cid->ci), so clear the PHYS_COMPRESSED
+			 * descriptor directly rather than via the locked helper.
+			 */
+			{
+				struct swap_cluster_info_dynamic *cid =
+					container_of(__swap_offset_to_cluster(si, offset + i),
+						     struct swap_cluster_info_dynamic, ci);
+				if (cid->virtual_table)
+					cid->virtual_table[(offset + i) % SWAPFILE_CLUSTER] = 0;
+			}
+
 			if (!phys.val)
 				continue;
 
@@ -3376,6 +3389,8 @@ static void free_ghost_clusters_info(struct swap_info_struct *si)
 		spin_lock(&cid->ci.lock);
 		if (cluster_table_is_alloced(&cid->ci))
 			swap_cluster_free_table(&cid->ci);
+		kfree(cid->virtual_table);
+		cid->virtual_table = NULL;
 		spin_unlock(&cid->ci.lock);
 		call_rcu(&cid->rcu, swap_ghost_free_cluster_rcu_cb);
 	}
@@ -4311,6 +4326,95 @@ swp_entry_t swap_ghost_lookup_physical(swp_entry_t ghost)
 void swap_ghost_erase_physical(swp_entry_t ghost)
 {
 	xa_erase(&swap_ghost_fwdmap, ghost.val);
+}
+
+/*
+ * PHYS_COMPRESSED descriptors for ghost slots.
+ *
+ * When a ghost slot is spilled to a real device as a compressed blob (rather
+ * than a decompressed page), the blob's descriptor {clen, algo_id} is stored
+ * in the ghost cluster's virtual_table so a later swapin can read the blob
+ * back and decompress it with the recorded codec.
+ */
+
+/* Return the dynamic cluster for @ghost, or NULL. */
+static struct swap_cluster_info_dynamic *swap_ghost_dyn(swp_entry_t ghost)
+{
+	struct swap_info_struct *si = __swap_entry_to_info(ghost);
+	unsigned long index = swp_offset(ghost) / SWAPFILE_CLUSTER;
+
+	return xa_load(&si->cluster_info_pool, index);
+}
+
+/*
+ * Record that ghost slot @ghost holds a compressed blob of @clen bytes made by
+ * codec @algo_id.  Allocates the cluster's virtual_table on first use.
+ */
+int swap_ghost_set_compressed(swp_entry_t ghost, unsigned int clen,
+			      unsigned int algo_id)
+{
+	struct swap_cluster_info_dynamic *cid = swap_ghost_dyn(ghost);
+	unsigned int ci_off = swp_offset(ghost) % SWAPFILE_CLUSTER;
+	unsigned long *vt;
+
+	if (!cid)
+		return -ENOENT;
+
+	spin_lock(&cid->ci.lock);
+	if (!cid->virtual_table) {
+		vt = kcalloc(SWAPFILE_CLUSTER, sizeof(*vt), GFP_ATOMIC);
+		if (!vt) {
+			spin_unlock(&cid->ci.lock);
+			return -ENOMEM;
+		}
+		cid->virtual_table = vt;
+	}
+	cid->virtual_table[ci_off] = swap_vt_encode(clen, algo_id);
+	spin_unlock(&cid->ci.lock);
+	return 0;
+}
+
+/*
+ * If ghost slot @ghost holds a compressed blob, return true and fill *clen and
+ * *algo_id; otherwise return false.
+ */
+bool swap_ghost_get_compressed(swp_entry_t ghost, unsigned int *clen,
+			       unsigned int *algo_id)
+{
+	struct swap_cluster_info_dynamic *cid = swap_ghost_dyn(ghost);
+	unsigned int ci_off = swp_offset(ghost) % SWAPFILE_CLUSTER;
+	unsigned long vt;
+	bool ret = false;
+
+	if (!cid)
+		return false;
+
+	spin_lock(&cid->ci.lock);
+	if (cid->virtual_table) {
+		vt = cid->virtual_table[ci_off];
+		if (swap_vt_is_compressed(vt)) {
+			*clen = swap_vt_clen(vt);
+			*algo_id = swap_vt_algo(vt);
+			ret = true;
+		}
+	}
+	spin_unlock(&cid->ci.lock);
+	return ret;
+}
+
+/* Clear the PHYS_COMPRESSED descriptor for @ghost when the slot is freed. */
+void swap_ghost_clear_compressed(swp_entry_t ghost)
+{
+	struct swap_cluster_info_dynamic *cid = swap_ghost_dyn(ghost);
+	unsigned int ci_off = swp_offset(ghost) % SWAPFILE_CLUSTER;
+
+	if (!cid)
+		return;
+
+	spin_lock(&cid->ci.lock);
+	if (cid->virtual_table)
+		cid->virtual_table[ci_off] = 0;
+	spin_unlock(&cid->ci.lock);
 }
 
 /*

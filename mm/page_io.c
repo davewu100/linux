@@ -710,10 +710,26 @@ void swap_read_folio(struct folio *folio, struct swap_iocb **plug)
 	if (sis->flags & SWP_GHOST) {
 #ifdef CONFIG_SWAP_GHOST
 		swp_entry_t phys = swap_ghost_lookup_physical(folio->swap);
+		unsigned int clen, algo_id;
 
 		if (phys.val) {
 			struct swap_info_struct *psi =
 				__swap_entry_to_info(phys);
+
+			/*
+			 * PHYS_COMPRESSED slots carry a {clen, algo_id}
+			 * descriptor in the ghost cluster's virtual_table.  The
+			 * spilled data is currently stored decompressed, so the
+			 * normal read below suffices; the descriptor is consulted
+			 * here so the PHYS_COMPRESSED state is observed and will
+			 * drive verbatim-blob decode once that path lands.
+			 */
+			if (swap_ghost_get_compressed(folio->swap, &clen,
+						      &algo_id)) {
+				/* verbatim-blob decode hook (future) */
+				(void)clen;
+				(void)algo_id;
+			}
 
 			/*
 			 * Point the folio at the physical slot for the read.

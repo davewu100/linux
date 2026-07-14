@@ -993,6 +993,9 @@ static int zswap_writeback_entry(struct zswap_entry *entry,
 	struct mempolicy *mpol;
 	struct swap_info_struct *si;
 	int ret = 0;
+#ifdef CONFIG_SWAP_GHOST
+	unsigned int ghost_clen = 0;
+#endif
 
 	/* try to allocate swap cache folio */
 	si = get_swap_device(swpentry);
@@ -1034,6 +1037,18 @@ static int zswap_writeback_entry(struct zswap_entry *entry,
 		goto out;
 	}
 
+#ifdef CONFIG_SWAP_GHOST
+	/*
+	 * Remember the compressed footprint of this entry before it is freed.
+	 * For a ghost slot spilled to a real device we record a PHYS_COMPRESSED
+	 * descriptor {clen, algo_id} in the ghost cluster's virtual_table, so a
+	 * later swapin knows the slot originated from a compressed blob.  algo
+	 * id 0 denotes "the zswap pool codec"; a full implementation would
+	 * intern the pool's tfm name into a small id registry.
+	 */
+	ghost_clen = entry->length;
+#endif
+
 	xa_erase(tree, offset);
 
 	count_vm_event(ZSWPWB);
@@ -1063,6 +1078,15 @@ static int zswap_writeback_entry(struct zswap_entry *entry,
 			folio_clear_reclaim(folio);
 			goto out;
 		}
+		/*
+		 * Record the PHYS_COMPRESSED descriptor on the ghost slot
+		 * (swpentry), which still owns the metadata; folio->swap now
+		 * points at the physical backing slot.  Best-effort: on failure
+		 * the slot is simply treated as an ordinary (decompressed) spill
+		 * on swapin.
+		 */
+		if (ghost_clen && ghost_clen < PAGE_SIZE)
+			swap_ghost_set_compressed(swpentry, ghost_clen, 0);
 	}
 #endif
 

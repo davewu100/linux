@@ -71,16 +71,53 @@ struct swap_cluster_info {
  * swap_cluster_info must be the first member so a pointer to it can be used
  * interchangeably with a normal cluster pointer on the shared paths.
  *
- * virtual_table is reserved for the compressed-writeback / PHYS_COMPRESSED
- * backend payload (see the virtual swap space design); it is not populated
- * yet.
+ * virtual_table holds the compressed-writeback / PHYS_COMPRESSED backend
+ * payload (see the virtual swap space design): one tag-encoded word per slot
+ * in the cluster, describing a compressed blob that was written back verbatim.
+ * It is allocated lazily the first time a slot in the cluster records a blob.
  */
 struct swap_cluster_info_dynamic {
 	struct swap_cluster_info ci;
 	unsigned int index;
 	struct rcu_head rcu;
-	unsigned long *virtual_table;	/* reserved, see above */
+	unsigned long *virtual_table;	/* SWAPFILE_CLUSTER PHYS_COMPRESSED descriptors */
 };
+
+/*
+ * PHYS_COMPRESSED descriptor encoding for a virtual_table slot word:
+ *
+ *   bit  0        : SWAP_VT_COMPRESSED present flag
+ *   bits 1..16    : compressed length in bytes (0..PAGE_SIZE)
+ *   bits 17..24   : codec/algo id
+ */
+#define SWAP_VT_COMPRESSED	(1UL << 0)
+#define SWAP_VT_CLEN_SHIFT	1
+#define SWAP_VT_CLEN_MASK	(0xffffUL << SWAP_VT_CLEN_SHIFT)
+#define SWAP_VT_ALGO_SHIFT	17
+#define SWAP_VT_ALGO_MASK	(0xffUL << SWAP_VT_ALGO_SHIFT)
+
+static inline unsigned long swap_vt_encode(unsigned int clen,
+					   unsigned int algo_id)
+{
+	return SWAP_VT_COMPRESSED |
+	       (((unsigned long)clen << SWAP_VT_CLEN_SHIFT) & SWAP_VT_CLEN_MASK) |
+	       (((unsigned long)algo_id << SWAP_VT_ALGO_SHIFT) & SWAP_VT_ALGO_MASK);
+}
+
+static inline bool swap_vt_is_compressed(unsigned long vt)
+{
+	return vt & SWAP_VT_COMPRESSED;
+}
+
+static inline unsigned int swap_vt_clen(unsigned long vt)
+{
+	return (vt & SWAP_VT_CLEN_MASK) >> SWAP_VT_CLEN_SHIFT;
+}
+
+static inline unsigned int swap_vt_algo(unsigned long vt)
+{
+	return (vt & SWAP_VT_ALGO_MASK) >> SWAP_VT_ALGO_SHIFT;
+}
 #endif /* CONFIG_SWAP_GHOST */
 
 /* All on-list cluster must have a non-zero flag. */
@@ -271,6 +308,11 @@ swp_entry_t swap_ghost_lookup_backing(swp_entry_t phys);
 void swap_ghost_erase_backing(swp_entry_t phys);
 swp_entry_t swap_ghost_lookup_physical(swp_entry_t ghost);
 void swap_ghost_erase_physical(swp_entry_t ghost);
+int swap_ghost_set_compressed(swp_entry_t ghost, unsigned int clen,
+			      unsigned int algo_id);
+bool swap_ghost_get_compressed(swp_entry_t ghost, unsigned int *clen,
+			       unsigned int *algo_id);
+void swap_ghost_clear_compressed(swp_entry_t ghost);
 #endif
 
 /* For internal use */
