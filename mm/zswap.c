@@ -971,25 +971,92 @@ static bool zswap_decompress(struct zswap_entry *entry, struct folio *folio)
 
 #ifdef CONFIG_SWAP_GHOST
 /*
+ * Codec name registry for ghost compressed-writeback.
+ *
+ * A PHYS_COMPRESSED descriptor stores an algo id rather than a codec name so
+ * it fits in a tag word.  This tiny registry interns crypto tfm names into
+ * small ids and resolves them back on swapin.  Names are never freed (the id
+ * space is tiny and bounded by the number of distinct compressors ever used),
+ * so a recorded id is always resolvable for the lifetime of the system.
+ *
+ * Id 0 is reserved as "invalid / not recorded".  Real ids start at 1.
+ */
+#define ZSWAP_CODEC_MAX 31
+static const char *zswap_codec_names[ZSWAP_CODEC_MAX + 1];
+static unsigned int zswap_codec_count;
+static DEFINE_SPINLOCK(zswap_codec_lock);
+
+/* Intern @name and return its id (1..ZSWAP_CODEC_MAX), or 0 on failure. */
+static unsigned int zswap_codec_to_id(const char *name)
+{
+	unsigned int i, id = 0;
+	char *dup;
+
+	spin_lock(&zswap_codec_lock);
+	for (i = 1; i <= zswap_codec_count; i++) {
+		if (!strcmp(zswap_codec_names[i], name)) {
+			id = i;
+			goto out;
+		}
+	}
+	if (zswap_codec_count >= ZSWAP_CODEC_MAX)
+		goto out;	/* registry full; caller falls back to decompress */
+
+	/* kstrdup under spinlock: use GFP_ATOMIC, names are short. */
+	dup = kstrdup(name, GFP_ATOMIC);
+	if (!dup)
+		goto out;
+	id = ++zswap_codec_count;
+	zswap_codec_names[id] = dup;
+out:
+	spin_unlock(&zswap_codec_lock);
+	return id;
+}
+
+/* Resolve an id back to its codec name, or NULL if unknown. */
+static const char *zswap_codec_from_id(unsigned int id)
+{
+	const char *name = NULL;
+
+	if (id == 0)
+		return NULL;
+	spin_lock(&zswap_codec_lock);
+	if (id <= zswap_codec_count)
+		name = zswap_codec_names[id];
+	spin_unlock(&zswap_codec_lock);
+	return name;
+}
+
+/*
  * Copy a genuinely compressed zswap entry's blob verbatim into @folio without
  * decompressing it.  The blob occupies the first entry->length bytes of the
  * folio; the rest is zeroed.  Used by ghost compressed-writeback so the
  * compressed bytes are written to the backing device as-is, avoiding a
  * decompress-on-writeback / recompress cycle.
  *
+ * On success, *algo_id is set to the interned id of the pool's codec so the
+ * caller can record it in the PHYS_COMPRESSED descriptor.
+ *
  * Return: the compressed length on success, 0 if the entry is not eligible
  * (uncompressed, or larger than a page).
  */
 static unsigned int zswap_copy_blob_to_folio(struct zswap_entry *entry,
-					     struct folio *folio)
+					     struct folio *folio,
+					     unsigned int *algo_id)
 {
 	struct zswap_pool *pool = entry->pool;
 	struct scatterlist input[2];
 	unsigned int clen = entry->length;
+	unsigned int id;
 	void *dst;
 
 	/* Only genuinely compressed, sub-page blobs are worth passing through. */
 	if (!clen || clen >= PAGE_SIZE)
+		return 0;
+
+	/* Need a resolvable codec id, or swapin could not decode the blob. */
+	id = zswap_codec_to_id(pool->tfm_name);
+	if (!id)
 		return 0;
 
 	zs_obj_read_sg_begin(pool->zs_pool, entry->handle, input, clen);
@@ -1000,13 +1067,14 @@ static unsigned int zswap_copy_blob_to_folio(struct zswap_entry *entry,
 	zs_obj_read_sg_end(pool->zs_pool, entry->handle);
 	flush_dcache_folio(folio);
 
+	*algo_id = id;
 	return clen;
 }
 
 /*
  * Decompress, in place, a compressed blob of @clen bytes sitting in the first
- * bytes of @folio, using the current zswap pool codec (algo_id is reserved for
- * a future codec-name registry; only the pool codec, id 0, is supported now).
+ * bytes of @folio, using the codec recorded as @algo_id in the PHYS_COMPRESSED
+ * descriptor.  The id is resolved back to a codec name through the registry.
  *
  * A scratch page is used as the decompression source because the folio is both
  * source and destination.  Deliberately simple for the prototype: a transient
@@ -1018,7 +1086,7 @@ static unsigned int zswap_copy_blob_to_folio(struct zswap_entry *entry,
 bool zswap_decompress_blob(struct folio *folio, unsigned int clen,
 			   unsigned int algo_id)
 {
-	struct zswap_pool *pool;
+	const char *codec;
 	struct crypto_acomp *acomp = NULL;
 	struct acomp_req *req = NULL;
 	struct crypto_wait wait;
@@ -1027,18 +1095,16 @@ bool zswap_decompress_blob(struct folio *folio, unsigned int clen,
 	void *sbuf, *fbuf;
 	int ret;
 
-	if (algo_id != 0)
-		return false;
 	if (!clen || clen >= PAGE_SIZE)
 		return false;
 
-	pool = zswap_pool_current_get();
-	if (!pool)
+	codec = zswap_codec_from_id(algo_id);
+	if (!codec)
 		return false;
 
-	acomp = crypto_alloc_acomp_node(pool->tfm_name, 0, 0, NUMA_NO_NODE);
+	acomp = crypto_alloc_acomp_node(codec, 0, 0, NUMA_NO_NODE);
 	if (IS_ERR(acomp))
-		goto err_pool;
+		return false;
 	req = acomp_request_alloc(acomp);
 	if (!req)
 		goto err_acomp;
@@ -1073,15 +1139,12 @@ bool zswap_decompress_blob(struct folio *folio, unsigned int clen,
 	__free_page(scratch);
 	acomp_request_free(req);
 	crypto_free_acomp(acomp);
-	zswap_pool_put(pool);
 	return ret == 0;
 
 err_req:
 	acomp_request_free(req);
 err_acomp:
 	crypto_free_acomp(acomp);
-err_pool:
-	zswap_pool_put(pool);
 	return false;
 }
 #endif /* CONFIG_SWAP_GHOST */
@@ -1111,7 +1174,7 @@ static int zswap_writeback_entry(struct zswap_entry *entry,
 	struct swap_info_struct *si;
 	int ret = 0;
 #ifdef CONFIG_SWAP_GHOST
-	unsigned int ghost_clen = 0;
+	unsigned int ghost_clen = 0, ghost_algo = 0;
 #endif
 
 	/* try to allocate swap cache folio */
@@ -1160,7 +1223,7 @@ static int zswap_writeback_entry(struct zswap_entry *entry,
 	 * a genuinely compressed sub-page blob.
 	 */
 	if (__swap_entry_to_info(swpentry)->flags & SWP_GHOST)
-		ghost_clen = zswap_copy_blob_to_folio(entry, folio);
+		ghost_clen = zswap_copy_blob_to_folio(entry, folio, &ghost_algo);
 
 	if (!ghost_clen)
 #endif
@@ -1200,7 +1263,8 @@ static int zswap_writeback_entry(struct zswap_entry *entry,
 		 * descriptor; on failure keep the folio in memory.
 		 */
 		if (ghost_clen) {
-			ret = swap_ghost_set_compressed(swpentry, ghost_clen, 0);
+			ret = swap_ghost_set_compressed(swpentry, ghost_clen,
+							ghost_algo);
 			if (ret) {
 				folio_clear_reclaim(folio);
 				goto out;
