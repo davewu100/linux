@@ -254,24 +254,23 @@ static inline struct xarray *swap_zswap_tree(swp_entry_t swp)
 static void __zswap_pool_empty(struct percpu_ref *ref);
 
 #if IS_ENABLED(CONFIG_ZCOMP)
-static bool zswap_compressor_is_crypto_exclusive(const char *alg)
-{
-	return strstr(alg, "-iaa");
-}
-
 static enum zswap_comp_backend zswap_compressor_backend(const char *alg)
 {
-	if (!zswap_compressor_is_crypto_exclusive(alg)) {
-		/*
-		 * Prefer crypto for deflate when a HW acomp exists, e.g.
-		 * Kunpeng ZIP or other offload drivers.
-		 */
-		if (!strcmp(alg, "deflate") && crypto_has_acomp(alg, 0, 0))
-			return ZSWAP_BACKEND_CRYPTO;
+	/*
+	 * lib/zcomp only knows software algorithms, so its backend table is
+	 * the single source of truth: names it recognizes are shared with
+	 * zram, everything else (hardware/offload acomp drivers) stays on
+	 * crypto, which owns those drivers.
+	 *
+	 * deflate is the one name both sides claim.  Keep it on crypto
+	 * unconditionally so its behavior stays identical to before this
+	 * backend split, and any offload driver is never bypassed.
+	 */
+	if (!strcmp(alg, "deflate"))
+		return ZSWAP_BACKEND_CRYPTO;
 
-		if (zcomp_lookup_backend_name(alg))
-			return ZSWAP_BACKEND_ZCOMP;
-	}
+	if (zcomp_lookup_backend_name(alg))
+		return ZSWAP_BACKEND_ZCOMP;
 
 	return ZSWAP_BACKEND_CRYPTO;
 }
