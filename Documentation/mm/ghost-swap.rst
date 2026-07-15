@@ -136,6 +136,26 @@ recompress it, a spilled ghost slot can store the zswap compressed blob
   the folio uptodate, then ``zswap_decompress_blob()`` decodes it in place with
   the recorded codec; only then is the folio marked uptodate and unlocked.
 
+Relation to zram passthrough
+============================
+
+Ghost compressed writeback and the zram ``REQ_COMPRESSED`` passthrough are two
+independent ways to avoid a decompress/recompress cycle on zswap writeback, and
+they coexist:
+
+* **zram passthrough** applies when the backing device is a synchronous bdev
+  (zram) that advertises the same compressor via ``->swap_comp_algo()``.  The
+  compressed blob is written with ``REQ_COMPRESSED`` and stored by zram
+  verbatim; the normal swapin path decompresses it in zram.  This is chosen
+  first in ``zswap_writeback_entry()``.
+
+* **ghost compressed writeback** applies to ghost-backed entries (which have no
+  bdev and never set passthrough): the blob is spilled to a real device with a
+  ``PHYS_COMPRESSED`` descriptor and decoded by mm on swapin.
+
+The two are mutually exclusive by backing type, so a given entry takes exactly
+one path; anything else falls back to decompress-and-write.
+
 Limitations
 ===========
 
