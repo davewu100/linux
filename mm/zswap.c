@@ -969,6 +969,123 @@ static bool zswap_decompress(struct zswap_entry *entry, struct folio *folio)
 	return false;
 }
 
+#ifdef CONFIG_SWAP_GHOST
+/*
+ * Copy a genuinely compressed zswap entry's blob verbatim into @folio without
+ * decompressing it.  The blob occupies the first entry->length bytes of the
+ * folio; the rest is zeroed.  Used by ghost compressed-writeback so the
+ * compressed bytes are written to the backing device as-is, avoiding a
+ * decompress-on-writeback / recompress cycle.
+ *
+ * Return: the compressed length on success, 0 if the entry is not eligible
+ * (uncompressed, or larger than a page).
+ */
+static unsigned int zswap_copy_blob_to_folio(struct zswap_entry *entry,
+					     struct folio *folio)
+{
+	struct zswap_pool *pool = entry->pool;
+	struct scatterlist input[2];
+	unsigned int clen = entry->length;
+	void *dst;
+
+	/* Only genuinely compressed, sub-page blobs are worth passing through. */
+	if (!clen || clen >= PAGE_SIZE)
+		return 0;
+
+	zs_obj_read_sg_begin(pool->zs_pool, entry->handle, input, clen);
+	dst = kmap_local_folio(folio, 0);
+	memcpy_from_sglist(dst, input, 0, clen);
+	memset(dst + clen, 0, PAGE_SIZE - clen);
+	kunmap_local(dst);
+	zs_obj_read_sg_end(pool->zs_pool, entry->handle);
+	flush_dcache_folio(folio);
+
+	return clen;
+}
+
+/*
+ * Decompress, in place, a compressed blob of @clen bytes sitting in the first
+ * bytes of @folio, using the current zswap pool codec (algo_id is reserved for
+ * a future codec-name registry; only the pool codec, id 0, is supported now).
+ *
+ * A scratch page is used as the decompression source because the folio is both
+ * source and destination.  Deliberately simple for the prototype: a transient
+ * acomp is allocated per call.
+ *
+ * Return: true on success (folio now holds the decompressed page), false
+ * otherwise.
+ */
+bool zswap_decompress_blob(struct folio *folio, unsigned int clen,
+			   unsigned int algo_id)
+{
+	struct zswap_pool *pool;
+	struct crypto_acomp *acomp = NULL;
+	struct acomp_req *req = NULL;
+	struct crypto_wait wait;
+	struct scatterlist sg_in, sg_out;
+	struct page *scratch = NULL;
+	void *sbuf, *fbuf;
+	int ret;
+
+	if (algo_id != 0)
+		return false;
+	if (!clen || clen >= PAGE_SIZE)
+		return false;
+
+	pool = zswap_pool_current_get();
+	if (!pool)
+		return false;
+
+	acomp = crypto_alloc_acomp_node(pool->tfm_name, 0, 0, NUMA_NO_NODE);
+	if (IS_ERR(acomp))
+		goto err_pool;
+	req = acomp_request_alloc(acomp);
+	if (!req)
+		goto err_acomp;
+
+	scratch = alloc_page(GFP_KERNEL);
+	if (!scratch)
+		goto err_req;
+
+	/* Move the blob out of the folio into the scratch page. */
+	sbuf = kmap_local_page(scratch);
+	fbuf = kmap_local_folio(folio, 0);
+	memcpy(sbuf, fbuf, clen);
+	kunmap_local(fbuf);
+	kunmap_local(sbuf);
+
+	crypto_init_wait(&wait);
+	acomp_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG,
+				   crypto_req_done, &wait);
+
+	sg_init_table(&sg_in, 1);
+	sg_set_page(&sg_in, scratch, clen, 0);
+	sg_init_table(&sg_out, 1);
+	sg_set_folio(&sg_out, folio, PAGE_SIZE, 0);
+	acomp_request_set_params(req, &sg_in, &sg_out, clen, PAGE_SIZE);
+
+	ret = crypto_wait_req(crypto_acomp_decompress(req), &wait);
+	if (!ret && req->dlen == PAGE_SIZE)
+		flush_dcache_folio(folio);
+	else
+		ret = ret ? ret : -EIO;
+
+	__free_page(scratch);
+	acomp_request_free(req);
+	crypto_free_acomp(acomp);
+	zswap_pool_put(pool);
+	return ret == 0;
+
+err_req:
+	acomp_request_free(req);
+err_acomp:
+	crypto_free_acomp(acomp);
+err_pool:
+	zswap_pool_put(pool);
+	return false;
+}
+#endif /* CONFIG_SWAP_GHOST */
+
 /*********************************
 * writeback code
 **********************************/
@@ -1032,22 +1149,25 @@ static int zswap_writeback_entry(struct zswap_entry *entry,
 		goto out;
 	}
 
+#ifdef CONFIG_SWAP_GHOST
+	/*
+	 * For a ghost slot that will be spilled to a real device, pass the
+	 * compressed blob through verbatim instead of decompressing it here
+	 * only to write a raw page that a later swapin would recompress.  Copy
+	 * the blob into the folio as-is and remember its length so a
+	 * PHYS_COMPRESSED descriptor can be recorded below; swapin decodes it
+	 * with the pool codec.  Fall back to decompression if the entry is not
+	 * a genuinely compressed sub-page blob.
+	 */
+	if (__swap_entry_to_info(swpentry)->flags & SWP_GHOST)
+		ghost_clen = zswap_copy_blob_to_folio(entry, folio);
+
+	if (!ghost_clen)
+#endif
 	if (!zswap_decompress(entry, folio)) {
 		ret = -EIO;
 		goto out;
 	}
-
-#ifdef CONFIG_SWAP_GHOST
-	/*
-	 * Remember the compressed footprint of this entry before it is freed.
-	 * For a ghost slot spilled to a real device we record a PHYS_COMPRESSED
-	 * descriptor {clen, algo_id} in the ghost cluster's virtual_table, so a
-	 * later swapin knows the slot originated from a compressed blob.  algo
-	 * id 0 denotes "the zswap pool codec"; a full implementation would
-	 * intern the pool's tfm name into a small id registry.
-	 */
-	ghost_clen = entry->length;
-#endif
 
 	xa_erase(tree, offset);
 
@@ -1065,28 +1185,42 @@ static int zswap_writeback_entry(struct zswap_entry *entry,
 
 #ifdef CONFIG_SWAP_GHOST
 	/*
-	 * If this entry lives on a ghost swap area it has no physical home to
-	 * be written to.  Spill it to a real device: folio_realloc_swap()
-	 * allocates a backing slot, records a reverse map from it to the ghost
-	 * slot (which keeps the metadata), and repoints folio->swap at the
-	 * physical slot for the write below.  If no real device has room, keep
-	 * the folio in memory.
+	 * A ghost swap area has no physical home of its own, so a ghost-backed
+	 * entry must be spilled to a real device.  When it was passed through as
+	 * a verbatim compressed blob above, record its descriptor first, then
+	 * allocate the backing slot.
 	 */
 	if (__swap_entry_to_info(swpentry)->flags & SWP_GHOST) {
+		/*
+		 * If the folio holds a verbatim compressed blob (ghost_clen
+		 * set), the PHYS_COMPRESSED descriptor is mandatory: without it
+		 * swapin would read the blob back as a raw page.  Record it on
+		 * the ghost slot (which still owns the metadata) before spilling
+		 * so there is no window where the blob exists without its
+		 * descriptor; on failure keep the folio in memory.
+		 */
+		if (ghost_clen) {
+			ret = swap_ghost_set_compressed(swpentry, ghost_clen, 0);
+			if (ret) {
+				folio_clear_reclaim(folio);
+				goto out;
+			}
+		}
+
+		/*
+		 * Spill to a real device: folio_realloc_swap() allocates a
+		 * backing slot, records a reverse map from it to the ghost slot,
+		 * and repoints folio->swap at the physical slot for the write
+		 * below.  If no real device has room, drop the descriptor again
+		 * and keep the folio in memory.
+		 */
 		ret = folio_realloc_swap(folio);
 		if (ret) {
+			if (ghost_clen)
+				swap_ghost_clear_compressed(swpentry);
 			folio_clear_reclaim(folio);
 			goto out;
 		}
-		/*
-		 * Record the PHYS_COMPRESSED descriptor on the ghost slot
-		 * (swpentry), which still owns the metadata; folio->swap now
-		 * points at the physical backing slot.  Best-effort: on failure
-		 * the slot is simply treated as an ordinary (decompressed) spill
-		 * on swapin.
-		 */
-		if (ghost_clen && ghost_clen < PAGE_SIZE)
-			swap_ghost_set_compressed(swpentry, ghost_clen, 0);
 	}
 #endif
 

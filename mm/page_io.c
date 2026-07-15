@@ -654,6 +654,34 @@ static void swap_read_folio_bdev_sync(struct folio *folio,
 	put_task_struct(current);
 }
 
+#ifdef CONFIG_SWAP_GHOST
+/*
+ * Synchronously read a raw blob from a block-backed swap device without the
+ * usual completion handling: the folio holds compressed bytes, not a page, so
+ * it must not be marked uptodate or unlocked until the caller has decoded it.
+ *
+ * Return: true if the read succeeded.
+ */
+static bool swap_read_folio_ghost_blob(struct folio *folio,
+				       struct swap_info_struct *sis)
+{
+	struct bio_vec bv;
+	struct bio bio;
+	int ret;
+
+	if (!sis->bdev)
+		return false;
+
+	bio_init(&bio, sis->bdev, &bv, 1, REQ_OP_READ);
+	bio.bi_iter.bi_sector = swap_folio_sector(folio);
+	bio_add_folio_nofail(&bio, folio, folio_size(folio), 0);
+	count_vm_events(PSWPIN, folio_nr_pages(folio));
+	ret = submit_bio_wait(&bio);
+	bio_uninit(&bio);
+	return ret == 0;
+}
+#endif /* CONFIG_SWAP_GHOST */
+
 static void swap_read_folio_bdev_async(struct folio *folio,
 		struct swap_info_struct *sis)
 {
@@ -715,21 +743,16 @@ void swap_read_folio(struct folio *folio, struct swap_iocb **plug)
 		if (phys.val) {
 			struct swap_info_struct *psi =
 				__swap_entry_to_info(phys);
+			bool compressed;
 
 			/*
 			 * PHYS_COMPRESSED slots carry a {clen, algo_id}
-			 * descriptor in the ghost cluster's virtual_table.  The
-			 * spilled data is currently stored decompressed, so the
-			 * normal read below suffices; the descriptor is consulted
-			 * here so the PHYS_COMPRESSED state is observed and will
-			 * drive verbatim-blob decode once that path lands.
+			 * descriptor in the ghost cluster's virtual_table: the
+			 * physical slot holds a verbatim compressed blob that
+			 * must be read back and decoded with zswap's codec.
 			 */
-			if (swap_ghost_get_compressed(folio->swap, &clen,
-						      &algo_id)) {
-				/* verbatim-blob decode hook (future) */
-				(void)clen;
-				(void)algo_id;
-			}
+			compressed = swap_ghost_get_compressed(folio->swap,
+							       &clen, &algo_id);
 
 			/*
 			 * Point the folio at the physical slot for the read.
@@ -738,12 +761,26 @@ void swap_read_folio(struct folio *folio, struct swap_iocb **plug)
 			 * entry keeps owning the metadata via the reverse map.
 			 */
 			folio->swap = phys;
-			if (data_race(psi->flags & SWP_FS_OPS))
+
+			if (compressed) {
+				/*
+				 * Read the blob synchronously without letting the
+				 * bio completion unlock/mark the folio (it holds
+				 * compressed bytes, not a valid page), decode it
+				 * in place, then finish the folio ourselves.
+				 */
+				if (swap_read_folio_ghost_blob(folio, psi) &&
+				    zswap_decompress_blob(folio, clen, algo_id)) {
+					folio_mark_uptodate(folio);
+				}
+				folio_unlock(folio);
+			} else if (data_race(psi->flags & SWP_FS_OPS)) {
 				swap_read_folio_fs(folio, plug);
-			else if (psi->flags & SWP_SYNCHRONOUS_IO)
+			} else if (psi->flags & SWP_SYNCHRONOUS_IO) {
 				swap_read_folio_bdev_sync(folio, psi);
-			else
+			} else {
 				swap_read_folio_bdev_async(folio, psi);
+			}
 			goto finish;
 		}
 #endif

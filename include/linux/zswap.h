@@ -35,6 +35,10 @@ void zswap_lruvec_state_init(struct lruvec *lruvec);
 void zswap_folio_swapin(struct folio *folio);
 bool zswap_is_enabled(void);
 bool zswap_never_enabled(void);
+#ifdef CONFIG_SWAP_GHOST
+bool zswap_decompress_blob(struct folio *folio, unsigned int clen,
+			   unsigned int algo_id);
+#endif
 #else
 
 struct zswap_lruvec_state {};
