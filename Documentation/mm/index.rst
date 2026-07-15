@@ -34,6 +34,7 @@ see the :doc:`admin guide <../admin-guide/mm/index>`.
    page_reclaim
    swap
    swap-table
+   ghost-swap
    page_cache
    shmfs
    oom
