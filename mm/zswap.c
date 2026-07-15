@@ -1072,13 +1072,85 @@ static unsigned int zswap_copy_blob_to_folio(struct zswap_entry *entry,
 }
 
 /*
+ * Core in-place blob decompression using a caller-provided request, wait, and
+ * a scratch buffer @sbuf of at least @clen bytes.  The folio is both source and
+ * destination, so the blob is first copied into @sbuf and decompressed from
+ * there back into the folio.
+ *
+ * Return: true on success (folio now holds the decompressed page).
+ */
+static bool zswap_decompress_blob_req(struct folio *folio, unsigned int clen,
+				      struct acomp_req *req,
+				      struct crypto_wait *wait, u8 *sbuf)
+{
+	struct scatterlist sg_in, sg_out;
+	void *fbuf;
+	int ret;
+
+	/* Move the blob out of the folio into the scratch buffer. */
+	fbuf = kmap_local_folio(folio, 0);
+	memcpy(sbuf, fbuf, clen);
+	kunmap_local(fbuf);
+
+	sg_init_one(&sg_in, sbuf, clen);
+	sg_init_table(&sg_out, 1);
+	sg_set_folio(&sg_out, folio, PAGE_SIZE, 0);
+	acomp_request_set_params(req, &sg_in, &sg_out, clen, PAGE_SIZE);
+
+	ret = crypto_wait_req(crypto_acomp_decompress(req), wait);
+	if (!ret && req->dlen == PAGE_SIZE) {
+		flush_dcache_folio(folio);
+		return true;
+	}
+	return false;
+}
+
+/*
+ * Slow path: the recorded codec is not the one the current pool's per-CPU
+ * context is set up for, so allocate a transient acomp for it.  Rare (only when
+ * the compressor changed between writeback and swapin).
+ */
+static bool zswap_decompress_blob_slow(struct folio *folio, unsigned int clen,
+				       const char *codec)
+{
+	struct crypto_acomp *acomp;
+	struct acomp_req *req;
+	struct crypto_wait wait;
+	u8 *sbuf;
+	bool ok = false;
+
+	acomp = crypto_alloc_acomp_node(codec, 0, 0, NUMA_NO_NODE);
+	if (IS_ERR(acomp))
+		return false;
+	req = acomp_request_alloc(acomp);
+	if (!req)
+		goto err_acomp;
+	sbuf = kmalloc(PAGE_SIZE, GFP_KERNEL);
+	if (!sbuf)
+		goto err_req;
+
+	crypto_init_wait(&wait);
+	acomp_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG,
+				   crypto_req_done, &wait);
+	ok = zswap_decompress_blob_req(folio, clen, req, &wait, sbuf);
+
+	kfree(sbuf);
+err_req:
+	acomp_request_free(req);
+err_acomp:
+	crypto_free_acomp(acomp);
+	return ok;
+}
+
+/*
  * Decompress, in place, a compressed blob of @clen bytes sitting in the first
  * bytes of @folio, using the codec recorded as @algo_id in the PHYS_COMPRESSED
  * descriptor.  The id is resolved back to a codec name through the registry.
  *
- * A scratch page is used as the decompression source because the folio is both
- * source and destination.  Deliberately simple for the prototype: a transient
- * acomp is allocated per call.
+ * Fast path: when the recorded codec matches the current zswap pool's codec,
+ * reuse the pool's per-CPU acomp context (request, wait, and PAGE_SIZE scratch
+ * buffer) under its mutex -- no per-swapin allocation.  Otherwise fall back to
+ * a transient acomp for the recorded codec.
  *
  * Return: true on success (folio now holds the decompressed page), false
  * otherwise.
@@ -1086,14 +1158,10 @@ static unsigned int zswap_copy_blob_to_folio(struct zswap_entry *entry,
 bool zswap_decompress_blob(struct folio *folio, unsigned int clen,
 			   unsigned int algo_id)
 {
+	struct crypto_acomp_ctx *acomp_ctx;
+	struct zswap_pool *pool;
 	const char *codec;
-	struct crypto_acomp *acomp = NULL;
-	struct acomp_req *req = NULL;
-	struct crypto_wait wait;
-	struct scatterlist sg_in, sg_out;
-	struct page *scratch = NULL;
-	void *sbuf, *fbuf;
-	int ret;
+	bool ok;
 
 	if (!clen || clen >= PAGE_SIZE)
 		return false;
@@ -1102,50 +1170,24 @@ bool zswap_decompress_blob(struct folio *folio, unsigned int clen,
 	if (!codec)
 		return false;
 
-	acomp = crypto_alloc_acomp_node(codec, 0, 0, NUMA_NO_NODE);
-	if (IS_ERR(acomp))
+	pool = zswap_pool_current_get();
+	if (!pool)
 		return false;
-	req = acomp_request_alloc(acomp);
-	if (!req)
-		goto err_acomp;
 
-	scratch = alloc_page(GFP_KERNEL);
-	if (!scratch)
-		goto err_req;
+	if (strcmp(pool->tfm_name, codec)) {
+		/* Codec changed since writeback: transient acomp. */
+		zswap_pool_put(pool);
+		return zswap_decompress_blob_slow(folio, clen, codec);
+	}
 
-	/* Move the blob out of the folio into the scratch page. */
-	sbuf = kmap_local_page(scratch);
-	fbuf = kmap_local_folio(folio, 0);
-	memcpy(sbuf, fbuf, clen);
-	kunmap_local(fbuf);
-	kunmap_local(sbuf);
+	acomp_ctx = raw_cpu_ptr(pool->acomp_ctx);
+	mutex_lock(&acomp_ctx->mutex);
+	ok = zswap_decompress_blob_req(folio, clen, acomp_ctx->req,
+				       &acomp_ctx->wait, acomp_ctx->buffer);
+	mutex_unlock(&acomp_ctx->mutex);
 
-	crypto_init_wait(&wait);
-	acomp_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG,
-				   crypto_req_done, &wait);
-
-	sg_init_table(&sg_in, 1);
-	sg_set_page(&sg_in, scratch, clen, 0);
-	sg_init_table(&sg_out, 1);
-	sg_set_folio(&sg_out, folio, PAGE_SIZE, 0);
-	acomp_request_set_params(req, &sg_in, &sg_out, clen, PAGE_SIZE);
-
-	ret = crypto_wait_req(crypto_acomp_decompress(req), &wait);
-	if (!ret && req->dlen == PAGE_SIZE)
-		flush_dcache_folio(folio);
-	else
-		ret = ret ? ret : -EIO;
-
-	__free_page(scratch);
-	acomp_request_free(req);
-	crypto_free_acomp(acomp);
-	return ret == 0;
-
-err_req:
-	acomp_request_free(req);
-err_acomp:
-	crypto_free_acomp(acomp);
-	return false;
+	zswap_pool_put(pool);
+	return ok;
 }
 #endif /* CONFIG_SWAP_GHOST */
 
