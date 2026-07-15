@@ -146,6 +146,7 @@ The prototype is intentionally simple and has not been runtime tested:
   xarrays / a per-cluster ``virtual_table`` as an interim.  In the full virtual
   swap design this state moves into the physical cluster's swap table; the
   interfaces are shaped so callers do not change when it does.
-* Swapin decompression allocates a transient acomp per call rather than reusing
-  a per-CPU codec context.
+* Swapin decompression reuses the zswap pool's per-CPU acomp context on the
+  common path (matching codec); only when the compressor changed between
+  writeback and swapin does it fall back to a transient acomp.
 * The codec name registry is bounded (31 entries) and never freed.
