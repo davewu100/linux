@@ -21,23 +21,23 @@
 #include "backend_842.h"
 
 static const struct zcomp_ops *backends[] = {
-#if IS_ENABLED(CONFIG_ZRAM_BACKEND_LZO)
+#if IS_ENABLED(CONFIG_ZCOMP_BACKEND_LZO)
 	&backend_lzorle,
 	&backend_lzo,
 #endif
-#if IS_ENABLED(CONFIG_ZRAM_BACKEND_LZ4)
+#if IS_ENABLED(CONFIG_ZCOMP_BACKEND_LZ4)
 	&backend_lz4,
 #endif
-#if IS_ENABLED(CONFIG_ZRAM_BACKEND_LZ4HC)
+#if IS_ENABLED(CONFIG_ZCOMP_BACKEND_LZ4HC)
 	&backend_lz4hc,
 #endif
-#if IS_ENABLED(CONFIG_ZRAM_BACKEND_ZSTD)
+#if IS_ENABLED(CONFIG_ZCOMP_BACKEND_ZSTD)
 	&backend_zstd,
 #endif
-#if IS_ENABLED(CONFIG_ZRAM_BACKEND_DEFLATE)
+#if IS_ENABLED(CONFIG_ZCOMP_BACKEND_DEFLATE)
 	&backend_deflate,
 #endif
-#if IS_ENABLED(CONFIG_ZRAM_BACKEND_842)
+#if IS_ENABLED(CONFIG_ZCOMP_BACKEND_842)
 	&backend_842,
 #endif
 	NULL

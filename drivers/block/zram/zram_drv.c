@@ -34,6 +34,7 @@
 #include <linux/part_stat.h>
 #include <linux/kernel_read_file.h>
 #include <linux/rcupdate.h>
+#include <linux/swap_compress.h>
 
 #include "zram_drv.h"
 
@@ -1366,6 +1367,20 @@ static int decompress_bdev_page(struct zram *zram, struct page *page, u32 index)
 	size = get_slot_size(zram, index);
 	prio = get_slot_comp_priority(zram, index);
 
+#ifdef CONFIG_SWAP_COMPRESS
+	if (prio == ZRAM_PRIMARY_COMP) {
+		zstrm = swap_compress_stream_get(zram->primary_comp);
+		src = kmap_local_page(page);
+		ret = swap_decompress(zram->primary_comp, zstrm, src, size,
+				      zstrm->local_copy);
+		if (!ret)
+			copy_page(src, zstrm->local_copy);
+		kunmap_local(src);
+		swap_compress_stream_put(zstrm);
+		slot_unlock(zram, index);
+		return ret;
+	}
+#endif
 	zstrm = zcomp_stream_get(zram->comps[prio]);
 	src = kmap_local_page(page);
 	ret = zcomp_decompress(zram->comps[prio], zstrm, src, size,
@@ -2099,6 +2114,19 @@ static int read_compressed_page(struct zram *zram, struct page *page, u32 index)
 	size = get_slot_size(zram, index);
 	prio = get_slot_comp_priority(zram, index);
 
+#ifdef CONFIG_SWAP_COMPRESS
+	if (prio == ZRAM_PRIMARY_COMP) {
+		zstrm = swap_compress_stream_get(zram->primary_comp);
+		src = zs_obj_read_begin(zram->mem_pool, handle, size,
+					zstrm->local_copy);
+		dst = kmap_local_page(page);
+		ret = swap_decompress(zram->primary_comp, zstrm, src, size, dst);
+		kunmap_local(dst);
+		zs_obj_read_end(zram->mem_pool, handle, size, src);
+		swap_compress_stream_put(zstrm);
+		return ret;
+	}
+#endif
 	zstrm = zcomp_stream_get(zram->comps[prio]);
 	src = zs_obj_read_begin(zram->mem_pool, handle, size,
 				zstrm->local_copy);
@@ -2127,12 +2155,20 @@ static int read_from_zspool_raw(struct zram *zram, struct page *page, u32 index)
 	 * case if object spans two physical pages. No decompression
 	 * takes place here, as we read raw compressed data.
 	 */
+#ifdef CONFIG_SWAP_COMPRESS
+	zstrm = swap_compress_stream_get(zram->primary_comp);
+#else
 	zstrm = zcomp_stream_get(zram->comps[ZRAM_PRIMARY_COMP]);
+#endif
 	src = zs_obj_read_begin(zram->mem_pool, handle, size,
 				zstrm->local_copy);
 	memcpy_to_page(page, 0, src, size);
 	zs_obj_read_end(zram->mem_pool, handle, size, src);
+#ifdef CONFIG_SWAP_COMPRESS
+	swap_compress_stream_put(zstrm);
+#else
 	zcomp_stream_put(zstrm);
+#endif
 
 	memzero_page(page, size, PAGE_SIZE - size);
 
@@ -2283,6 +2319,40 @@ static int zram_write_page(struct zram *zram, struct page *page, u32 index)
 	if (same_filled)
 		return write_same_filled_page(zram, element, index);
 
+#ifdef CONFIG_SWAP_COMPRESS
+	zstrm = swap_compress_stream_get(zram->primary_comp);
+	mem = kmap_local_page(page);
+	ret = swap_compress(zram->primary_comp, zstrm, mem, &comp_len);
+	kunmap_local(mem);
+
+	if (unlikely(ret)) {
+		swap_compress_stream_put(zstrm);
+		pr_err("Compression failed! err=%d\n", ret);
+		return ret;
+	}
+
+	if (comp_len >= huge_class_size) {
+		swap_compress_stream_put(zstrm);
+		return write_incompressible_page(zram, page, index);
+	}
+
+	handle = zs_malloc(zram->mem_pool, comp_len,
+			   GFP_NOIO | __GFP_NOWARN |
+			   __GFP_HIGHMEM | __GFP_MOVABLE, page_to_nid(page));
+	if (IS_ERR_VALUE(handle)) {
+		swap_compress_stream_put(zstrm);
+		return PTR_ERR((void *)handle);
+	}
+
+	if (!zram_can_store_page(zram)) {
+		swap_compress_stream_put(zstrm);
+		zs_free(zram->mem_pool, handle);
+		return -ENOMEM;
+	}
+
+	zs_obj_write(zram->mem_pool, handle, zstrm->buffer, comp_len);
+	swap_compress_stream_put(zstrm);
+#else
 	zstrm = zcomp_stream_get(zram->comps[ZRAM_PRIMARY_COMP]);
 	mem = kmap_local_page(page);
 	ret = zcomp_compress(zram->comps[ZRAM_PRIMARY_COMP], zstrm,
@@ -2316,6 +2386,7 @@ static int zram_write_page(struct zram *zram, struct page *page, u32 index)
 
 	zs_obj_write(zram->mem_pool, handle, zstrm->buffer, comp_len);
 	zcomp_stream_put(zstrm);
+#endif
 
 	slot_lock(zram, index);
 	slot_free(zram, index);
@@ -2827,10 +2898,19 @@ static void zram_destroy_comps(struct zram *zram)
 		struct zcomp *comp = zram->comps[prio];
 
 		zram->comps[prio] = NULL;
+#ifdef CONFIG_SWAP_COMPRESS
+		if (prio == ZRAM_PRIMARY_COMP)
+			continue;
+#endif
 		if (!comp)
 			continue;
 		zcomp_destroy(comp);
 	}
+
+#ifdef CONFIG_SWAP_COMPRESS
+	swap_comp_destroy(zram->primary_comp);
+	zram->primary_comp = NULL;
+#endif
 
 	for (prio = ZRAM_PRIMARY_COMP; prio < ZRAM_MAX_COMPS; prio++)
 		zram->comp_algs[prio] = NULL;
@@ -2884,6 +2964,21 @@ static ssize_t disksize_store(struct device *dev, struct device_attribute *attr,
 		if (!zram->comp_algs[prio])
 			continue;
 
+#ifdef CONFIG_SWAP_COMPRESS
+		if (prio == ZRAM_PRIMARY_COMP) {
+			struct swap_comp *sc;
+
+			sc = swap_comp_create(zram->comp_algs[prio]);
+			if (IS_ERR(sc)) {
+				pr_err("Cannot initialise %s compressing backend\n",
+				       zram->comp_algs[prio]);
+				err = PTR_ERR(sc);
+				goto out_free_comps;
+			}
+			zram->primary_comp = sc;
+			continue;
+		}
+#endif
 		comp = zcomp_create(zram->comp_algs[prio],
 				    &zram->params[prio]);
 		if (IS_ERR(comp)) {
