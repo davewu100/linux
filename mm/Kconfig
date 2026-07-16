@@ -42,6 +42,18 @@ config ZSWAP_DEFAULT_ON
 	  The selection made here can be overridden by using the kernel
 	  command line 'zswap.enabled=' option.
 
+config SWAP_COMPRESS
+	bool "Core swap page compression helpers"
+	depends on SWAP && ZRAM
+	default y
+	help
+	  Compression for swap pages is handled in the mm core.  Backends
+	  such as zram store the compressed result instead of calling the
+	  compressor directly.
+
+	  This is the first step toward treating swap devices as dumb
+	  storage while the virtual swap layer owns swap semantics.
+
 config ZSWAP_SHRINKER_DEFAULT_ON
 	bool "Shrink the zswap pool on memory pressure"
 	depends on ZSWAP

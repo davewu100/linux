@@ -20,6 +20,8 @@
 
 #include "zcomp.h"
 
+struct swap_comp;
+
 #define SECTORS_PER_PAGE_SHIFT	(PAGE_SHIFT - SECTOR_SHIFT)
 #define SECTORS_PER_PAGE	(1 << SECTORS_PER_PAGE_SHIFT)
 #define ZRAM_LOGICAL_BLOCK_SHIFT 12
@@ -110,6 +112,15 @@ struct zram {
 	struct zs_pool *mem_pool;
 	struct zcomp *comps[ZRAM_MAX_COMPS];
 	struct zcomp_params params[ZRAM_MAX_COMPS];
+#ifdef CONFIG_SWAP_COMPRESS
+	/*
+	 * Per-device primary compressor owned by the mm core.  Used instead of
+	 * comps[ZRAM_PRIMARY_COMP] for the primary slot when CONFIG_SWAP_COMPRESS
+	 * is enabled; being per-device (not a global singleton) it avoids
+	 * cross-device stream contention.
+	 */
+	struct swap_comp *primary_comp;
+#endif
 	struct gendisk *disk;
 	/* Locks the device either in exclusive or in shared mode */
 	struct rw_semaphore dev_lock;
