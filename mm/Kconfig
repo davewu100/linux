@@ -89,36 +89,42 @@ choice
 config ZSWAP_COMPRESSOR_DEFAULT_DEFLATE
 	bool "Deflate"
 	select CRYPTO_DEFLATE
+	select ZCOMP_BACKEND_DEFLATE
 	help
 	  Use the Deflate algorithm as the default compression algorithm.
 
 config ZSWAP_COMPRESSOR_DEFAULT_LZO
 	bool "LZO"
 	select CRYPTO_LZO
+	select ZCOMP_BACKEND_LZO
 	help
 	  Use the LZO algorithm as the default compression algorithm.
 
 config ZSWAP_COMPRESSOR_DEFAULT_842
 	bool "842"
 	select CRYPTO_842
+	select ZCOMP_BACKEND_842
 	help
 	  Use the 842 algorithm as the default compression algorithm.
 
 config ZSWAP_COMPRESSOR_DEFAULT_LZ4
 	bool "LZ4"
 	select CRYPTO_LZ4
+	select ZCOMP_BACKEND_LZ4
 	help
 	  Use the LZ4 algorithm as the default compression algorithm.
 
 config ZSWAP_COMPRESSOR_DEFAULT_LZ4HC
 	bool "LZ4HC"
 	select CRYPTO_LZ4HC
+	select ZCOMP_BACKEND_LZ4HC
 	help
 	  Use the LZ4HC algorithm as the default compression algorithm.
 
 config ZSWAP_COMPRESSOR_DEFAULT_ZSTD
 	bool "zstd"
 	select CRYPTO_ZSTD
+	select ZCOMP_BACKEND_ZSTD
 	help
 	  Use the zstd algorithm as the default compression algorithm.
 endchoice
