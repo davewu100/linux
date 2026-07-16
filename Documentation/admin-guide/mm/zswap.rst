@@ -93,6 +93,17 @@ made for a page in an old pool, it is uncompressed using its original
 compressor.  Once all pages are removed from an old pool, the pool and its
 compressor are freed.
 
+Internally zswap routes each pool to one of two compression backends
+depending on the selected algorithm.  Software-only algorithms shared with
+zram (e.g. lzo, lzo-rle, lz4hc) are handled by the in-kernel ``lib/zcomp``
+library, the same code zram uses, without going through the crypto API.
+Algorithms whose generic name may also be claimed by a crypto
+hardware/offload driver (deflate, lz4, zstd, 842) stay on the crypto acomp
+API so that a higher-priority accelerator (e.g. deflate-iaa, 842-nx,
+hisi-lz4-acomp, qat_zstd) is used when present instead of being bypassed.
+This routing is transparent: the ``compressor`` attribute and its accepted
+values are unchanged.
+
 Some of the pages in zswap are same-value filled pages (i.e. contents of the
 page have same value or repetitive pattern). These pages include zero-filled
 pages and they are handled differently. During store operation, a page is

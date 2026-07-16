@@ -40,6 +40,8 @@
 #include "swap.h"
 #include "internal.h"
 
+#include "zcomp.h"
+
 /*********************************
 * statistics
 **********************************/
@@ -144,6 +146,11 @@ struct crypto_acomp_ctx {
 	struct mutex mutex;
 };
 
+enum zswap_comp_backend {
+	ZSWAP_BACKEND_CRYPTO,
+	ZSWAP_BACKEND_ZCOMP,
+};
+
 /*
  * The lock ordering is zswap_tree.lock -> zswap_pool.lru_lock.
  * The only case where lru_lock is not acquired while holding tree.lock is
@@ -152,7 +159,9 @@ struct crypto_acomp_ctx {
  */
 struct zswap_pool {
 	struct zs_pool *zs_pool;
+	enum zswap_comp_backend backend;
 	struct crypto_acomp_ctx __percpu *acomp_ctx;
+	struct zcomp *zcomp;
 	struct percpu_ref ref;
 	struct list_head list;
 	struct work_struct release_work;
@@ -242,6 +251,51 @@ static inline struct xarray *swap_zswap_tree(swp_entry_t swp)
 **********************************/
 static void __zswap_pool_empty(struct percpu_ref *ref);
 
+/*
+ * Generic names that in-tree crypto hardware/offload drivers also register
+ * under the same cra_name.  For these, staying on crypto lets it pick the
+ * higher-priority hardware implementation when present (e.g. deflate-iaa,
+ * 842-nx, hisi-lz4-acomp, qat_zstd); routing them through lib/zcomp would
+ * silently bypass the accelerator and change behaviour vs. before the
+ * backend split.  Software-only names fall through to zcomp.
+ */
+static const char * const zswap_crypto_only_algs[] = {
+	"deflate",
+	"lz4",
+	"zstd",
+	"842",
+};
+
+static enum zswap_comp_backend zswap_compressor_backend(const char *alg)
+{
+	int i;
+
+	/*
+	 * lib/zcomp only knows software algorithms, so its backend table is
+	 * the single source of truth: names it recognizes are shared with
+	 * zram.  But some names are also claimed by crypto hardware/offload
+	 * drivers, so keep those on crypto unconditionally (see the list
+	 * above) to avoid bypassing an accelerator.  Everything else that
+	 * zcomp recognizes is software-only and routes through zcomp.
+	 */
+	for (i = 0; i < ARRAY_SIZE(zswap_crypto_only_algs); i++)
+		if (!strcmp(alg, zswap_crypto_only_algs[i]))
+			return ZSWAP_BACKEND_CRYPTO;
+
+	if (zcomp_lookup_backend_name(alg))
+		return ZSWAP_BACKEND_ZCOMP;
+
+	return ZSWAP_BACKEND_CRYPTO;
+}
+
+static bool zswap_compressor_available(const char *alg)
+{
+	if (zswap_compressor_backend(alg) == ZSWAP_BACKEND_ZCOMP)
+		return zcomp_lookup_backend_name(alg) != NULL;
+
+	return crypto_has_acomp(alg, 0, 0);
+}
+
 static void acomp_ctx_free(struct crypto_acomp_ctx *acomp_ctx)
 {
 	if (!acomp_ctx)
@@ -290,28 +344,41 @@ static struct zswap_pool *zswap_pool_create(char *compressor)
 		goto error;
 
 	strscpy(pool->tfm_name, compressor, sizeof(pool->tfm_name));
+	pool->backend = zswap_compressor_backend(compressor);
 
-	/* Many things rely on the zero-initialization. */
-	pool->acomp_ctx = alloc_percpu_gfp(*pool->acomp_ctx,
-					   GFP_KERNEL | __GFP_ZERO);
-	if (!pool->acomp_ctx) {
-		pr_err("percpu alloc failed\n");
-		goto error;
+	if (pool->backend == ZSWAP_BACKEND_ZCOMP) {
+		pool->zcomp = zcomp_create(compressor, &(struct zcomp_params){
+			.level = ZCOMP_PARAM_NOT_SET,
+			.deflate.winbits = ZCOMP_PARAM_NOT_SET,
+		});
+		if (IS_ERR(pool->zcomp)) {
+			pr_err("zcomp %s init failed: %ld\n", compressor,
+			       PTR_ERR(pool->zcomp));
+			goto error;
+		}
+	} else {
+		/* Many things rely on the zero-initialization. */
+		pool->acomp_ctx = alloc_percpu_gfp(*pool->acomp_ctx,
+						   GFP_KERNEL | __GFP_ZERO);
+		if (!pool->acomp_ctx) {
+			pr_err("percpu alloc failed\n");
+			goto error;
+		}
+
+		/*
+		 * This is serialized against CPU hotplug operations. Hence, cores
+		 * cannot be offlined until this finishes.
+		 */
+		ret = cpuhp_state_add_instance(CPUHP_MM_ZSWP_POOL_PREPARE,
+					       &pool->node);
+
+		/*
+		 * cpuhp_state_add_instance() will not cleanup on failure since
+		 * we don't register a hotunplug callback.
+		 */
+		if (ret)
+			goto cpuhp_add_fail;
 	}
-
-	/*
-	 * This is serialized against CPU hotplug operations. Hence, cores
-	 * cannot be offlined until this finishes.
-	 */
-	ret = cpuhp_state_add_instance(CPUHP_MM_ZSWP_POOL_PREPARE,
-				       &pool->node);
-
-	/*
-	 * cpuhp_state_add_instance() will not cleanup on failure since
-	 * we don't register a hotunplug callback.
-	 */
-	if (ret)
-		goto cpuhp_add_fail;
 
 	/* being the current pool takes 1 ref; this func expects the
 	 * caller to always add the new pool as the current pool
@@ -327,12 +394,19 @@ static struct zswap_pool *zswap_pool_create(char *compressor)
 	return pool;
 
 ref_fail:
-	cpuhp_state_remove_instance(CPUHP_MM_ZSWP_POOL_PREPARE, &pool->node);
+	if (pool->backend == ZSWAP_BACKEND_CRYPTO)
+		cpuhp_state_remove_instance(CPUHP_MM_ZSWP_POOL_PREPARE,
+					    &pool->node);
 
 cpuhp_add_fail:
-	for_each_possible_cpu(cpu)
-		acomp_ctx_free(per_cpu_ptr(pool->acomp_ctx, cpu));
+	if (pool->backend == ZSWAP_BACKEND_CRYPTO) {
+		for_each_possible_cpu(cpu)
+			acomp_ctx_free(per_cpu_ptr(pool->acomp_ctx, cpu));
+	}
 error:
+	if (pool->backend == ZSWAP_BACKEND_ZCOMP &&
+	    !IS_ERR_OR_NULL(pool->zcomp))
+		zcomp_destroy(pool->zcomp);
 	if (pool->acomp_ctx)
 		free_percpu(pool->acomp_ctx);
 	if (pool->zs_pool)
@@ -343,7 +417,7 @@ error:
 
 static struct zswap_pool *__zswap_pool_create_fallback(void)
 {
-	if (!crypto_has_acomp(zswap_compressor, 0, 0) &&
+	if (!zswap_compressor_available(zswap_compressor) &&
 	    strcmp(zswap_compressor, CONFIG_ZSWAP_COMPRESSOR_DEFAULT)) {
 		pr_err("compressor %s not available, using default %s\n",
 		       zswap_compressor, CONFIG_ZSWAP_COMPRESSOR_DEFAULT);
@@ -352,7 +426,7 @@ static struct zswap_pool *__zswap_pool_create_fallback(void)
 	}
 
 	/* Default compressor should be available. Kconfig bug? */
-	if (WARN_ON_ONCE(!crypto_has_acomp(zswap_compressor, 0, 0))) {
+	if (WARN_ON_ONCE(!zswap_compressor_available(zswap_compressor))) {
 		zswap_compressor = ZSWAP_PARAM_UNSET;
 		return NULL;
 	}
@@ -366,12 +440,17 @@ static void zswap_pool_destroy(struct zswap_pool *pool)
 
 	zswap_pool_debug("destroying", pool);
 
-	cpuhp_state_remove_instance(CPUHP_MM_ZSWP_POOL_PREPARE, &pool->node);
+	if (pool->backend == ZSWAP_BACKEND_ZCOMP) {
+		zcomp_destroy(pool->zcomp);
+	} else {
+		cpuhp_state_remove_instance(CPUHP_MM_ZSWP_POOL_PREPARE,
+					    &pool->node);
 
-	for_each_possible_cpu(cpu)
-		acomp_ctx_free(per_cpu_ptr(pool->acomp_ctx, cpu));
+		for_each_possible_cpu(cpu)
+			acomp_ctx_free(per_cpu_ptr(pool->acomp_ctx, cpu));
 
-	free_percpu(pool->acomp_ctx);
+		free_percpu(pool->acomp_ctx);
+	}
 
 	zs_destroy_pool(pool->zs_pool);
 	kfree(pool);
@@ -551,7 +630,7 @@ static int zswap_compressor_param_set(const char *val, const struct kernel_param
 	if (!create_pool)
 		return ret;
 
-	if (!crypto_has_acomp(s, 0, 0)) {
+	if (!zswap_compressor_available(s)) {
 		pr_err("compressor %s not available\n", s);
 		return -ENOENT;
 	}
@@ -783,8 +862,13 @@ static void zswap_entry_free(struct zswap_entry *entry)
 static int zswap_cpu_comp_prepare(unsigned int cpu, struct hlist_node *node)
 {
 	struct zswap_pool *pool = hlist_entry(node, struct zswap_pool, node);
-	struct crypto_acomp_ctx *acomp_ctx = per_cpu_ptr(pool->acomp_ctx, cpu);
+	struct crypto_acomp_ctx *acomp_ctx;
 	int ret = -ENOMEM;
+
+	if (pool->backend != ZSWAP_BACKEND_CRYPTO)
+		return 0;
+
+	acomp_ctx = per_cpu_ptr(pool->acomp_ctx, cpu);
 
 	/*
 	 * To handle cases where the CPU goes through online-offline-online
@@ -837,26 +921,178 @@ fail:
 	return ret;
 }
 
-static bool zswap_compress(struct page *page, struct zswap_entry *entry,
-			   struct zswap_pool *pool)
+/*
+ * Store the compression result of @page into the zsmalloc pool.
+ *
+ * @dst / @dlen describe the compressor output and @comp_ret is the
+ * compressor return value.  This is the backend-independent tail shared by
+ * the zcomp and crypto compress paths: it handles the incompressible page
+ * case, allocates the zsmalloc object, writes it out and bumps the reject
+ * counters.  The caller still owns the per-CPU compression context (stream
+ * or acomp mutex) and must release it after this returns.
+ *
+ * Returns true on success.
+ */
+static bool zswap_store_compressed(struct page *page, struct zswap_entry *entry,
+				   struct zswap_pool *pool, u8 *dst,
+				   unsigned int dlen, int comp_ret)
+{
+	int alloc_ret = 0;
+	unsigned long handle;
+	bool mapped = false;
+	gfp_t gfp;
+
+	if (comp_ret || !dlen || dlen >= PAGE_SIZE) {
+		/*
+		 * If a page cannot be compressed into a size smaller than
+		 * PAGE_SIZE, save the content as is without a compression, to
+		 * keep the LRU order of writebacks.  If writeback is disabled,
+		 * reject the page since it only adds metadata overhead.
+		 * swap_writeout() will put the page back to the active LRU
+		 * list in that case.
+		 */
+		rcu_read_lock();
+		if (!mem_cgroup_zswap_writeback_enabled(
+					folio_memcg(page_folio(page)))) {
+			rcu_read_unlock();
+			comp_ret = comp_ret ? comp_ret : -EINVAL;
+			goto out;
+		}
+		rcu_read_unlock();
+		comp_ret = 0;
+		dlen = PAGE_SIZE;
+		dst = kmap_local_page(page);
+		mapped = true;
+	}
+
+	gfp = GFP_NOWAIT | __GFP_NORETRY | __GFP_HIGHMEM | __GFP_MOVABLE;
+	handle = zs_malloc(pool->zs_pool, dlen, gfp, page_to_nid(page));
+	if (IS_ERR_VALUE(handle)) {
+		alloc_ret = PTR_ERR((void *)handle);
+		goto out;
+	}
+
+	zs_obj_write(pool->zs_pool, handle, dst, dlen);
+	entry->handle = handle;
+	entry->length = dlen;
+
+out:
+	if (mapped)
+		kunmap_local(dst);
+	if (comp_ret == -ENOSPC || alloc_ret == -ENOSPC)
+		zswap_reject_compress_poor++;
+	else if (comp_ret)
+		zswap_reject_compress_fail++;
+	else if (alloc_ret)
+		zswap_reject_alloc_fail++;
+
+	return comp_ret == 0 && alloc_ret == 0;
+}
+
+static bool zswap_zcomp_compress(struct page *page, struct zswap_entry *entry,
+				 struct zswap_pool *pool)
+{
+	struct zcomp_strm *zstrm;
+	void *mem;
+	int comp_ret;
+	unsigned int dlen;
+	bool ret;
+
+	zstrm = zcomp_stream_get(pool->zcomp);
+	mem = kmap_local_page(page);
+	comp_ret = zcomp_compress(pool->zcomp, zstrm, mem, &dlen);
+	kunmap_local(mem);
+
+	ret = zswap_store_compressed(page, entry, pool, zstrm->buffer, dlen,
+				     comp_ret);
+	zcomp_stream_put(zstrm);
+	return ret;
+}
+
+/*
+ * Fast path for an entry that was stored uncompressed (length == PAGE_SIZE):
+ * copy the raw bytes straight from the zsmalloc SG list into @folio.  Shared
+ * by the zcomp and crypto decompress paths.
+ */
+static void zswap_decompress_copy_page(struct folio *folio,
+				       struct scatterlist *input)
+{
+	void *dst = kmap_local_folio(folio, 0);
+
+	memcpy_from_sglist(dst, input, 0, PAGE_SIZE);
+	kunmap_local(dst);
+	flush_dcache_folio(folio);
+}
+
+static bool zswap_decompress_failed(struct zswap_entry *entry, int dlen)
+{
+	zswap_decompress_fail++;
+	pr_alert_ratelimited("Decompression error from zswap (%d:%lu %s %u->%d)\n",
+			     swp_type(entry->swpentry), swp_offset(entry->swpentry),
+			     entry->pool->tfm_name, entry->length, dlen);
+	return false;
+}
+
+static bool zswap_zcomp_decompress(struct zswap_entry *entry, struct folio *folio)
+{
+	struct zswap_pool *pool = entry->pool;
+	struct scatterlist input[2];
+	struct zcomp_strm *zstrm;
+	void *dst, *src;
+	int ret = 0;
+
+	zstrm = zcomp_stream_get(pool->zcomp);
+	zs_obj_read_sg_begin(pool->zs_pool, entry->handle, input, entry->length);
+
+	if (entry->length == PAGE_SIZE) {
+		zswap_decompress_copy_page(folio, input);
+	} else {
+		dst = kmap_local_folio(folio, 0);
+		/*
+		 * zcomp_decompress() only takes a single contiguous source
+		 * buffer, but zsmalloc may hand back the object as an SG list
+		 * spanning up to two entries.  Gather the compressed bytes into
+		 * the per-CPU stream's local_copy first.  Unlike the crypto
+		 * path, which passes the SG list straight to acomp, zcomp needs
+		 * this extra copy; it is cheap since it only moves the (already
+		 * small) compressed data, not a full page.
+		 *
+		 * zcomp always decompresses into a full PAGE_SIZE destination
+		 * and does not report an output length, so a zero return is
+		 * the only success indication (like zram).
+		 */
+		src = zstrm->local_copy;
+		memcpy_from_sglist(src, input, 0, entry->length);
+		ret = zcomp_decompress(pool->zcomp, zstrm, src, entry->length, dst);
+		kunmap_local(dst);
+		flush_dcache_folio(folio);
+	}
+
+	zs_obj_read_sg_end(pool->zs_pool, entry->handle);
+	zcomp_stream_put(zstrm);
+
+	if (!ret)
+		return true;
+
+	return zswap_decompress_failed(entry, PAGE_SIZE);
+}
+
+static bool zswap_crypto_compress(struct page *page, struct zswap_entry *entry,
+				  struct zswap_pool *pool)
 {
 	struct crypto_acomp_ctx *acomp_ctx;
 	struct scatterlist input, output;
-	int comp_ret = 0, alloc_ret = 0;
 	unsigned int dlen = PAGE_SIZE;
-	unsigned long handle;
-	gfp_t gfp;
-	u8 *dst;
-	bool mapped = false;
+	int comp_ret;
+	bool ret;
 
 	acomp_ctx = raw_cpu_ptr(pool->acomp_ctx);
 	mutex_lock(&acomp_ctx->mutex);
 
-	dst = acomp_ctx->buffer;
 	sg_init_table(&input, 1);
 	sg_set_page(&input, page, PAGE_SIZE, 0);
 
-	sg_init_one(&output, dst, PAGE_SIZE);
+	sg_init_one(&output, acomp_ctx->buffer, PAGE_SIZE);
 	acomp_request_set_params(acomp_ctx->req, &input, &output, PAGE_SIZE, dlen);
 
 	/*
@@ -874,54 +1110,22 @@ static bool zswap_compress(struct page *page, struct zswap_entry *entry,
 	comp_ret = crypto_wait_req(crypto_acomp_compress(acomp_ctx->req), &acomp_ctx->wait);
 	dlen = acomp_ctx->req->dlen;
 
-	/*
-	 * If a page cannot be compressed into a size smaller than PAGE_SIZE,
-	 * save the content as is without a compression, to keep the LRU order
-	 * of writebacks.  If writeback is disabled, reject the page since it
-	 * only adds metadata overhead.  swap_writeout() will put the page back
-	 * to the active LRU list in the case.
-	 */
-	if (comp_ret || !dlen || dlen >= PAGE_SIZE) {
-		rcu_read_lock();
-		if (!mem_cgroup_zswap_writeback_enabled(
-					folio_memcg(page_folio(page)))) {
-			rcu_read_unlock();
-			comp_ret = comp_ret ? comp_ret : -EINVAL;
-			goto unlock;
-		}
-		rcu_read_unlock();
-		comp_ret = 0;
-		dlen = PAGE_SIZE;
-		dst = kmap_local_page(page);
-		mapped = true;
-	}
-
-	gfp = GFP_NOWAIT | __GFP_NORETRY | __GFP_HIGHMEM | __GFP_MOVABLE;
-	handle = zs_malloc(pool->zs_pool, dlen, gfp, page_to_nid(page));
-	if (IS_ERR_VALUE(handle)) {
-		alloc_ret = PTR_ERR((void *)handle);
-		goto unlock;
-	}
-
-	zs_obj_write(pool->zs_pool, handle, dst, dlen);
-	entry->handle = handle;
-	entry->length = dlen;
-
-unlock:
-	if (mapped)
-		kunmap_local(dst);
-	if (comp_ret == -ENOSPC || alloc_ret == -ENOSPC)
-		zswap_reject_compress_poor++;
-	else if (comp_ret)
-		zswap_reject_compress_fail++;
-	else if (alloc_ret)
-		zswap_reject_alloc_fail++;
-
+	ret = zswap_store_compressed(page, entry, pool, acomp_ctx->buffer, dlen,
+				     comp_ret);
 	mutex_unlock(&acomp_ctx->mutex);
-	return comp_ret == 0 && alloc_ret == 0;
+	return ret;
 }
 
-static bool zswap_decompress(struct zswap_entry *entry, struct folio *folio)
+static bool zswap_compress(struct page *page, struct zswap_entry *entry,
+			   struct zswap_pool *pool)
+{
+	if (pool->backend == ZSWAP_BACKEND_ZCOMP)
+		return zswap_zcomp_compress(page, entry, pool);
+
+	return zswap_crypto_compress(page, entry, pool);
+}
+
+static bool zswap_crypto_decompress(struct zswap_entry *entry, struct folio *folio)
 {
 	struct zswap_pool *pool = entry->pool;
 	struct scatterlist input[2]; /* zsmalloc returns an SG list 1-2 entries */
@@ -935,15 +1139,9 @@ static bool zswap_decompress(struct zswap_entry *entry, struct folio *folio)
 
 	/* zswap entries of length PAGE_SIZE are not compressed. */
 	if (entry->length == PAGE_SIZE) {
-		void *dst;
-
 		WARN_ON_ONCE(input->length != PAGE_SIZE);
-
-		dst = kmap_local_folio(folio, 0);
-		memcpy_from_sglist(dst, input, 0, PAGE_SIZE);
+		zswap_decompress_copy_page(folio, input);
 		dlen = PAGE_SIZE;
-		kunmap_local(dst);
-		flush_dcache_folio(folio);
 	} else {
 		sg_init_table(&output, 1);
 		sg_set_folio(&output, folio, PAGE_SIZE, 0);
@@ -960,13 +1158,17 @@ static bool zswap_decompress(struct zswap_entry *entry, struct folio *folio)
 	if (!ret && dlen == PAGE_SIZE)
 		return true;
 
-	zswap_decompress_fail++;
-	pr_alert_ratelimited("Decompression error from zswap (%d:%lu %s %u->%d)\n",
-						swp_type(entry->swpentry),
-						swp_offset(entry->swpentry),
-						entry->pool->tfm_name,
-						entry->length, dlen);
-	return false;
+	return zswap_decompress_failed(entry, dlen);
+}
+
+static bool zswap_decompress(struct zswap_entry *entry, struct folio *folio)
+{
+	struct zswap_pool *pool = entry->pool;
+
+	if (pool->backend == ZSWAP_BACKEND_ZCOMP)
+		return zswap_zcomp_decompress(entry, folio);
+
+	return zswap_crypto_decompress(entry, folio);
 }
 
 /*********************************

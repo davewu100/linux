@@ -23,6 +23,7 @@ config ZSWAP
 	bool "Compressed cache for swap pages"
 	depends on SWAP
 	select CRYPTO
+	select ZCOMP
 	select ZSMALLOC
 	help
 	  A lightweight compressed cache for swap pages.  It takes
@@ -82,7 +83,7 @@ config ZSWAP_COMPRESSOR_DEFAULT_DEFLATE
 
 config ZSWAP_COMPRESSOR_DEFAULT_LZO
 	bool "LZO"
-	select CRYPTO_LZO
+	select ZCOMP_BACKEND_LZO
 	help
 	  Use the LZO algorithm as the default compression algorithm.
 
@@ -100,7 +101,7 @@ config ZSWAP_COMPRESSOR_DEFAULT_LZ4
 
 config ZSWAP_COMPRESSOR_DEFAULT_LZ4HC
 	bool "LZ4HC"
-	select CRYPTO_LZ4HC
+	select ZCOMP_BACKEND_LZ4HC
 	help
 	  Use the LZ4HC algorithm as the default compression algorithm.
 
