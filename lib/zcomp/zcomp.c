@@ -21,23 +21,23 @@
 #include "backend_842.h"
 
 static const struct zcomp_ops *backends[] = {
-#if IS_ENABLED(CONFIG_ZRAM_BACKEND_LZO)
+#if IS_ENABLED(CONFIG_ZCOMP_BACKEND_LZO)
 	&backend_lzorle,
 	&backend_lzo,
 #endif
-#if IS_ENABLED(CONFIG_ZRAM_BACKEND_LZ4)
+#if IS_ENABLED(CONFIG_ZCOMP_BACKEND_LZ4)
 	&backend_lz4,
 #endif
-#if IS_ENABLED(CONFIG_ZRAM_BACKEND_LZ4HC)
+#if IS_ENABLED(CONFIG_ZCOMP_BACKEND_LZ4HC)
 	&backend_lz4hc,
 #endif
-#if IS_ENABLED(CONFIG_ZRAM_BACKEND_ZSTD)
+#if IS_ENABLED(CONFIG_ZCOMP_BACKEND_ZSTD)
 	&backend_zstd,
 #endif
-#if IS_ENABLED(CONFIG_ZRAM_BACKEND_DEFLATE)
+#if IS_ENABLED(CONFIG_ZCOMP_BACKEND_DEFLATE)
 	&backend_deflate,
 #endif
-#if IS_ENABLED(CONFIG_ZRAM_BACKEND_842)
+#if IS_ENABLED(CONFIG_ZCOMP_BACKEND_842)
 	&backend_842,
 #endif
 	NULL
@@ -92,6 +92,33 @@ const char *zcomp_lookup_backend_name(const char *comp)
 		return backend->name;
 
 	return NULL;
+}
+
+/*
+ * Stable, build-time identifier for a backend: its index in backends[].
+ * The index depends only on which ZCOMP_BACKEND_* options are enabled, so it
+ * is stable for the lifetime of a kernel image and can be persisted alongside
+ * a stored blob to record which codec produced it.  Returns a negative value
+ * for an unknown algorithm name.
+ */
+int zcomp_lookup_backend_id(const char *comp)
+{
+	int i = 0;
+
+	while (backends[i]) {
+		if (sysfs_streq(comp, backends[i]->name))
+			return i;
+		i++;
+	}
+	return -EINVAL;
+}
+
+/* Reverse of zcomp_lookup_backend_id(): name for a backend id, or NULL. */
+const char *zcomp_backend_name_by_id(int id)
+{
+	if (id < 0 || id >= ARRAY_SIZE(backends) - 1)
+		return NULL;
+	return backends[id]->name;
 }
 
 /* show available compressors */
