@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: GPL-2.0-only
 
 menu "zcomp compressor backends"
-	depends on ZRAM || SWAP_COMPRESS
+	depends on ZCOMP
 
 config ZCOMP_BACKEND_LZ4
 	bool "lz4 compression support"
-	depends on ZRAM || SWAP_COMPRESS
+	depends on ZCOMP
 	select LZ4_COMPRESS
 	select LZ4_DECOMPRESS
 	help
@@ -18,7 +18,7 @@ config ZCOMP_BACKEND_LZ4
 
 config ZCOMP_BACKEND_LZ4HC
 	bool "lz4hc compression support"
-	depends on ZRAM || SWAP_COMPRESS
+	depends on ZCOMP
 	select LZ4HC_COMPRESS
 	select LZ4_DECOMPRESS
 	help
@@ -31,7 +31,7 @@ config ZCOMP_BACKEND_LZ4HC
 
 config ZCOMP_BACKEND_ZSTD
 	bool "zstd compression support"
-	depends on ZRAM || SWAP_COMPRESS
+	depends on ZCOMP
 	select ZSTD_COMPRESS
 	select ZSTD_DECOMPRESS
 	help
@@ -44,7 +44,7 @@ config ZCOMP_BACKEND_ZSTD
 
 config ZCOMP_BACKEND_DEFLATE
 	bool "deflate compression support"
-	depends on ZRAM || SWAP_COMPRESS
+	depends on ZCOMP
 	select ZLIB_DEFLATE
 	select ZLIB_INFLATE
 	help
@@ -58,7 +58,7 @@ config ZCOMP_BACKEND_DEFLATE
 
 config ZCOMP_BACKEND_842
 	bool "842 compression support"
-	depends on ZRAM || SWAP_COMPRESS
+	depends on ZCOMP
 	select 842_COMPRESS
 	select 842_DECOMPRESS
 	help
@@ -70,14 +70,14 @@ config ZCOMP_BACKEND_842
 	  If unsure, say N.
 
 config ZCOMP_BACKEND_FORCE_LZO
-	depends on ZRAM || SWAP_COMPRESS
+	depends on ZCOMP
 	def_bool !ZCOMP_BACKEND_LZ4 && !ZCOMP_BACKEND_LZ4HC && \
 		!ZCOMP_BACKEND_ZSTD && !ZCOMP_BACKEND_DEFLATE && \
 		!ZCOMP_BACKEND_842
 
 config ZCOMP_BACKEND_LZO
 	bool "lzo and lzo-rle compression support" if !ZCOMP_BACKEND_FORCE_LZO
-	depends on ZRAM || SWAP_COMPRESS
+	depends on ZCOMP
 	default ZCOMP_BACKEND_FORCE_LZO
 	select LZO_COMPRESS
 	select LZO_DECOMPRESS

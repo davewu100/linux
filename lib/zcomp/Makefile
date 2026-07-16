@@ -9,4 +9,4 @@ libzcomp-$(CONFIG_ZCOMP_BACKEND_ZSTD)	+= backend_zstd.o
 libzcomp-$(CONFIG_ZCOMP_BACKEND_DEFLATE)	+= backend_deflate.o
 libzcomp-$(CONFIG_ZCOMP_BACKEND_842)	+= backend_842.o
 
-obj-$(CONFIG_ZRAM)	+= libzcomp.o
+obj-$(CONFIG_ZCOMP)	+= libzcomp.o
