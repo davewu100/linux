@@ -138,6 +138,12 @@ config TRACE_MMIO_ACCESS
 
 source "lib/crc/Kconfig"
 source "lib/crypto/Kconfig"
+
+config ZCOMP
+	bool
+	default y if ZRAM
+
+source "lib/zcomp/Kconfig"
 source "lib/raid/Kconfig"
 
 config XXHASH

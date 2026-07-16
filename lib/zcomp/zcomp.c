@@ -3,6 +3,7 @@
 #include <linux/kernel.h>
 #include <linux/string.h>
 #include <linux/err.h>
+#include <linux/export.h>
 #include <linux/slab.h>
 #include <linux/wait.h>
 #include <linux/sched.h>
@@ -21,23 +22,23 @@
 #include "backend_842.h"
 
 static const struct zcomp_ops *backends[] = {
-#if IS_ENABLED(CONFIG_ZRAM_BACKEND_LZO)
+#if IS_ENABLED(CONFIG_ZCOMP_BACKEND_LZO)
 	&backend_lzorle,
 	&backend_lzo,
 #endif
-#if IS_ENABLED(CONFIG_ZRAM_BACKEND_LZ4)
+#if IS_ENABLED(CONFIG_ZCOMP_BACKEND_LZ4)
 	&backend_lz4,
 #endif
-#if IS_ENABLED(CONFIG_ZRAM_BACKEND_LZ4HC)
+#if IS_ENABLED(CONFIG_ZCOMP_BACKEND_LZ4HC)
 	&backend_lz4hc,
 #endif
-#if IS_ENABLED(CONFIG_ZRAM_BACKEND_ZSTD)
+#if IS_ENABLED(CONFIG_ZCOMP_BACKEND_ZSTD)
 	&backend_zstd,
 #endif
-#if IS_ENABLED(CONFIG_ZRAM_BACKEND_DEFLATE)
+#if IS_ENABLED(CONFIG_ZCOMP_BACKEND_DEFLATE)
 	&backend_deflate,
 #endif
-#if IS_ENABLED(CONFIG_ZRAM_BACKEND_842)
+#if IS_ENABLED(CONFIG_ZCOMP_BACKEND_842)
 	&backend_842,
 #endif
 	NULL
@@ -93,6 +94,7 @@ const char *zcomp_lookup_backend_name(const char *comp)
 
 	return NULL;
 }
+EXPORT_SYMBOL_GPL(zcomp_lookup_backend_name);
 
 /* show available compressors */
 ssize_t zcomp_available_show(const char *comp, char *buf, ssize_t at)
@@ -111,6 +113,7 @@ ssize_t zcomp_available_show(const char *comp, char *buf, ssize_t at)
 	at += sysfs_emit_at(buf, at, "\n");
 	return at;
 }
+EXPORT_SYMBOL_GPL(zcomp_available_show);
 
 struct zcomp_strm *zcomp_stream_get(struct zcomp *comp)
 {
@@ -133,11 +136,13 @@ struct zcomp_strm *zcomp_stream_get(struct zcomp *comp)
 		mutex_unlock(&zstrm->lock);
 	}
 }
+EXPORT_SYMBOL_GPL(zcomp_stream_get);
 
 void zcomp_stream_put(struct zcomp_strm *zstrm)
 {
 	mutex_unlock(&zstrm->lock);
 }
+EXPORT_SYMBOL_GPL(zcomp_stream_put);
 
 int zcomp_compress(struct zcomp *comp, struct zcomp_strm *zstrm,
 		   const void *src, unsigned int *dst_len)
@@ -156,6 +161,7 @@ int zcomp_compress(struct zcomp *comp, struct zcomp_strm *zstrm,
 		*dst_len = req.dst_len;
 	return ret;
 }
+EXPORT_SYMBOL_GPL(zcomp_compress);
 
 int zcomp_decompress(struct zcomp *comp, struct zcomp_strm *zstrm,
 		     const void *src, unsigned int src_len, void *dst)
@@ -170,6 +176,7 @@ int zcomp_decompress(struct zcomp *comp, struct zcomp_strm *zstrm,
 	might_sleep();
 	return comp->ops->decompress(comp->params, &zstrm->ctx, &req);
 }
+EXPORT_SYMBOL_GPL(zcomp_decompress);
 
 int zcomp_cpu_up_prepare(unsigned int cpu, struct hlist_node *node)
 {
@@ -182,6 +189,7 @@ int zcomp_cpu_up_prepare(unsigned int cpu, struct hlist_node *node)
 		pr_err("Can't allocate a compression stream\n");
 	return ret;
 }
+EXPORT_SYMBOL_GPL(zcomp_cpu_up_prepare);
 
 int zcomp_cpu_dead(unsigned int cpu, struct hlist_node *node)
 {
@@ -193,6 +201,7 @@ int zcomp_cpu_dead(unsigned int cpu, struct hlist_node *node)
 	mutex_unlock(&zstrm->lock);
 	return 0;
 }
+EXPORT_SYMBOL_GPL(zcomp_cpu_dead);
 
 static int zcomp_init(struct zcomp *comp, struct zcomp_params *params)
 {
@@ -229,6 +238,7 @@ void zcomp_destroy(struct zcomp *comp)
 	free_percpu(comp->stream);
 	kfree(comp);
 }
+EXPORT_SYMBOL_GPL(zcomp_destroy);
 
 struct zcomp *zcomp_create(const char *alg, struct zcomp_params *params)
 {
@@ -260,3 +270,4 @@ struct zcomp *zcomp_create(const char *alg, struct zcomp_params *params)
 	}
 	return comp;
 }
+EXPORT_SYMBOL_GPL(zcomp_create);
