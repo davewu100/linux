@@ -8,6 +8,8 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/crypto.h>
+#include <linux/sched.h>
+#include <linux/mm.h>
 #include <linux/swap_compress.h>
 
 #include "zcomp.h"
@@ -55,6 +57,18 @@ static int swap_comp_ensure(void)
 	return ret;
 }
 
+/*
+ * Change the shared core-swap compressor.
+ *
+ * WARNING: compressed-blob passthrough (see
+ * Documentation/mm/core-swap-compressed-passthrough.md) stores blobs on the
+ * backing device that can only be decoded by the codec that produced them.
+ * Changing the codec while such blobs are live on disk would make them
+ * undecodable.  Callers must ensure no passthrough blobs outlive the old codec
+ * (e.g. only allow a change when no swap area with passthrough slots is
+ * active).  This is not yet enforced here and is a prerequisite for enabling
+ * passthrough on a system that reconfigures the compressor at runtime.
+ */
 int swap_compress_set_algorithm(const char *alg)
 {
 	struct zcomp *comp, *old;
@@ -111,3 +125,41 @@ int swap_decompress(struct zcomp_strm *zstrm, const void *src, unsigned int src_
 	return zcomp_decompress(swap_comp, zstrm, src, src_len, dst);
 }
 EXPORT_SYMBOL_GPL(swap_decompress);
+
+/*
+ * Compressed-blob passthrough length transport.
+ *
+ * A precompressed writeback issues a synchronous bio and blocks on it in the
+ * submitting task's context (zram runs ->submit_bio synchronously in the same
+ * task, with no worker handoff).  The compressed length is therefore recorded
+ * on the task, which keeps it valid across the submit_bio_wait() sleep and
+ * unambiguous even when several CPUs write back concurrently -- without ever
+ * becoming a struct bio property or a block-layer flag.
+ *
+ * current->swap_precompressed_len == 0 means "no passthrough in flight" (an
+ * ordinary raw-page write).  Nesting is not expected on the writeback path, so
+ * begin() over an already-open region is a bug.
+ */
+void swap_precompressed_write_begin(unsigned int comp_len)
+{
+	WARN_ON_ONCE(current->swap_precompressed_len);
+	current->swap_precompressed_len = comp_len;
+}
+EXPORT_SYMBOL_GPL(swap_precompressed_write_begin);
+
+void swap_precompressed_write_end(void)
+{
+	current->swap_precompressed_len = 0;
+}
+EXPORT_SYMBOL_GPL(swap_precompressed_write_end);
+
+bool swap_precompressed_write_len(unsigned int *comp_len)
+{
+	unsigned int len = current->swap_precompressed_len;
+
+	if (!len || len >= PAGE_SIZE)
+		return false;
+	*comp_len = len;
+	return true;
+}
+EXPORT_SYMBOL_GPL(swap_precompressed_write_len);

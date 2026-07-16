@@ -2302,6 +2302,79 @@ static int write_incompressible_page(struct zram *zram, struct page *page,
 	return 0;
 }
 
+#ifdef CONFIG_SWAP_COMPRESS
+/*
+ * Store data that arrived already compressed by the shared core-swap codec
+ * (a zswap writeback passthrough).  @page holds @comp_len bytes of a blob our
+ * primary slot decodes with the same codec, so it is stored as an ordinary
+ * compressed slot at ZRAM_PRIMARY_COMP and read back unchanged -- no recompress,
+ * and no ZRAM_HUGE / extra slot flag, because the codec matches.
+ */
+static int zram_store_precompressed(struct zram *zram, struct page *page,
+				    u32 index, unsigned int comp_len)
+{
+	unsigned long handle;
+	void *src;
+
+	if (!comp_len || comp_len >= PAGE_SIZE)
+		return -EINVAL;
+
+	handle = zs_malloc(zram->mem_pool, comp_len,
+			   GFP_NOIO | __GFP_NOWARN |
+			   __GFP_HIGHMEM | __GFP_MOVABLE, page_to_nid(page));
+	if (IS_ERR_VALUE(handle))
+		return PTR_ERR((void *)handle);
+
+	if (!zram_can_store_page(zram)) {
+		zs_free(zram->mem_pool, handle);
+		return -ENOMEM;
+	}
+
+	src = kmap_local_page(page);
+	zs_obj_write(zram->mem_pool, handle, src, comp_len);
+	kunmap_local(src);
+
+	slot_lock(zram, index);
+	slot_free(zram, index);
+	set_slot_handle(zram, index, handle);
+	set_slot_size(zram, index, comp_len);
+	set_slot_comp_priority(zram, index, ZRAM_PRIMARY_COMP);
+	slot_unlock(zram, index);
+
+	atomic64_inc(&zram->stats.pages_stored);
+	atomic64_add(comp_len, &zram->stats.compr_data_size);
+
+	return 0;
+}
+
+/*
+ * Compressed-blob passthrough entry point.  If the core swap layer marks the
+ * current write as precompressed, @page holds a blob produced by the shared
+ * codec and only its (descriptor-carried) length is stored, skipping
+ * compression.  The bvec itself is a full page; the length comes from the
+ * per-task descriptor, not the bvec.  Returns true (with *@ret set) if it
+ * handled the write, false for an ordinary raw-page write.
+ */
+static bool zram_try_write_precompressed(struct zram *zram, struct page *page,
+					 u32 index, int *ret)
+{
+	unsigned int comp_len;
+
+	if (!swap_precompressed_write_len(&comp_len))
+		return false;
+
+	*ret = zram_store_precompressed(zram, page, index, comp_len);
+	return true;
+}
+#else /* CONFIG_SWAP_COMPRESS */
+static inline bool zram_try_write_precompressed(struct zram *zram,
+						struct page *page, u32 index,
+						int *ret)
+{
+	return false;
+}
+#endif /* CONFIG_SWAP_COMPRESS */
+
 static int zram_write_page(struct zram *zram, struct page *page, u32 index)
 {
 	int ret = 0;
@@ -2424,6 +2497,15 @@ static int zram_bvec_write_partial(struct zram *zram, struct bio_vec *bvec,
 static int zram_bvec_write(struct zram *zram, struct bio_vec *bvec,
 			   u32 index, int offset)
 {
+	int ret;
+
+	/*
+	 * Compressed-blob passthrough is checked first: the write carries a
+	 * shared-codec blob whose length lives in a per-task descriptor, so it
+	 * is stored verbatim rather than compressed again.
+	 */
+	if (zram_try_write_precompressed(zram, bvec->bv_page, index, &ret))
+		return ret;
 	if (is_partial_io(bvec))
 		return zram_bvec_write_partial(zram, bvec, index, offset);
 	return zram_write_page(zram, bvec->bv_page, index);

@@ -1140,6 +1140,15 @@ struct task_struct {
 	unsigned long			min_flt;
 	unsigned long			maj_flt;
 
+#ifdef CONFIG_SWAP_COMPRESS
+	/*
+	 * Compressed length of an in-flight compressed-blob swap writeback on
+	 * this task (0 if none).  Lets the backing store learn the blob length
+	 * of a passthrough write without a bio flag; see mm/swap_compress.c.
+	 */
+	unsigned int			swap_precompressed_len;
+#endif
+
 	/* Empty if CONFIG_POSIX_CPUTIMERS=n */
 	struct posix_cputimers		posix_cputimers;
 
