@@ -3,12 +3,14 @@
 #include <linux/kernel.h>
 #include <linux/string.h>
 #include <linux/err.h>
+#include <linux/export.h>
 #include <linux/slab.h>
 #include <linux/wait.h>
 #include <linux/sched.h>
 #include <linux/cpuhotplug.h>
 #include <linux/vmalloc.h>
 #include <linux/sysfs.h>
+#include <linux/init.h>
 
 #include "zcomp.h"
 
@@ -20,24 +22,39 @@
 #include "backend_deflate.h"
 #include "backend_842.h"
 
+/*
+ * Registry of available compression backends, terminated by a NULL sentinel
+ * that lookup_backend_ops() relies on.  Backends are matched by ->name and
+ * exposed to users (zswap, zram) purely through this table, so no caller
+ * hardcodes an algorithm name.
+ *
+ * To add a backend "foo":
+ *   1. implement lib/zcomp/backend_foo.c (a struct zcomp_ops backend_foo)
+ *      and declare it in lib/zcomp/backend_foo.h;
+ *   2. #include "backend_foo.h" above;
+ *   3. add a guarded &backend_foo entry to this array;
+ *   4. add CONFIG_ZCOMP_BACKEND_FOO in lib/zcomp/Kconfig and the object in
+ *      lib/zcomp/Makefile.
+ * Nothing in zswap or zram needs to change for the new name to be usable.
+ */
 static const struct zcomp_ops *backends[] = {
-#if IS_ENABLED(CONFIG_ZRAM_BACKEND_LZO)
+#if IS_ENABLED(CONFIG_ZCOMP_BACKEND_LZO)
 	&backend_lzorle,
 	&backend_lzo,
 #endif
-#if IS_ENABLED(CONFIG_ZRAM_BACKEND_LZ4)
+#if IS_ENABLED(CONFIG_ZCOMP_BACKEND_LZ4)
 	&backend_lz4,
 #endif
-#if IS_ENABLED(CONFIG_ZRAM_BACKEND_LZ4HC)
+#if IS_ENABLED(CONFIG_ZCOMP_BACKEND_LZ4HC)
 	&backend_lz4hc,
 #endif
-#if IS_ENABLED(CONFIG_ZRAM_BACKEND_ZSTD)
+#if IS_ENABLED(CONFIG_ZCOMP_BACKEND_ZSTD)
 	&backend_zstd,
 #endif
-#if IS_ENABLED(CONFIG_ZRAM_BACKEND_DEFLATE)
+#if IS_ENABLED(CONFIG_ZCOMP_BACKEND_DEFLATE)
 	&backend_deflate,
 #endif
-#if IS_ENABLED(CONFIG_ZRAM_BACKEND_842)
+#if IS_ENABLED(CONFIG_ZCOMP_BACKEND_842)
 	&backend_842,
 #endif
 	NULL
@@ -93,6 +110,7 @@ const char *zcomp_lookup_backend_name(const char *comp)
 
 	return NULL;
 }
+EXPORT_SYMBOL_GPL(zcomp_lookup_backend_name);
 
 /* show available compressors */
 ssize_t zcomp_available_show(const char *comp, char *buf, ssize_t at)
@@ -111,6 +129,7 @@ ssize_t zcomp_available_show(const char *comp, char *buf, ssize_t at)
 	at += sysfs_emit_at(buf, at, "\n");
 	return at;
 }
+EXPORT_SYMBOL_GPL(zcomp_available_show);
 
 struct zcomp_strm *zcomp_stream_get(struct zcomp *comp)
 {
@@ -133,11 +152,13 @@ struct zcomp_strm *zcomp_stream_get(struct zcomp *comp)
 		mutex_unlock(&zstrm->lock);
 	}
 }
+EXPORT_SYMBOL_GPL(zcomp_stream_get);
 
 void zcomp_stream_put(struct zcomp_strm *zstrm)
 {
 	mutex_unlock(&zstrm->lock);
 }
+EXPORT_SYMBOL_GPL(zcomp_stream_put);
 
 int zcomp_compress(struct zcomp *comp, struct zcomp_strm *zstrm,
 		   const void *src, unsigned int *dst_len)
@@ -156,6 +177,7 @@ int zcomp_compress(struct zcomp *comp, struct zcomp_strm *zstrm,
 		*dst_len = req.dst_len;
 	return ret;
 }
+EXPORT_SYMBOL_GPL(zcomp_compress);
 
 int zcomp_decompress(struct zcomp *comp, struct zcomp_strm *zstrm,
 		     const void *src, unsigned int src_len, void *dst)
@@ -170,6 +192,7 @@ int zcomp_decompress(struct zcomp *comp, struct zcomp_strm *zstrm,
 	might_sleep();
 	return comp->ops->decompress(comp->params, &zstrm->ctx, &req);
 }
+EXPORT_SYMBOL_GPL(zcomp_decompress);
 
 int zcomp_cpu_up_prepare(unsigned int cpu, struct hlist_node *node)
 {
@@ -182,6 +205,7 @@ int zcomp_cpu_up_prepare(unsigned int cpu, struct hlist_node *node)
 		pr_err("Can't allocate a compression stream\n");
 	return ret;
 }
+EXPORT_SYMBOL_GPL(zcomp_cpu_up_prepare);
 
 int zcomp_cpu_dead(unsigned int cpu, struct hlist_node *node)
 {
@@ -193,6 +217,7 @@ int zcomp_cpu_dead(unsigned int cpu, struct hlist_node *node)
 	mutex_unlock(&zstrm->lock);
 	return 0;
 }
+EXPORT_SYMBOL_GPL(zcomp_cpu_dead);
 
 static int zcomp_init(struct zcomp *comp, struct zcomp_params *params)
 {
@@ -229,6 +254,7 @@ void zcomp_destroy(struct zcomp *comp)
 	free_percpu(comp->stream);
 	kfree(comp);
 }
+EXPORT_SYMBOL_GPL(zcomp_destroy);
 
 struct zcomp *zcomp_create(const char *alg, struct zcomp_params *params)
 {
@@ -260,3 +286,32 @@ struct zcomp *zcomp_create(const char *alg, struct zcomp_params *params)
 	}
 	return comp;
 }
+EXPORT_SYMBOL_GPL(zcomp_create);
+
+/*
+ * Register the shared CPU-hotplug state used by every zcomp instance.
+ *
+ * The per-CPU compression streams are (de)allocated through this state, so it
+ * must be set up before any zcomp user (zram, zswap, ...) calls
+ * zcomp_create().  It used to be registered from zram's module init, which
+ * left zcomp unusable for zswap (and other users) unless zram happened to be
+ * loaded first.  Do it here in the library with a core_initcall so it is
+ * always available regardless of which user comes first.
+ *
+ * If the registration fails there is no silent fallback: the error is
+ * logged, the initcall return value is otherwise ignored by the boot code,
+ * and every later zcomp_create() fails at cpuhp_state_add_instance() because
+ * CPUHP_ZCOMP_PREPARE was never set up.  Users therefore see zcomp become
+ * unavailable rather than operating on unallocated per-CPU streams.
+ */
+static int __init zcomp_core_init(void)
+{
+	int ret;
+
+	ret = cpuhp_setup_state_multi(CPUHP_ZCOMP_PREPARE, "lib/zcomp:prepare",
+				      zcomp_cpu_up_prepare, zcomp_cpu_dead);
+	if (ret < 0)
+		pr_err("zcomp: failed to register cpuhp state: %d\n", ret);
+	return ret;
+}
+core_initcall(zcomp_core_init);
