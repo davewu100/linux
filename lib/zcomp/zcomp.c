@@ -269,6 +269,12 @@ struct zcomp *zcomp_create(const char *alg, struct zcomp_params *params)
 	 * backend selected.
 	 */
 	BUILD_BUG_ON(ARRAY_SIZE(backends) <= 1);
+	/*
+	 * Keep ZCOMP_MAX_BACKENDS an honest upper bound: consumers persist the
+	 * backend id in fixed-width fields sized against it.  Excludes the
+	 * trailing NULL sentinel.
+	 */
+	BUILD_BUG_ON(ARRAY_SIZE(backends) - 1 > ZCOMP_MAX_BACKENDS);
 
 	comp = kzalloc_obj(struct zcomp);
 	if (!comp)

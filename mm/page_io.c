@@ -25,6 +25,7 @@
 #include <linux/sched/task.h>
 #include <linux/delayacct.h>
 #include <linux/zswap.h>
+#include <linux/swap_compress.h>
 #include "swap.h"
 #include "swap_table.h"
 
@@ -456,6 +457,78 @@ static void swap_writepage_bdev_async(struct folio *folio,
 	folio_start_writeback(folio);
 	folio_unlock(folio);
 	submit_bio(bio);
+}
+
+/*
+ * Write a precompressed blob straight to the backing swap device.
+ *
+ * @folio holds @comp_len bytes of a blob produced by the codec with backend id
+ * @alg_id at offset 0, with the rest of the folio zero-padded.  The bio is a
+ * normal full-folio, block-aligned write: a bio sized to @comp_len would be
+ * rejected by the backing device, since @comp_len is almost never a multiple of
+ * the logical block size.  Neither the compressed length nor the codec id is
+ * carried in the bio -- both ride the per-task descriptor set here, which the
+ * backing store (zram) reads to store only @comp_len bytes verbatim, tagged
+ * with @alg_id so a later swapin decodes them with the producing codec.  No bio
+ * flag, no length in bi_iter.bi_size, and no assumption that the backing store's
+ * own codec matches.
+ *
+ * @comp_len == folio_size(folio) is the incompressible marker: @folio holds a
+ * whole raw page the producing tier already found incompressible, and the
+ * backing store stores it verbatim without attempting to compress it.  @alg_id
+ * is then irrelevant.
+ *
+ * Unlike __swap_writepage(), this does NOT start writeback or unlock @folio:
+ * the folio contains compressed (or verbatim-incompressible) bytes, not a
+ * page to be marked uptodate, so the caller manages its lifetime (a later
+ * swapin reads the data back from the backing store).
+ *
+ * PoC restriction: synchronous bdev backing only.  Returns 0 on success or a
+ * negative errno; on failure the caller can fall back to the normal
+ * decompress-then-write path.
+ */
+int swap_writepage_precompressed(struct folio *folio, unsigned int comp_len,
+				 int alg_id)
+{
+	struct swap_info_struct *sis = __swap_entry_to_info(folio->swap);
+	struct bio_vec bv;
+	struct bio bio;
+	int ret;
+
+	if (!comp_len || comp_len > folio_size(folio))
+		return -EINVAL;
+	if (alg_id < 0)
+		return -EINVAL;
+	/*
+	 * ->flags can be updated non-atomically, but that will never affect
+	 * SWP_FS_OPS / SWP_SYNCHRONOUS_IO, so the data_race is safe.  PoC: only
+	 * the synchronous bdev path carries the passthrough length.
+	 */
+	if (data_race(sis->flags & (SWP_FS_OPS | SWP_SYNCHRONOUS_IO)) !=
+	    SWP_SYNCHRONOUS_IO)
+		return -EOPNOTSUPP;
+	/*
+	 * The per-task length descriptor is only observed correctly if the
+	 * backing store runs ->submit_bio synchronously in this task.  If we are
+	 * already nested inside another ->submit_bio, the block layer defers our
+	 * bio onto current->bio_list and a different bio could later observe our
+	 * descriptor.  Refuse the passthrough in that case; the caller falls back.
+	 */
+	if (current->bio_list)
+		return -EOPNOTSUPP;
+
+	bio_init(&bio, sis->bdev, &bv, 1, REQ_OP_WRITE | REQ_SWAP);
+	bio.bi_iter.bi_sector = swap_folio_sector(folio);
+	bio_add_folio_nofail(&bio, folio, folio_size(folio), 0);
+
+	bio_associate_blkg_from_page(&bio, folio);
+	count_swpout_vm_event(folio);
+
+	swap_precompressed_write_begin(comp_len, alg_id);
+	ret = submit_bio_wait(&bio);
+	swap_precompressed_write_end();
+
+	return ret;
 }
 
 void __swap_writepage(struct folio *folio, struct swap_iocb **swap_plug)
