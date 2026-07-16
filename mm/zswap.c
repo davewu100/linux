@@ -40,6 +40,8 @@
 #include "swap.h"
 #include "internal.h"
 
+#include "zcomp.h"
+
 /*********************************
 * statistics
 **********************************/
@@ -144,6 +146,11 @@ struct crypto_acomp_ctx {
 	struct mutex mutex;
 };
 
+enum zswap_comp_backend {
+	ZSWAP_BACKEND_CRYPTO,
+	ZSWAP_BACKEND_ZCOMP,
+};
+
 /*
  * The lock ordering is zswap_tree.lock -> zswap_pool.lru_lock.
  * The only case where lru_lock is not acquired while holding tree.lock is
@@ -152,7 +159,15 @@ struct crypto_acomp_ctx {
  */
 struct zswap_pool {
 	struct zs_pool *zs_pool;
+	enum zswap_comp_backend backend;
 	struct crypto_acomp_ctx __percpu *acomp_ctx;
+	struct zcomp *zcomp;
+	/*
+	 * zcomp keeps a pointer to these params for the lifetime of the
+	 * compressor, so they must outlive zcomp_create(). Keep them here in
+	 * the pool rather than on the stack.
+	 */
+	struct zcomp_params zcomp_params;
 	struct percpu_ref ref;
 	struct list_head list;
 	struct work_struct release_work;
@@ -242,6 +257,83 @@ static inline struct xarray *swap_zswap_tree(swp_entry_t swp)
 **********************************/
 static void __zswap_pool_empty(struct percpu_ref *ref);
 
+/*
+ * Heuristically decide whether a crypto driver name refers to a pure-software
+ * implementation.  In-tree software (de)compressors register with a driver
+ * name ending in "-generic" (plain algorithms, e.g. deflate-generic) or
+ * "-scomp" (the scomp software wrapper, e.g. lzo-scomp, lz4-scomp), while
+ * hardware/offload drivers use a device-specific suffix (e.g. deflate-iaa,
+ * 842-nx, hisi-lz4, qat-*).
+ *
+ * This relies on the crypto naming convention rather than a hard guarantee
+ * from the crypto core.  The convention holds for every in-tree software
+ * compressor zswap can share with zcomp today; verify with /proc/crypto if
+ * adding a new one.  A misjudgement is not a correctness bug, only a
+ * suboptimal backend choice: a software driver mistaken for hardware would
+ * stay on crypto (i.e. behave as before this change) instead of moving to
+ * zcomp.
+ */
+static bool zswap_crypto_is_software(const char *drv_name)
+{
+	static const char * const sw_suffix[] = { "-generic", "-scomp" };
+	size_t drv_len = strlen(drv_name);
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(sw_suffix); i++) {
+		size_t len = strlen(sw_suffix[i]);
+
+		if (drv_len >= len && !strcmp(drv_name + drv_len - len, sw_suffix[i]))
+			return true;
+	}
+	return false;
+}
+
+/*
+ * Some names (e.g. deflate, lz4, zstd, 842) are shared between zcomp's
+ * software backends and higher-priority crypto hardware/offload drivers.
+ * Route through zcomp only when zcomp recognizes the name *and* crypto would
+ * pick a pure-software implementation anyway; otherwise stay on crypto so an
+ * accelerator, when present, is not silently bypassed.
+ *
+ * This makes backend selection a passive contract for accelerators: a crypto
+ * offload driver is picked up automatically, with no change to zswap, as long
+ * as it (a) registers under the standard cra_name for the format it produces
+ * (so users can select it via the existing compressor name), (b) uses a
+ * cra_priority higher than the software implementation so crypto prefers it,
+ * and (c) uses a device-specific cra_driver_name, i.e. one not matched by
+ * zswap_crypto_is_software().  The produced format must stay compatible with
+ * the software implementation of that name, since data may be decompressed on
+ * a system where the accelerator is absent.
+ */
+static enum zswap_comp_backend zswap_compressor_backend(const char *alg)
+{
+	struct crypto_acomp *acomp;
+	enum zswap_comp_backend backend = ZSWAP_BACKEND_CRYPTO;
+
+	if (!zcomp_lookup_backend_name(alg))
+		return ZSWAP_BACKEND_CRYPTO;
+
+	acomp = crypto_alloc_acomp(alg, 0, 0);
+	if (IS_ERR(acomp)) {
+		/* No crypto implementation at all: zcomp is our only option. */
+		return ZSWAP_BACKEND_ZCOMP;
+	}
+
+	if (zswap_crypto_is_software(crypto_acomp_driver_name(acomp)))
+		backend = ZSWAP_BACKEND_ZCOMP;
+	crypto_free_acomp(acomp);
+
+	return backend;
+}
+
+static bool zswap_compressor_available(const char *alg)
+{
+	if (zcomp_lookup_backend_name(alg))
+		return true;
+
+	return crypto_has_acomp(alg, 0, 0);
+}
+
 static void acomp_ctx_free(struct crypto_acomp_ctx *acomp_ctx)
 {
 	if (!acomp_ctx)
@@ -290,6 +382,19 @@ static struct zswap_pool *zswap_pool_create(char *compressor)
 		goto error;
 
 	strscpy(pool->tfm_name, compressor, sizeof(pool->tfm_name));
+	pool->backend = zswap_compressor_backend(compressor);
+
+	if (pool->backend == ZSWAP_BACKEND_ZCOMP) {
+		pool->zcomp_params.level = ZCOMP_PARAM_NOT_SET;
+		pool->zcomp_params.deflate.winbits = ZCOMP_PARAM_NOT_SET;
+		pool->zcomp = zcomp_create(compressor, &pool->zcomp_params);
+		if (IS_ERR(pool->zcomp)) {
+			pr_err("zcomp %s init failed: %ld\n", compressor,
+			       PTR_ERR(pool->zcomp));
+			goto error;
+		}
+		goto init_ref;
+	}
 
 	/* Many things rely on the zero-initialization. */
 	pool->acomp_ctx = alloc_percpu_gfp(*pool->acomp_ctx,
@@ -313,6 +418,7 @@ static struct zswap_pool *zswap_pool_create(char *compressor)
 	if (ret)
 		goto cpuhp_add_fail;
 
+init_ref:
 	/* being the current pool takes 1 ref; this func expects the
 	 * caller to always add the new pool as the current pool
 	 */
@@ -327,12 +433,17 @@ static struct zswap_pool *zswap_pool_create(char *compressor)
 	return pool;
 
 ref_fail:
+	if (pool->backend == ZSWAP_BACKEND_ZCOMP)
+		goto error;
 	cpuhp_state_remove_instance(CPUHP_MM_ZSWP_POOL_PREPARE, &pool->node);
 
 cpuhp_add_fail:
 	for_each_possible_cpu(cpu)
 		acomp_ctx_free(per_cpu_ptr(pool->acomp_ctx, cpu));
 error:
+	if (pool->backend == ZSWAP_BACKEND_ZCOMP &&
+	    !IS_ERR_OR_NULL(pool->zcomp))
+		zcomp_destroy(pool->zcomp);
 	if (pool->acomp_ctx)
 		free_percpu(pool->acomp_ctx);
 	if (pool->zs_pool)
@@ -343,7 +454,7 @@ error:
 
 static struct zswap_pool *__zswap_pool_create_fallback(void)
 {
-	if (!crypto_has_acomp(zswap_compressor, 0, 0) &&
+	if (!zswap_compressor_available(zswap_compressor) &&
 	    strcmp(zswap_compressor, CONFIG_ZSWAP_COMPRESSOR_DEFAULT)) {
 		pr_err("compressor %s not available, using default %s\n",
 		       zswap_compressor, CONFIG_ZSWAP_COMPRESSOR_DEFAULT);
@@ -352,7 +463,7 @@ static struct zswap_pool *__zswap_pool_create_fallback(void)
 	}
 
 	/* Default compressor should be available. Kconfig bug? */
-	if (WARN_ON_ONCE(!crypto_has_acomp(zswap_compressor, 0, 0))) {
+	if (WARN_ON_ONCE(!zswap_compressor_available(zswap_compressor))) {
 		zswap_compressor = ZSWAP_PARAM_UNSET;
 		return NULL;
 	}
@@ -366,6 +477,11 @@ static void zswap_pool_destroy(struct zswap_pool *pool)
 
 	zswap_pool_debug("destroying", pool);
 
+	if (pool->backend == ZSWAP_BACKEND_ZCOMP) {
+		zcomp_destroy(pool->zcomp);
+		goto destroy_zs;
+	}
+
 	cpuhp_state_remove_instance(CPUHP_MM_ZSWP_POOL_PREPARE, &pool->node);
 
 	for_each_possible_cpu(cpu)
@@ -373,6 +489,7 @@ static void zswap_pool_destroy(struct zswap_pool *pool)
 
 	free_percpu(pool->acomp_ctx);
 
+destroy_zs:
 	zs_destroy_pool(pool->zs_pool);
 	kfree(pool);
 }
@@ -551,7 +668,7 @@ static int zswap_compressor_param_set(const char *val, const struct kernel_param
 	if (!create_pool)
 		return ret;
 
-	if (!crypto_has_acomp(s, 0, 0)) {
+	if (!zswap_compressor_available(s)) {
 		pr_err("compressor %s not available\n", s);
 		return -ENOENT;
 	}
@@ -783,8 +900,13 @@ static void zswap_entry_free(struct zswap_entry *entry)
 static int zswap_cpu_comp_prepare(unsigned int cpu, struct hlist_node *node)
 {
 	struct zswap_pool *pool = hlist_entry(node, struct zswap_pool, node);
-	struct crypto_acomp_ctx *acomp_ctx = per_cpu_ptr(pool->acomp_ctx, cpu);
+	struct crypto_acomp_ctx *acomp_ctx;
 	int ret = -ENOMEM;
+
+	if (pool->backend != ZSWAP_BACKEND_CRYPTO)
+		return 0;
+
+	acomp_ctx = per_cpu_ptr(pool->acomp_ctx, cpu);
 
 	/*
 	 * To handle cases where the CPU goes through online-offline-online
@@ -837,6 +959,65 @@ fail:
 	return ret;
 }
 
+static bool zswap_zcomp_compress(struct page *page, struct zswap_entry *entry,
+				 struct zswap_pool *pool)
+{
+	struct zcomp_strm *zstrm;
+	int comp_ret = 0, alloc_ret = 0;
+	unsigned int dlen = PAGE_SIZE;
+	unsigned long handle;
+	gfp_t gfp;
+	void *mem;
+	u8 *dst;
+	bool mapped = false;
+
+	zstrm = zcomp_stream_get(pool->zcomp);
+	mem = kmap_local_page(page);
+	comp_ret = zcomp_compress(pool->zcomp, zstrm, mem, &dlen);
+	kunmap_local(mem);
+	dst = zstrm->buffer;
+
+	/* See zswap_compress() for the incompressible page handling. */
+	if (comp_ret || !dlen || dlen >= PAGE_SIZE) {
+		rcu_read_lock();
+		if (!mem_cgroup_zswap_writeback_enabled(
+					folio_memcg(page_folio(page)))) {
+			rcu_read_unlock();
+			comp_ret = comp_ret ? comp_ret : -EINVAL;
+			goto unlock;
+		}
+		rcu_read_unlock();
+		comp_ret = 0;
+		dlen = PAGE_SIZE;
+		dst = kmap_local_page(page);
+		mapped = true;
+	}
+
+	gfp = GFP_NOWAIT | __GFP_NORETRY | __GFP_HIGHMEM | __GFP_MOVABLE;
+	handle = zs_malloc(pool->zs_pool, dlen, gfp, page_to_nid(page));
+	if (IS_ERR_VALUE(handle)) {
+		alloc_ret = PTR_ERR((void *)handle);
+		goto unlock;
+	}
+
+	zs_obj_write(pool->zs_pool, handle, dst, dlen);
+	entry->handle = handle;
+	entry->length = dlen;
+
+unlock:
+	if (mapped)
+		kunmap_local(dst);
+	if (comp_ret == -ENOSPC || alloc_ret == -ENOSPC)
+		zswap_reject_compress_poor++;
+	else if (comp_ret)
+		zswap_reject_compress_fail++;
+	else if (alloc_ret)
+		zswap_reject_alloc_fail++;
+
+	zcomp_stream_put(zstrm);
+	return comp_ret == 0 && alloc_ret == 0;
+}
+
 static bool zswap_compress(struct page *page, struct zswap_entry *entry,
 			   struct zswap_pool *pool)
 {
@@ -848,6 +1029,9 @@ static bool zswap_compress(struct page *page, struct zswap_entry *entry,
 	gfp_t gfp;
 	u8 *dst;
 	bool mapped = false;
+
+	if (pool->backend == ZSWAP_BACKEND_ZCOMP)
+		return zswap_zcomp_compress(page, entry, pool);
 
 	acomp_ctx = raw_cpu_ptr(pool->acomp_ctx);
 	mutex_lock(&acomp_ctx->mutex);
@@ -921,6 +1105,56 @@ unlock:
 	return comp_ret == 0 && alloc_ret == 0;
 }
 
+static bool zswap_zcomp_decompress(struct zswap_entry *entry, struct folio *folio)
+{
+	struct zswap_pool *pool = entry->pool;
+	struct scatterlist input[2]; /* zsmalloc returns an SG list 1-2 entries */
+	struct zcomp_strm *zstrm;
+	void *dst, *src;
+	int ret = 0;
+
+	zstrm = zcomp_stream_get(pool->zcomp);
+	zs_obj_read_sg_begin(pool->zs_pool, entry->handle, input, entry->length);
+
+	dst = kmap_local_folio(folio, 0);
+	if (entry->length == PAGE_SIZE) {
+		memcpy_from_sglist(dst, input, 0, PAGE_SIZE);
+	} else {
+		/*
+		 * zcomp_decompress() needs a single contiguous source buffer,
+		 * but zsmalloc may return the object as a 1-2 entry SG list, so
+		 * gather it into the stream's local_copy first.  This only
+		 * copies the (small) compressed data, not a full page.
+		 */
+		src = zstrm->local_copy;
+		memcpy_from_sglist(src, input, 0, entry->length);
+		ret = zcomp_decompress(pool->zcomp, zstrm, src, entry->length, dst);
+	}
+	kunmap_local(dst);
+	flush_dcache_folio(folio);
+
+	zs_obj_read_sg_end(pool->zs_pool, entry->handle);
+	zcomp_stream_put(zstrm);
+
+	/*
+	 * Unlike the crypto path, there is no need to also check that the
+	 * decompressed length equals PAGE_SIZE: the zcomp API contract is that
+	 * a zero return means the whole original page was recovered (the
+	 * backends fail with an error otherwise), which is exactly how zram
+	 * consumes zcomp_decompress() too.
+	 */
+	if (!ret)
+		return true;
+
+	zswap_decompress_fail++;
+	pr_alert_ratelimited("Decompression error from zswap (%d:%lu %s %u->%d)\n",
+						swp_type(entry->swpentry),
+						swp_offset(entry->swpentry),
+						entry->pool->tfm_name,
+						entry->length, (int)PAGE_SIZE);
+	return false;
+}
+
 static bool zswap_decompress(struct zswap_entry *entry, struct folio *folio)
 {
 	struct zswap_pool *pool = entry->pool;
@@ -928,6 +1162,9 @@ static bool zswap_decompress(struct zswap_entry *entry, struct folio *folio)
 	struct scatterlist output;
 	struct crypto_acomp_ctx *acomp_ctx;
 	int ret = 0, dlen;
+
+	if (pool->backend == ZSWAP_BACKEND_ZCOMP)
+		return zswap_zcomp_decompress(entry, folio);
 
 	acomp_ctx = raw_cpu_ptr(pool->acomp_ctx);
 	mutex_lock(&acomp_ctx->mutex);
