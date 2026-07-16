@@ -8,30 +8,66 @@ config ZCOMP_BACKEND_LZ4
 	depends on ZCOMP
 	select LZ4_COMPRESS
 	select LZ4_DECOMPRESS
+	help
+	  Enable the LZ4 backend for the zcomp compression library used by
+	  zram and zswap.  LZ4 offers very high compression and
+	  decompression throughput at a moderate compression ratio, making
+	  it a good default for latency-sensitive swap and memory workloads.
+
+	  If unsure, say N.
 
 config ZCOMP_BACKEND_LZ4HC
 	bool "lz4hc compression support"
 	depends on ZCOMP
 	select LZ4HC_COMPRESS
 	select LZ4_DECOMPRESS
+	help
+	  Enable the LZ4HC (high compression) backend for the zcomp
+	  compression library used by zram and zswap.  LZ4HC spends more
+	  CPU time during compression to achieve a better compression ratio
+	  than plain LZ4, while keeping the same fast decompression.
+
+	  If unsure, say N.
 
 config ZCOMP_BACKEND_ZSTD
 	bool "zstd compression support"
 	depends on ZCOMP
 	select ZSTD_COMPRESS
 	select ZSTD_DECOMPRESS
+	help
+	  Enable the Zstandard (zstd) backend for the zcomp compression
+	  library used by zram and zswap.  zstd typically achieves a higher
+	  compression ratio than LZ4 or LZO at the cost of more CPU time,
+	  which suits workloads where saving memory matters more than speed.
+
+	  If unsure, say N.
 
 config ZCOMP_BACKEND_DEFLATE
 	bool "deflate compression support"
 	depends on ZCOMP
 	select ZLIB_DEFLATE
 	select ZLIB_INFLATE
+	help
+	  Enable the deflate (zlib) backend for the zcomp compression
+	  library used by zram and zswap.  Deflate provides a solid
+	  compression ratio but is slower than LZ4 and LZO; it is mainly
+	  useful for parity with hardware deflate accelerators and legacy
+	  setups.
+
+	  If unsure, say N.
 
 config ZCOMP_BACKEND_842
 	bool "842 compression support"
 	depends on ZCOMP
 	select 842_COMPRESS
 	select 842_DECOMPRESS
+	help
+	  Enable the 842 backend for the zcomp compression library used by
+	  zram and zswap.  The 842 algorithm is designed to pair with the
+	  NX-842 compression accelerator found on some POWER systems, and
+	  is rarely useful for pure software compression.
+
+	  If unsure, say N.
 
 config ZCOMP_BACKEND_FORCE_LZO
 	depends on ZCOMP
@@ -45,5 +81,13 @@ config ZCOMP_BACKEND_LZO
 	default ZCOMP_BACKEND_FORCE_LZO
 	select LZO_COMPRESS
 	select LZO_DECOMPRESS
+	help
+	  Enable the LZO and LZO-RLE backends for the zcomp compression
+	  library used by zram and zswap.  LZO is fast with a low
+	  compression ratio, and LZO-RLE adds run-length encoding that helps
+	  on zero-filled and repetitive pages.  This is the fallback backend
+	  selected when no other zcomp backend is enabled.
+
+	  If unsure, say N.
 
 endmenu
