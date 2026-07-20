@@ -1187,23 +1187,30 @@ static bool zswap_decompress(struct zswap_entry *entry, struct folio *folio)
 
 #ifdef CONFIG_SWAP_COMPRESS
 /*
- * Compressed-blob passthrough: hand this entry's already-compressed blob to the
- * backing swap device (zram) verbatim, skipping the decompress-on-writeback /
- * recompress-on-store cycle.  See
- * Documentation/mm/core-swap-compressed-passthrough.md.
+ * Passthrough: hand this entry's stored bytes to the backing swap device (zram)
+ * verbatim, skipping the decompress-on-writeback / recompress-on-store cycle.
+ * See Documentation/mm/core-swap-compressed-passthrough.md.
  *
- * Eligible when the entry was compressed by a zcomp backend (ZSWAP_BACKEND_ZCOMP,
- * so the blob has a stable backend id); genuinely compressed (0 < length <
- * PAGE_SIZE); and order-0.  The producing codec's backend id is passed down and
- * stamped onto the backing slot, so this does NOT require the backing device's
- * own codec to match -- zram decodes the blob with the id we hand it.  The
- * caller must also have checked that the write is on the synchronous bdev path
- * (via the return of swap_writepage_precompressed()).
+ * Two cases, both order-0:
  *
- * On success the blob is durably stored on the backing device and @folio holds
- * compressed bytes (NOT the raw page), so the caller must drop it from the swap
- * cache rather than mark it uptodate.  Returns false on ineligibility or I/O
- * error, leaving the entry intact for the decompress fallback.
+ *  - Compressed blob (0 < length < PAGE_SIZE) from a zcomp backend
+ *    (ZSWAP_BACKEND_ZCOMP, so it has a stable backend id).  The producing
+ *    codec's id is passed down and stamped onto the backing slot, so this does
+ *    NOT require the backing device's own codec to match -- zram decodes the
+ *    blob with the id we hand it.
+ *  - Incompressible page (length == PAGE_SIZE): the entry holds a raw,
+ *    uncompressed page zswap already found incompressible.  It is handed over as
+ *    a whole page (comp_len == PAGE_SIZE, codec id irrelevant) so zram stores it
+ *    verbatim without attempting to compress it again.  This case does not
+ *    depend on the backend, since no codec is involved.
+ *
+ * The caller must also have checked that the write is on the synchronous bdev
+ * path (via the return of swap_writepage_precompressed()).
+ *
+ * On success the data is durably stored on the backing device and @folio holds
+ * the stored bytes (NOT a page to mark uptodate), so the caller must drop it
+ * from the swap cache.  Returns false on ineligibility or I/O error, leaving the
+ * entry intact for the decompress fallback.
  */
 static bool zswap_writeback_passthrough(struct zswap_entry *entry,
 					struct folio *folio)
@@ -1211,30 +1218,34 @@ static bool zswap_writeback_passthrough(struct zswap_entry *entry,
 	struct zswap_pool *pool = entry->pool;
 	struct scatterlist input[2];
 	unsigned int clen = entry->length;
+	bool incompressible = (clen == PAGE_SIZE);
 	void *src;
-	int alg_id;
+	int alg_id = 0;
 
-	if (pool->backend != ZSWAP_BACKEND_ZCOMP)
-		return false;
-	if (!clen || clen >= PAGE_SIZE)
+	if (!clen || clen > PAGE_SIZE)
 		return false;
 	if (folio_test_large(folio))
 		return false;
 
 	/*
-	 * Identify the codec that produced this blob so the backing store can
-	 * decode it independently of its own primary codec.  If the name has no
-	 * stable backend id, we cannot describe the blob to the backing store,
-	 * so fall back to decompression.
+	 * A compressed blob must be decodable by the backing store: it needs to
+	 * come from a zcomp backend and have a stable backend id to tag the slot
+	 * with.  An incompressible whole page needs neither (it is stored raw),
+	 * so it can pass through regardless of backend.
 	 */
-	alg_id = zcomp_lookup_backend_id(pool->tfm_name);
-	if (alg_id < 0)
-		return false;
+	if (!incompressible) {
+		if (pool->backend != ZSWAP_BACKEND_ZCOMP)
+			return false;
+		alg_id = zcomp_lookup_backend_id(pool->tfm_name);
+		if (alg_id < 0)
+			return false;
+	}
 
 	/*
-	 * Copy the compressed blob into the folio and zero-pad the tail in a
-	 * single mapping, so the folio is well-defined past the blob (the write
-	 * submits the whole folio; only clen bytes are stored).
+	 * Copy the stored bytes into the folio and zero-pad the tail in a single
+	 * mapping, so the folio is well-defined past the data (the write submits
+	 * the whole folio; only clen bytes are stored).  For an incompressible
+	 * page clen == folio_size(), so this is a plain full-page copy.
 	 */
 	zs_obj_read_sg_begin(pool->zs_pool, entry->handle, input, clen);
 	src = kmap_local_folio(folio, 0);

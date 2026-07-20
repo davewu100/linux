@@ -243,6 +243,12 @@ EXPORT_SYMBOL_GPL(swap_decompress_by_id);
  * blob with the codec that produced it (swap_decompress_by_id()), not with its
  * own primary codec.
  *
+ * A length of exactly PAGE_SIZE is the "incompressible passthrough" marker: the
+ * folio holds a raw, uncompressed page that the producing tier (zswap) already
+ * found incompressible, so the backing store should store it verbatim and skip
+ * its own (near-certainly futile) compression attempt.  In that case @alg_id is
+ * meaningless and ignored.
+ *
  * current->swap_precompressed_len == 0 means "no passthrough in flight" (an
  * ordinary raw-page write).  Nesting is not expected on the writeback path, so
  * begin() over an already-open region is a bug.
@@ -266,7 +272,14 @@ bool swap_precompressed_write_len(unsigned int *comp_len, int *alg_id)
 {
 	unsigned int len = current->swap_precompressed_len;
 
-	if (!len || len >= PAGE_SIZE)
+	/*
+	 * len == 0 : no passthrough in flight.
+	 * 0 < len < PAGE_SIZE : compressed blob of that length, codec @alg_id.
+	 * len == PAGE_SIZE : incompressible raw page, store verbatim (@alg_id
+	 *                    ignored).
+	 * len > PAGE_SIZE : never set; treated as no passthrough.
+	 */
+	if (!len || len > PAGE_SIZE)
 		return false;
 	*comp_len = len;
 	*alg_id = current->swap_precompressed_alg_id;

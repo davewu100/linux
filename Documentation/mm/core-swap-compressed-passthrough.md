@@ -29,6 +29,11 @@ each passthrough slot with the codec the id names. This requires:
 It is the "same functional win" as the old zram `REQ_COMPRESSED` series, but
 obtained on the compliant core-swap foundation instead of a block-layer flag.
 
+As a small extension in the same spirit, a page zswap already found
+**incompressible** (`entry->length == PAGE_SIZE`) is passed through as a whole
+page too, so zram stores it verbatim (a `ZRAM_HUGE` slot) instead of retrying —
+and almost certainly failing — the compression zswap already gave up on.
+
 ## 1. Why this is now clean
 
 Two facts from the base branch remove everything that made the old passthrough
@@ -111,18 +116,19 @@ tiers use different algorithms.
 
 ## 3. Write path (zswap → core swap → zram)
 
-`zswap_writeback_entry()` gains a passthrough branch taken when:
+`zswap_writeback_entry()` gains a passthrough branch taken, for an order-0 folio
+on the synchronous bdev path, in one of two cases:
 
-- the entry is genuinely compressed (`0 < entry->length < PAGE_SIZE`),
-- the folio is order-0,
-- the entry was compressed by a lib/zcomp backend (`ZSWAP_BACKEND_ZCOMP`), so
-  its algorithm has a stable backend id, and
-- the write is on the synchronous bdev path.
+- **Compressed blob** (`0 < entry->length < PAGE_SIZE`) from a lib/zcomp backend
+  (`ZSWAP_BACKEND_ZCOMP`), so its algorithm has a stable backend id.  There is
+  **no** requirement that the backing zram's primary codec match the zswap
+  codec: the blob is tagged with its own codec id.
+- **Incompressible page** (`entry->length == PAGE_SIZE`): the entry already holds
+  a raw page zswap could not compress.  It is handed over as a whole page so zram
+  stores it verbatim instead of pointlessly trying to compress it again.  No
+  codec is involved, so this case is independent of the backend.
 
-Note there is **no** requirement that the backing zram's primary codec match the
-zswap codec: the blob is tagged with its own codec id.
-
-Steps:
+Steps (compressed blob):
 
 1. Copy `entry->length` blob bytes to folio offset 0 (zero-padded); no
    `swap_decompress()`.  Resolve the producing codec id with
@@ -130,22 +136,28 @@ Steps:
 2. `swap_writepage_precompressed(folio, entry->length, alg_id)` records the
    length and codec id in the core-swap descriptor and submits the sync write.
 3. zram's `zram_bvec_write()` asks core swap for the precompressed length and
-   id; if present it calls `zram_store_precompressed(page, index, comp_len,
-   alg_id)` which:
+   id; if present and `comp_len < PAGE_SIZE` it calls
+   `zram_store_precompressed(page, index, comp_len, alg_id)` which:
      - `zs_malloc(comp_len)` + `zs_obj_write(handle, blob, comp_len)`,
      - `set_slot_size(index, comp_len)`, `set_slot_comp_priority(index,
        ZRAM_PRIMARY_COMP)`,
      - `set_slot_flag(index, ZRAM_PRECOMP)` and `set_slot_precomp_alg(index,
        alg_id)` to record that this slot is an external blob and which codec
        produced it.
-   No `ZRAM_HUGE`; one new `ZRAM_PRECOMP` flag plus a 3-bit codec id, so the
-   read path can pick the right decoder.
+   One new `ZRAM_PRECOMP` flag plus a 3-bit codec id, so the read path can pick
+   the right decoder.
 4. On success zswap frees the entry and drops the folio from the swap cache
    (it holds compressed bytes, not a page), so a later swapin re-reads and
    decompresses it from zram.
 
-`length == PAGE_SIZE` entries (stored raw) are copied out and written normally,
-letting zram compress them with its own codec — same as today.
+Steps (incompressible page):
+
+The full page is copied to the folio and `swap_writepage_precompressed(folio,
+PAGE_SIZE, 0)` marks the descriptor length as `PAGE_SIZE`.  zram sees
+`comp_len == PAGE_SIZE` and stores the page through the existing
+`write_incompressible_page()` path — a normal `ZRAM_HUGE` slot, read back with a
+plain `copy_page()` and no decompression.  This avoids the compression attempt
+zram would otherwise make on a page zswap already knows is incompressible.
 
 ## 4. Read path (swapin)
 
@@ -155,6 +167,11 @@ for the compressed-writeback tier) detect `ZRAM_PRECOMP`, read `get_slot_size()`
 bytes, and call `swap_decompress_by_id(get_slot_precomp_alg(...), ...)` — i.e.
 decode with the codec that produced the blob, not zram's own primary codec.
 Non-passthrough primary slots keep using `swap_decompress()` as before.
+
+An incompressible passthrough page is stored as an ordinary `ZRAM_HUGE` slot, so
+it needs no special read handling at all: `read_incompressible_page()` returns it
+with a plain `copy_page()`, exactly like any other huge/incompressible zram
+slot.
 
 ## 5. swapoff / fallback / safety
 

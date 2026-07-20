@@ -2425,11 +2425,18 @@ static int zram_store_precompressed(struct zram *zram, struct page *page,
 
 /*
  * Compressed-blob passthrough entry point.  If the core swap layer marks the
- * current write as precompressed, @page holds a blob produced by the codec the
- * descriptor names; only its (descriptor-carried) length and codec id are
- * stored, skipping compression.  The bvec itself is a full page; the length and
- * id come from the per-task descriptor, not the bvec.  Returns true (with *@ret
- * set) if it handled the write, false for an ordinary raw-page write.
+ * current write as precompressed, @page holds data the producing tier already
+ * processed, so we skip compression:
+ *
+ *  - comp_len == PAGE_SIZE: an incompressible raw page.  Store it verbatim as a
+ *    ZRAM_HUGE slot, exactly like a page zram itself found incompressible, so no
+ *    (futile) compression is attempted and no codec id is needed.
+ *  - 0 < comp_len < PAGE_SIZE: a compressed blob produced by codec @alg_id.
+ *    Store it as a ZRAM_PRECOMP slot tagged with @alg_id.
+ *
+ * The bvec itself is a full page; the length and id come from the per-task
+ * descriptor, not the bvec.  Returns true (with *@ret set) if it handled the
+ * write, false for an ordinary raw-page write.
  */
 static bool zram_try_write_precompressed(struct zram *zram, struct page *page,
 					 u32 index, int *ret)
@@ -2440,7 +2447,11 @@ static bool zram_try_write_precompressed(struct zram *zram, struct page *page,
 	if (!swap_precompressed_write_len(&comp_len, &alg_id))
 		return false;
 
-	*ret = zram_store_precompressed(zram, page, index, comp_len, alg_id);
+	if (comp_len == PAGE_SIZE)
+		*ret = write_incompressible_page(zram, page, index);
+	else
+		*ret = zram_store_precompressed(zram, page, index, comp_len,
+						alg_id);
 	return true;
 }
 #else /* CONFIG_SWAP_COMPRESS */

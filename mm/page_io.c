@@ -473,9 +473,15 @@ static void swap_writepage_bdev_async(struct folio *folio,
  * flag, no length in bi_iter.bi_size, and no assumption that the backing store's
  * own codec matches.
  *
+ * @comp_len == folio_size(folio) is the incompressible marker: @folio holds a
+ * whole raw page the producing tier already found incompressible, and the
+ * backing store stores it verbatim without attempting to compress it.  @alg_id
+ * is then irrelevant.
+ *
  * Unlike __swap_writepage(), this does NOT start writeback or unlock @folio:
- * the folio contains compressed bytes, not the raw page, so the caller manages
- * its lifetime (a later swapin reads the blob back and decompresses it).
+ * the folio contains compressed (or verbatim-incompressible) bytes, not a
+ * page to be marked uptodate, so the caller manages its lifetime (a later
+ * swapin reads the data back from the backing store).
  *
  * PoC restriction: synchronous bdev backing only.  Returns 0 on success or a
  * negative errno; on failure the caller can fall back to the normal
@@ -489,7 +495,7 @@ int swap_writepage_precompressed(struct folio *folio, unsigned int comp_len,
 	struct bio bio;
 	int ret;
 
-	if (!comp_len || comp_len >= folio_size(folio))
+	if (!comp_len || comp_len > folio_size(folio))
 		return -EINVAL;
 	if (alg_id < 0)
 		return -EINVAL;
