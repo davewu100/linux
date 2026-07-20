@@ -17,8 +17,10 @@ avoid the decompress-on-writeback / recompress-on-store cycle: on writeback
 
 This draft adds **compressed-blob passthrough**: on writeback zswap hands its
 already-compressed blob to core swap, which stores it into zram verbatim as a
-compressed slot, skipping both the decompress and the recompress. Because both
-tiers now share one codec (base branch), this requires:
+compressed slot, skipping both the decompress and the recompress. The blob
+carries the identity of the codec that produced it (a stable lib/zcomp backend
+id), so the two tiers do **not** have to use the same algorithm; zram decodes
+each passthrough slot with the codec the id names. This requires:
 
 - **no new `REQ_COMPRESSED` bio flag**,
 - **no `->swap_comp_algo()` negotiation / format contract**,
@@ -32,12 +34,16 @@ obtained on the compliant core-swap foundation instead of a block-layer flag.
 Two facts from the base branch remove everything that made the old passthrough
 non-upstreamable:
 
-1. **One codec, both tiers.** `swap_compress()`/`swap_decompress()` in
-   `mm/swap_compress.c` are the single compressor for zswap's software
-   algorithms and for zram's primary slot (`ZRAM_PRIMARY_COMP`). A blob
-   produced by `swap_compress()` is by construction decodable by
-   `swap_decompress()`. There is no cross-component format contract to
-   negotiate or version.
+1. **Shared codec library, id-tagged blobs.** zswap's software algorithms and
+   zram's primary slot both run on `lib/zcomp`. A blob is decodable by any tier
+   as long as it is decoded with the *same backend* that produced it. Rather
+   than force both tiers onto one global algorithm, each passthrough blob is
+   tagged with the producing backend's **stable id** (its index in lib/zcomp's
+   `backends[]`, see `zcomp_lookup_backend_id()`). `mm/swap_compress.c` keeps a
+   small id-indexed cache of zcomp instances and decodes a blob with
+   `swap_decompress_by_id()`. zswap and zram may therefore use different
+   algorithms; there is still no cross-component format contract to negotiate or
+   version, only a one-integer codec id travelling with the blob.
 
 2. **zram already stores the compressed length.** `zram_write_page()` stores
    `comp_len` via `set_slot_size()`, and `read_compressed_page()` reads it back
@@ -97,9 +103,11 @@ Transport mechanism (in preference order; RFC lands (A)):
   home once the write path is generalized beyond sync bdev, and mirrors where
   a virtual-swap layer would keep per-slot descriptors.
 
-The descriptor deliberately carries **only** `comp_len`. No algorithm id and no
-format version, because the shared codec makes them redundant — the key
-simplification the base branch buys us.
+The descriptor carries `comp_len` **and** the producing codec's backend id
+(`current->swap_precompressed_len` / `_alg_id`). It carries no format version:
+the id names a lib/zcomp backend whose on-disk format is fixed for a kernel
+image, so the id alone is enough to decode the blob. The id is what lets the two
+tiers use different algorithms.
 
 ## 3. Write path (zswap → core swap → zram)
 
@@ -107,62 +115,73 @@ simplification the base branch buys us.
 
 - the entry is genuinely compressed (`0 < entry->length < PAGE_SIZE`),
 - the folio is order-0,
-- the backing device stores primary slots through the shared codec
-  (i.e. `CONFIG_SWAP_COMPRESS` backing == zram primary), and
+- the entry was compressed by a lib/zcomp backend (`ZSWAP_BACKEND_ZCOMP`), so
+  its algorithm has a stable backend id, and
 - the write is on the synchronous bdev path.
+
+Note there is **no** requirement that the backing zram's primary codec match the
+zswap codec: the blob is tagged with its own codec id.
 
 Steps:
 
-1. `swap_copy_blob_to_folio(entry, folio)` copies `entry->length` blob bytes to
-   folio offset 0 (zero-padded); no `swap_decompress()`.
-2. `swap_writepage_precompressed(folio, entry->length)` records the length in
-   the core-swap descriptor and submits the sync write.
-3. zram's `zram_bvec_write()` asks core swap for the precompressed length; if
-   present it calls `zram_store_precompressed(page, index, comp_len)` which:
+1. Copy `entry->length` blob bytes to folio offset 0 (zero-padded); no
+   `swap_decompress()`.  Resolve the producing codec id with
+   `zcomp_lookup_backend_id(pool->tfm_name)`.
+2. `swap_writepage_precompressed(folio, entry->length, alg_id)` records the
+   length and codec id in the core-swap descriptor and submits the sync write.
+3. zram's `zram_bvec_write()` asks core swap for the precompressed length and
+   id; if present it calls `zram_store_precompressed(page, index, comp_len,
+   alg_id)` which:
      - `zs_malloc(comp_len)` + `zs_obj_write(handle, blob, comp_len)`,
      - `set_slot_size(index, comp_len)`, `set_slot_comp_priority(index,
        ZRAM_PRIMARY_COMP)`,
-   i.e. a normal compressed slot — **no** `ZRAM_HUGE`, **no** extra slot flag,
-   because the codec matches (unlike v0.0.8 which needed `ZRAM_NOCOMP`).
+     - `set_slot_flag(index, ZRAM_PRECOMP)` and `set_slot_precomp_alg(index,
+       alg_id)` to record that this slot is an external blob and which codec
+       produced it.
+   No `ZRAM_HUGE`; one new `ZRAM_PRECOMP` flag plus a 3-bit codec id, so the
+   read path can pick the right decoder.
 4. On success zswap frees the entry and drops the folio from the swap cache
    (it holds compressed bytes, not a page), so a later swapin re-reads and
    decompresses it from zram.
 
 `length == PAGE_SIZE` entries (stored raw) are copied out and written normally,
-letting zram compress them with the shared codec — same as today.
+letting zram compress them with its own codec — same as today.
 
 ## 4. Read path (swapin)
 
-**No change.** A passthrough blob is an ordinary `ZRAM_PRIMARY_COMP` slot with a
-correct `slot_size`. `read_compressed_page()` reads `get_slot_size()` bytes and
-calls `swap_decompress()` — the existing shared-codec read path. This is the
-biggest simplification versus every prior approach: the read side is already
-done by the base branch.
+A passthrough blob is a `ZRAM_PRIMARY_COMP` slot with a correct `slot_size` and
+the `ZRAM_PRECOMP` flag. `read_compressed_page()` (and `decompress_bdev_page()`
+for the compressed-writeback tier) detect `ZRAM_PRECOMP`, read `get_slot_size()`
+bytes, and call `swap_decompress_by_id(get_slot_precomp_alg(...), ...)` — i.e.
+decode with the codec that produced the blob, not zram's own primary codec.
+Non-passthrough primary slots keep using `swap_decompress()` as before.
 
 ## 5. swapoff / fallback / safety
 
 - **Fallback**: if any precondition fails (not compressed, large folio, async
-  path, allocation failure, backing not shared-codec), take the existing path —
+  path, allocation failure, no stable backend id), take the existing path —
   `swap_decompress()` into the folio + `__swap_writepage()`. Correctness
   backstop unchanged.
-- **swapoff**: passthrough slots are normal zram compressed slots, so the
-  standard swapoff read loop decompresses them via `read_compressed_page()`.
-  Nothing special.
-- **Codec change while blobs live on disk**: because the codec is the single
-  core-swap compressor, changing it (`swap_compress_set_algorithm()`) must be
-  gated the same way zram already gates a live pool — reject or drain while
-  passthrough slots exist. This is a pre-existing concern of the shared codec,
-  not new to passthrough, but passthrough makes it load-bearing and must be
-  documented/enforced.
+- **swapoff**: passthrough slots are normal zram compressed slots (with the
+  `ZRAM_PRECOMP` tag), so the standard swapoff read loop decompresses them via
+  `read_compressed_page()`. Nothing special.
+- **Primary-codec change while blobs live on disk**: no longer a concern for
+  passthrough. Each blob records its own codec id and is decoded through the
+  id-indexed cache, so changing zram's primary codec
+  (`swap_compress_set_algorithm()`) does not affect stored passthrough blobs.
+  The id→format mapping is stable for a kernel image, so no drain/gate is
+  required.
 
 ## 6. Why this satisfies the review direction
 
 - Compression stays in core swap (`lib/zcomp` + `mm/swap_compress.c`); zram only
-  stores an opaque blob it can already read back.
-- No block-layer flags; the write is plain data, length rides a core-swap
-  descriptor, not `struct bio`.
-- No zswap↔zram format contract; one shared codec makes byte compatibility a
-  fact, not an assumption. `comp_len` is the only thing transported.
+  stores an opaque blob plus the codec id needed to read it back.
+- No block-layer flags; the write is plain data, length and codec id ride a
+  core-swap descriptor, not `struct bio`.
+- No zswap↔zram format *contract* to negotiate or version: byte compatibility is
+  guaranteed by decoding each blob with the exact lib/zcomp backend that produced
+  it. Only `comp_len` and a one-integer codec id are transported, and the two
+  tiers may use different algorithms.
 
 ## 7. Comparison
 
@@ -170,21 +189,26 @@ done by the base branch.
 |---|---|---|---|
 | Block-layer flag | new `REQ_COMPRESSED` | new `REQ_COMPRESSED` | none |
 | Length transport | `bi_iter.bi_size` hack | `bi_iter.bi_size` hack | core-swap descriptor |
-| Format contract | implicit name match | explicit + versioned | none (shared codec) |
-| Extra zram slot flag | `ZRAM_NOCOMP` | `ZRAM_NOCOMP` | none |
-| Read path change | via zram | via zram | none (base branch) |
+| Format contract | implicit name match | explicit + versioned | codec id per blob (no negotiation) |
+| Heterogeneous zswap/zram codecs | no | no | yes |
+| Extra zram slot flag | `ZRAM_NOCOMP` | `ZRAM_NOCOMP` | `ZRAM_PRECOMP` + 3-bit codec id |
+| Read path change | via zram | via zram | decode by codec id |
 | Avoids 2nd compression | yes | yes | yes |
 | Compliant w/ Christoph | no | no | yes |
 
 ## 8. Incremental patch plan
 
-1. `mm/swap_compress.{c,h}`: add `struct swap_precompressed`, per-CPU
-   descriptor, `swap_writepage_precompressed()`, `swap_read_precompressed_len()`,
-   `swap_copy_blob_to_folio()`.
-2. `drivers/block/zram/zram_drv.c`: `zram_store_precompressed()`; in
-   `zram_bvec_write()` consult the descriptor and route to it.
-3. `mm/zswap.c`: passthrough branch in `zswap_writeback_entry()` +
-   preconditions; keep decompress fallback.
-4. Enforce codec-change safety while passthrough slots exist.
-5. Docs + limitations (order-0, sync bdev only for RFC; async via descriptor
+1. `lib/zcomp`: expose `zcomp_lookup_backend_id()` / `zcomp_backend_name_by_id()`
+   (stable backend index as a codec id).
+2. `mm/swap_compress.{c,h}` + `include/linux/sched.h`: per-task descriptor
+   carrying `{comp_len, alg_id}`; id-indexed zcomp cache with
+   `swap_decompress_by_id()`; `swap_compress_alg_id()`.
+3. `mm/page_io.c`: `swap_writepage_precompressed(folio, comp_len, alg_id)`.
+4. `drivers/block/zram`: `ZRAM_PRECOMP` flag + 3-bit codec id in the slot;
+   `zram_store_precompressed()` stamps them; `read_compressed_page()` and
+   `decompress_bdev_page()` decode via `swap_decompress_by_id()`; `slot_free()`
+   clears the tag.
+5. `mm/zswap.c`: passthrough branch in `zswap_writeback_entry()` resolves the
+   codec id from `pool->tfm_name`; keep decompress fallback.
+6. Docs + limitations (order-0, sync bdev only for RFC; async via descriptor
    option (B) as follow-up).

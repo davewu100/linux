@@ -17,37 +17,59 @@ int swap_decompress(struct zcomp_strm *zstrm, const void *src, unsigned int src_
 int swap_compress_set_algorithm(const char *alg);
 
 /*
+ * Stable backend id for an algorithm name, for stamping onto a stored blob so
+ * it can later be decoded with the exact codec that produced it.  Negative
+ * errno for an unknown/unsupported name.
+ */
+int swap_compress_alg_id(const char *alg);
+
+/*
+ * Acquire the per-CPU stream of the codec identified by @alg_id, held with its
+ * lock (release with swap_compress_stream_put()).  Its ->local_copy may serve as
+ * a bounce buffer.  NULL if the codec is unavailable.
+ */
+struct zcomp_strm *swap_decompress_stream_by_id_get(int alg_id);
+
+/*
+ * Decompress a passthrough blob with the codec identified by @alg_id (the one
+ * that produced it), independent of any primary codec, using @zstrm previously
+ * obtained from swap_decompress_stream_by_id_get().
+ */
+int swap_decompress_by_id(int alg_id, struct zcomp_strm *zstrm,
+			  const void *src, unsigned int src_len, void *dst);
+
+/*
  * Compressed-blob passthrough (see
  * Documentation/mm/core-swap-compressed-passthrough.md).
  *
- * On writeback, zswap holds a blob that was produced by the shared core-swap
- * codec (swap_compress()).  Because the backing device (zram primary slot)
- * decompresses through the same codec, the blob can be stored verbatim instead
- * of decompressing it into a page and letting the backing device recompress it.
- *
- * The only datum the backing store needs that it cannot recover on its own is
- * the compressed length.  It is transported through a per-task descriptor
- * (current->swap_precompressed_len), scoped to a single synchronous write that
- * the backing store runs in this same task, so it never becomes a struct bio
- * property or a block-layer flag.
+ * On writeback, zswap holds a blob it already compressed.  Instead of
+ * decompressing it into a page and letting the backing device recompress it,
+ * the blob is stored verbatim.  The backing store cannot recover two things on
+ * its own: the compressed length, and which codec produced the blob (zswap and
+ * the backing primary slot may use different algorithms).  Both travel on a
+ * per-task descriptor (current->swap_precompressed_len / _alg_id), scoped to a
+ * single synchronous write that the backing store runs in this same task, so
+ * they never become a struct bio property or a block-layer flag.
  */
 
 /*
- * Begin a precompressed write on the current task: record @comp_len for the
- * synchronous bio the caller is about to submit.  Must be paired with
- * swap_precompressed_write_end().  Not expected to nest.
+ * Begin a precompressed write on the current task: record @comp_len and the
+ * producing codec @alg_id for the synchronous bio the caller is about to
+ * submit.  Must be paired with swap_precompressed_write_end().  Not expected to
+ * nest.
  */
-void swap_precompressed_write_begin(unsigned int comp_len);
+void swap_precompressed_write_begin(unsigned int comp_len, int alg_id);
 
 /* End the precompressed write region opened by swap_precompressed_write_begin(). */
 void swap_precompressed_write_end(void);
 
 /*
  * Backing-store query: if a precompressed write is in flight on this task,
- * store its length in @comp_len and return true.  @comp_len is guaranteed
- * 0 < *comp_len < PAGE_SIZE.  Returns false for an ordinary raw-page write.
+ * store its length in @comp_len and producing-codec id in @alg_id, and return
+ * true.  @comp_len is guaranteed 0 < *comp_len < PAGE_SIZE.  Returns false for
+ * an ordinary raw-page write.
  */
-bool swap_precompressed_write_len(unsigned int *comp_len);
+bool swap_precompressed_write_len(unsigned int *comp_len, int *alg_id);
 
 #else /* CONFIG_SWAP_COMPRESS */
 
@@ -77,7 +99,25 @@ static inline int swap_compress_set_algorithm(const char *alg)
 	return -EOPNOTSUPP;
 }
 
-static inline void swap_precompressed_write_begin(unsigned int comp_len)
+static inline int swap_compress_alg_id(const char *alg)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline struct zcomp_strm *swap_decompress_stream_by_id_get(int alg_id)
+{
+	return NULL;
+}
+
+static inline int swap_decompress_by_id(int alg_id, struct zcomp_strm *zstrm,
+					const void *src, unsigned int src_len,
+					void *dst)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline void swap_precompressed_write_begin(unsigned int comp_len,
+						  int alg_id)
 {
 }
 
@@ -85,7 +125,8 @@ static inline void swap_precompressed_write_end(void)
 {
 }
 
-static inline bool swap_precompressed_write_len(unsigned int *comp_len)
+static inline bool swap_precompressed_write_len(unsigned int *comp_len,
+					       int *alg_id)
 {
 	return false;
 }

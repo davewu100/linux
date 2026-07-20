@@ -41,6 +41,9 @@
 /* Only 2 bits are allowed for comp priority index */
 #define ZRAM_COMP_PRIORITY_MASK	0x3
 
+/* Only 3 bits are allowed for the passthrough codec (backend) id */
+#define ZRAM_PRECOMP_ALG_MASK	0x7
+
 /* Flags for zram pages (table[page_no].flags) */
 enum zram_pageflags {
 	ZRAM_SAME = ZRAM_FLAG_SHIFT,	/* Page consists the same element */
@@ -53,6 +56,17 @@ enum zram_pageflags {
 
 	ZRAM_COMP_PRIORITY_BIT1, /* First bit of comp priority index */
 	ZRAM_COMP_PRIORITY_BIT2, /* Second bit of comp priority index */
+
+	/*
+	 * Compressed-blob passthrough: the primary slot holds a blob produced
+	 * by another tier (zswap) with a codec that may differ from this zram's
+	 * primary codec.  ZRAM_PRECOMP marks such a slot and the ALG bits record
+	 * the backend id of the producing codec so swapin decodes it correctly.
+	 */
+	ZRAM_PRECOMP,		/* Slot holds an external precompressed blob */
+	ZRAM_PRECOMP_ALG_BIT1,	/* First bit of passthrough codec id */
+	ZRAM_PRECOMP_ALG_BIT2,	/* Second bit of passthrough codec id */
+	ZRAM_PRECOMP_ALG_BIT3,	/* Third bit of passthrough codec id */
 
 	__NR_ZRAM_PAGEFLAGS,
 };

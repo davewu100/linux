@@ -462,14 +462,16 @@ static void swap_writepage_bdev_async(struct folio *folio,
 /*
  * Write a precompressed blob straight to the backing swap device.
  *
- * @folio holds @comp_len bytes of a blob produced by the shared core-swap
- * codec (see mm/swap_compress.c) at offset 0, with the rest of the folio
- * zero-padded.  The bio is a normal full-folio, block-aligned write: a bio
- * sized to @comp_len would be rejected by the backing device, since @comp_len
- * is almost never a multiple of the logical block size.  The compressed length
- * is not carried in the bio at all -- it rides the per-task descriptor set
- * here, which the backing store (zram) reads to store only @comp_len bytes
- * verbatim as a compressed slot.  No bio flag, no length in bi_iter.bi_size.
+ * @folio holds @comp_len bytes of a blob produced by the codec with backend id
+ * @alg_id at offset 0, with the rest of the folio zero-padded.  The bio is a
+ * normal full-folio, block-aligned write: a bio sized to @comp_len would be
+ * rejected by the backing device, since @comp_len is almost never a multiple of
+ * the logical block size.  Neither the compressed length nor the codec id is
+ * carried in the bio -- both ride the per-task descriptor set here, which the
+ * backing store (zram) reads to store only @comp_len bytes verbatim, tagged
+ * with @alg_id so a later swapin decodes them with the producing codec.  No bio
+ * flag, no length in bi_iter.bi_size, and no assumption that the backing store's
+ * own codec matches.
  *
  * Unlike __swap_writepage(), this does NOT start writeback or unlock @folio:
  * the folio contains compressed bytes, not the raw page, so the caller manages
@@ -479,7 +481,8 @@ static void swap_writepage_bdev_async(struct folio *folio,
  * negative errno; on failure the caller can fall back to the normal
  * decompress-then-write path.
  */
-int swap_writepage_precompressed(struct folio *folio, unsigned int comp_len)
+int swap_writepage_precompressed(struct folio *folio, unsigned int comp_len,
+				 int alg_id)
 {
 	struct swap_info_struct *sis = __swap_entry_to_info(folio->swap);
 	struct bio_vec bv;
@@ -487,6 +490,8 @@ int swap_writepage_precompressed(struct folio *folio, unsigned int comp_len)
 	int ret;
 
 	if (!comp_len || comp_len >= folio_size(folio))
+		return -EINVAL;
+	if (alg_id < 0)
 		return -EINVAL;
 	/*
 	 * ->flags can be updated non-atomically, but that will never affect
@@ -513,7 +518,7 @@ int swap_writepage_precompressed(struct folio *folio, unsigned int comp_len)
 	bio_associate_blkg_from_page(&bio, folio);
 	count_swpout_vm_event(folio);
 
-	swap_precompressed_write_begin(comp_len);
+	swap_precompressed_write_begin(comp_len, alg_id);
 	ret = submit_bio_wait(&bio);
 	swap_precompressed_write_end();
 

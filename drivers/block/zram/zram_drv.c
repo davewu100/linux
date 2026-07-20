@@ -187,6 +187,23 @@ static inline u32 get_slot_comp_priority(struct zram *zram, u32 index)
 	return prio & ZRAM_COMP_PRIORITY_MASK;
 }
 
+#ifdef CONFIG_SWAP_COMPRESS
+static inline void set_slot_precomp_alg(struct zram *zram, u32 index, u32 alg)
+{
+	alg &= ZRAM_PRECOMP_ALG_MASK;
+	zram->table[index].attr.flags &= ~(ZRAM_PRECOMP_ALG_MASK <<
+					   ZRAM_PRECOMP_ALG_BIT1);
+	zram->table[index].attr.flags |= (alg << ZRAM_PRECOMP_ALG_BIT1);
+}
+
+static inline u32 get_slot_precomp_alg(struct zram *zram, u32 index)
+{
+	u32 alg = zram->table[index].attr.flags >> ZRAM_PRECOMP_ALG_BIT1;
+
+	return alg & ZRAM_PRECOMP_ALG_MASK;
+}
+#endif
+
 static void mark_slot_accessed(struct zram *zram, u32 index)
 {
 	clear_slot_flag(zram, index, ZRAM_IDLE);
@@ -1368,6 +1385,30 @@ static int decompress_bdev_page(struct zram *zram, struct page *page, u32 index)
 	prio = get_slot_comp_priority(zram, index);
 
 #ifdef CONFIG_SWAP_COMPRESS
+	/*
+	 * Passthrough slot: decode in place with the exact producing codec.
+	 * @page already holds the raw blob read back from the backing device,
+	 * so decompress into the stream's scratch and copy the page back.
+	 */
+	if (test_slot_flag(zram, index, ZRAM_PRECOMP)) {
+		int alg_id = get_slot_precomp_alg(zram, index);
+
+		zstrm = swap_decompress_stream_by_id_get(alg_id);
+		if (!zstrm) {
+			slot_unlock(zram, index);
+			return -ENODEV;
+		}
+		src = kmap_local_page(page);
+		ret = swap_decompress_by_id(alg_id, zstrm, src, size,
+					    zstrm->local_copy);
+		if (!ret)
+			copy_page(src, zstrm->local_copy);
+		kunmap_local(src);
+		swap_compress_stream_put(zstrm);
+		slot_unlock(zram, index);
+		return ret;
+	}
+
 	if (prio == ZRAM_PRIMARY_COMP) {
 		zstrm = swap_compress_stream_get();
 		src = kmap_local_page(page);
@@ -2034,6 +2075,13 @@ static void slot_free(struct zram *zram, u32 index)
 	clear_slot_flag(zram, index, ZRAM_PP_SLOT);
 	set_slot_comp_priority(zram, index, 0);
 
+#ifdef CONFIG_SWAP_COMPRESS
+	if (test_slot_flag(zram, index, ZRAM_PRECOMP)) {
+		clear_slot_flag(zram, index, ZRAM_PRECOMP);
+		set_slot_precomp_alg(zram, index, 0);
+	}
+#endif
+
 	if (test_slot_flag(zram, index, ZRAM_HUGE)) {
 		/*
 		 * Writeback completion decrements ->huge_pages but keeps
@@ -2114,6 +2162,28 @@ static int read_compressed_page(struct zram *zram, struct page *page, u32 index)
 	prio = get_slot_comp_priority(zram, index);
 
 #ifdef CONFIG_SWAP_COMPRESS
+	/*
+	 * Passthrough slot: the blob was produced by another tier (zswap) with
+	 * a codec that may differ from our primary.  Decode with the exact
+	 * producing codec, recorded on the slot.  The zsmalloc object may span
+	 * two physical pages, so read it out through a bounce buffer first.
+	 */
+	if (test_slot_flag(zram, index, ZRAM_PRECOMP)) {
+		int alg_id = get_slot_precomp_alg(zram, index);
+
+		zstrm = swap_decompress_stream_by_id_get(alg_id);
+		if (!zstrm)
+			return -ENODEV;
+		src = zs_obj_read_begin(zram->mem_pool, handle, size,
+					zstrm->local_copy);
+		dst = kmap_local_page(page);
+		ret = swap_decompress_by_id(alg_id, zstrm, src, size, dst);
+		kunmap_local(dst);
+		zs_obj_read_end(zram->mem_pool, handle, size, src);
+		swap_compress_stream_put(zstrm);
+		return ret;
+	}
+
 	if (prio == ZRAM_PRIMARY_COMP) {
 		zstrm = swap_compress_stream_get();
 		src = zs_obj_read_begin(zram->mem_pool, handle, size,
@@ -2304,19 +2374,23 @@ static int write_incompressible_page(struct zram *zram, struct page *page,
 
 #ifdef CONFIG_SWAP_COMPRESS
 /*
- * Store data that arrived already compressed by the shared core-swap codec
- * (a zswap writeback passthrough).  @page holds @comp_len bytes of a blob our
- * primary slot decodes with the same codec, so it is stored as an ordinary
- * compressed slot at ZRAM_PRIMARY_COMP and read back unchanged -- no recompress,
- * and no ZRAM_HUGE / extra slot flag, because the codec matches.
+ * Store data that arrived already compressed (a zswap writeback passthrough).
+ * @page holds @comp_len bytes of a blob produced by the codec with backend id
+ * @alg_id, which may differ from this zram's primary codec.  The slot is marked
+ * ZRAM_PRECOMP and stamped with @alg_id so swapin decodes it with the exact
+ * producing codec (see read_precompressed_page()) rather than recompressing or
+ * assuming a shared codec.
  */
 static int zram_store_precompressed(struct zram *zram, struct page *page,
-				    u32 index, unsigned int comp_len)
+				    u32 index, unsigned int comp_len, int alg_id)
 {
 	unsigned long handle;
 	void *src;
 
 	if (!comp_len || comp_len >= PAGE_SIZE)
+		return -EINVAL;
+	/* Must be a codec id we can decode back; otherwise refuse. */
+	if (alg_id < 0 || !zcomp_backend_name_by_id(alg_id))
 		return -EINVAL;
 
 	handle = zs_malloc(zram->mem_pool, comp_len,
@@ -2339,6 +2413,8 @@ static int zram_store_precompressed(struct zram *zram, struct page *page,
 	set_slot_handle(zram, index, handle);
 	set_slot_size(zram, index, comp_len);
 	set_slot_comp_priority(zram, index, ZRAM_PRIMARY_COMP);
+	set_slot_flag(zram, index, ZRAM_PRECOMP);
+	set_slot_precomp_alg(zram, index, alg_id);
 	slot_unlock(zram, index);
 
 	atomic64_inc(&zram->stats.pages_stored);
@@ -2349,21 +2425,22 @@ static int zram_store_precompressed(struct zram *zram, struct page *page,
 
 /*
  * Compressed-blob passthrough entry point.  If the core swap layer marks the
- * current write as precompressed, @page holds a blob produced by the shared
- * codec and only its (descriptor-carried) length is stored, skipping
- * compression.  The bvec itself is a full page; the length comes from the
- * per-task descriptor, not the bvec.  Returns true (with *@ret set) if it
- * handled the write, false for an ordinary raw-page write.
+ * current write as precompressed, @page holds a blob produced by the codec the
+ * descriptor names; only its (descriptor-carried) length and codec id are
+ * stored, skipping compression.  The bvec itself is a full page; the length and
+ * id come from the per-task descriptor, not the bvec.  Returns true (with *@ret
+ * set) if it handled the write, false for an ordinary raw-page write.
  */
 static bool zram_try_write_precompressed(struct zram *zram, struct page *page,
 					 u32 index, int *ret)
 {
 	unsigned int comp_len;
+	int alg_id;
 
-	if (!swap_precompressed_write_len(&comp_len))
+	if (!swap_precompressed_write_len(&comp_len, &alg_id))
 		return false;
 
-	*ret = zram_store_precompressed(zram, page, index, comp_len);
+	*ret = zram_store_precompressed(zram, page, index, comp_len, alg_id);
 	return true;
 }
 #else /* CONFIG_SWAP_COMPRESS */

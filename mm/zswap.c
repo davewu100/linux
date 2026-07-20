@@ -1192,11 +1192,13 @@ static bool zswap_decompress(struct zswap_entry *entry, struct folio *folio)
  * recompress-on-store cycle.  See
  * Documentation/mm/core-swap-compressed-passthrough.md.
  *
- * Eligible only when the entry was compressed by the shared core-swap codec
- * (ZSWAP_BACKEND_ZCOMP), so zram decodes it with the same codec; genuinely
- * compressed (0 < length < PAGE_SIZE); and order-0.  The caller must also have
- * checked that the write is on the synchronous bdev path (via the return of
- * swap_writepage_precompressed()).
+ * Eligible when the entry was compressed by a zcomp backend (ZSWAP_BACKEND_ZCOMP,
+ * so the blob has a stable backend id); genuinely compressed (0 < length <
+ * PAGE_SIZE); and order-0.  The producing codec's backend id is passed down and
+ * stamped onto the backing slot, so this does NOT require the backing device's
+ * own codec to match -- zram decodes the blob with the id we hand it.  The
+ * caller must also have checked that the write is on the synchronous bdev path
+ * (via the return of swap_writepage_precompressed()).
  *
  * On success the blob is durably stored on the backing device and @folio holds
  * compressed bytes (NOT the raw page), so the caller must drop it from the swap
@@ -1210,12 +1212,23 @@ static bool zswap_writeback_passthrough(struct zswap_entry *entry,
 	struct scatterlist input[2];
 	unsigned int clen = entry->length;
 	void *src;
+	int alg_id;
 
 	if (pool->backend != ZSWAP_BACKEND_ZCOMP)
 		return false;
 	if (!clen || clen >= PAGE_SIZE)
 		return false;
 	if (folio_test_large(folio))
+		return false;
+
+	/*
+	 * Identify the codec that produced this blob so the backing store can
+	 * decode it independently of its own primary codec.  If the name has no
+	 * stable backend id, we cannot describe the blob to the backing store,
+	 * so fall back to decompression.
+	 */
+	alg_id = zcomp_lookup_backend_id(pool->tfm_name);
+	if (alg_id < 0)
 		return false;
 
 	/*
@@ -1231,7 +1244,7 @@ static bool zswap_writeback_passthrough(struct zswap_entry *entry,
 	zs_obj_read_sg_end(pool->zs_pool, entry->handle);
 	flush_dcache_folio(folio);
 
-	return swap_writepage_precompressed(folio, clen) == 0;
+	return swap_writepage_precompressed(folio, clen, alg_id) == 0;
 }
 #endif /* CONFIG_SWAP_COMPRESS */
 

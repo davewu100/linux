@@ -1142,11 +1142,14 @@ struct task_struct {
 
 #ifdef CONFIG_SWAP_COMPRESS
 	/*
-	 * Compressed length of an in-flight compressed-blob swap writeback on
-	 * this task (0 if none).  Lets the backing store learn the blob length
-	 * of a passthrough write without a bio flag; see mm/swap_compress.c.
+	 * In-flight compressed-blob swap writeback on this task (len 0 if none).
+	 * Lets the backing store learn the blob length and the id of the codec
+	 * that produced it -- so it can be decoded even when the backing store's
+	 * own primary codec differs -- without a bio flag; see
+	 * mm/swap_compress.c.
 	 */
 	unsigned int			swap_precompressed_len;
+	int				swap_precompressed_alg_id;
 #endif
 
 	/* Empty if CONFIG_POSIX_CPUTIMERS=n */
