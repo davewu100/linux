@@ -94,6 +94,33 @@ const char *zcomp_lookup_backend_name(const char *comp)
 	return NULL;
 }
 
+/*
+ * Stable, build-time identifier for a backend: its index in backends[].
+ * The index depends only on which ZCOMP_BACKEND_* options are enabled, so it
+ * is stable for the lifetime of a kernel image and can be persisted alongside
+ * a stored blob to record which codec produced it.  Returns a negative value
+ * for an unknown algorithm name.
+ */
+int zcomp_lookup_backend_id(const char *comp)
+{
+	int i = 0;
+
+	while (backends[i]) {
+		if (sysfs_streq(comp, backends[i]->name))
+			return i;
+		i++;
+	}
+	return -EINVAL;
+}
+
+/* Reverse of zcomp_lookup_backend_id(): name for a backend id, or NULL. */
+const char *zcomp_backend_name_by_id(int id)
+{
+	if (id < 0 || id >= ARRAY_SIZE(backends) - 1)
+		return NULL;
+	return backends[id]->name;
+}
+
 /* show available compressors */
 ssize_t zcomp_available_show(const char *comp, char *buf, ssize_t at)
 {
