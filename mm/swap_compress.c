@@ -155,6 +155,9 @@ static struct zcomp *swap_codec_get(int id)
 	struct zcomp *comp;
 	const char *name;
 
+	/* The cache must be able to index every possible backend id. */
+	BUILD_BUG_ON(SWAP_CODEC_CACHE_MAX < ZCOMP_MAX_BACKENDS);
+
 	if (id < 0 || id >= SWAP_CODEC_CACHE_MAX)
 		return ERR_PTR(-EINVAL);
 

@@ -3499,6 +3499,14 @@ static int __init zram_init(void)
 	int ret;
 
 	BUILD_BUG_ON(__NR_ZRAM_PAGEFLAGS > sizeof(zram_te.attr.flags) * 8);
+#ifdef CONFIG_SWAP_COMPRESS
+	/*
+	 * A passthrough slot stores the producing codec's backend id in the
+	 * ZRAM_PRECOMP_ALG_* bits.  Ensure every possible id fits, so a future
+	 * backend can never be silently truncated to a wrong codec on readback.
+	 */
+	BUILD_BUG_ON(ZCOMP_MAX_BACKENDS - 1 > ZRAM_PRECOMP_ALG_MASK);
+#endif
 
 	ret = cpuhp_setup_state_multi(CPUHP_ZCOMP_PREPARE, "block/zram:prepare",
 				      zcomp_cpu_up_prepare, zcomp_cpu_dead);

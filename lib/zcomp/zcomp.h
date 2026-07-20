@@ -84,6 +84,15 @@ const char *zcomp_lookup_backend_name(const char *comp);
 int zcomp_lookup_backend_id(const char *comp);
 const char *zcomp_backend_name_by_id(int id);
 
+/*
+ * Compile-time upper bound on the number of backends (and thus on the backend
+ * id returned by zcomp_lookup_backend_id()).  lzo contributes two entries
+ * (lzo-rle and lzo); every other backend contributes one.  Consumers that
+ * persist a backend id in a fixed-width field can BUILD_BUG_ON against this to
+ * guarantee the id always fits.
+ */
+#define ZCOMP_MAX_BACKENDS	7
+
 struct zcomp *zcomp_create(const char *alg, struct zcomp_params *params);
 void zcomp_destroy(struct zcomp *comp);
 
