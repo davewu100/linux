@@ -35,6 +35,7 @@
 #include <linux/pagemap.h>
 #include <linux/workqueue.h>
 #include <linux/list_lru.h>
+#include <linux/idr.h>
 #include <linux/zsmalloc.h>
 
 #include "swap.h"
@@ -157,8 +158,37 @@ struct zswap_pool {
 	struct list_head list;
 	struct work_struct release_work;
 	struct hlist_node node;
+	u16 idx;
 	char tfm_name[CRYPTO_MAX_ALG_NAME];
 };
+
+/*
+ * Every stored entry references its pool by a small index instead of an
+ * 8-byte pointer, which shrinks struct zswap_entry (a per-stored-page
+ * allocation) on 64-bit.  The index is resolved through this RCU-protected
+ * table.  Slots are handed out at pool creation and released at pool
+ * destruction; because every live entry holds a reference on its pool, a
+ * pool (and thus its slot) cannot be freed while entries still point at it,
+ * so an index is never reused under a stale entry.
+ *
+ * Only a handful of pools are ever live at once (one per active compressor);
+ * freed indices are recycled by the IDA, so the table stays small.  The u16
+ * entry field allows far more than this cap should a need ever arise.
+ */
+#define ZSWAP_MAX_POOLS		64
+static struct zswap_pool __rcu *zswap_pool_by_idx[ZSWAP_MAX_POOLS];
+static DEFINE_IDA(zswap_pool_ida);
+
+/*
+ * Resolve a pool index to its pool.  Callers reaching here through a stored
+ * entry hold a reference on that pool (see struct zswap_entry), which keeps
+ * the pool - and hence this table slot - alive, so the lookup does not need
+ * its own RCU read-side critical section for liveness.
+ */
+static struct zswap_pool *zswap_pool_by_index(u16 idx)
+{
+	return rcu_dereference_protected(zswap_pool_by_idx[idx], true);
+}
 
 /* Global LRU lists shared by all zswap pools. */
 static struct list_lru zswap_list_lru;
@@ -182,7 +212,10 @@ static struct shrinker *zswap_shrinker;
  *              writeback logic. The entry is only reclaimed by the writeback
  *              logic if referenced is unset. See comments in the shrinker
  *              section for context.
- * pool - the zswap_pool the entry's data is in
+ * pool_idx - index of the zswap_pool the entry's data is in, resolved via
+ *            zswap_pool_by_index(). Stored as a u16 rather than an 8-byte
+ *            pool pointer to keep the per-page entry small; it fits in what
+ *            would otherwise be padding after @referenced.
  * handle - zsmalloc allocation handle that stores the compressed page data
  * objcg - the obj_cgroup that the compressed memory is charged to
  * lru - handle to the pool's lru used to evict pages.
@@ -191,11 +224,17 @@ struct zswap_entry {
 	swp_entry_t swpentry;
 	unsigned int length;
 	bool referenced;
-	struct zswap_pool *pool;
+	u16 pool_idx;
 	unsigned long handle;
 	struct obj_cgroup *objcg;
 	struct list_head lru;
 };
+
+/* Resolve the pool an entry's data lives in. */
+static struct zswap_pool *zswap_entry_pool(struct zswap_entry *entry)
+{
+	return zswap_pool_by_index(entry->pool_idx);
+}
 
 static struct xarray *zswap_trees[MAX_SWAPFILES];
 static unsigned int nr_zswap_trees[MAX_SWAPFILES];
@@ -322,10 +361,18 @@ static struct zswap_pool *zswap_pool_create(char *compressor)
 		goto ref_fail;
 	INIT_LIST_HEAD(&pool->list);
 
+	ret = ida_alloc_max(&zswap_pool_ida, ZSWAP_MAX_POOLS - 1, GFP_KERNEL);
+	if (ret < 0)
+		goto idx_fail;
+	pool->idx = ret;
+	rcu_assign_pointer(zswap_pool_by_idx[pool->idx], pool);
+
 	zswap_pool_debug("created", pool);
 
 	return pool;
 
+idx_fail:
+	percpu_ref_exit(&pool->ref);
 ref_fail:
 	cpuhp_state_remove_instance(CPUHP_MM_ZSWP_POOL_PREPARE, &pool->node);
 
@@ -365,6 +412,9 @@ static void zswap_pool_destroy(struct zswap_pool *pool)
 	int cpu;
 
 	zswap_pool_debug("destroying", pool);
+
+	rcu_assign_pointer(zswap_pool_by_idx[pool->idx], NULL);
+	ida_free(&zswap_pool_ida, pool->idx);
 
 	cpuhp_state_remove_instance(CPUHP_MM_ZSWP_POOL_PREPARE, &pool->node);
 
@@ -764,9 +814,11 @@ static void zswap_entry_cache_free(struct zswap_entry *entry)
  */
 static void zswap_entry_free(struct zswap_entry *entry)
 {
+	struct zswap_pool *pool = zswap_entry_pool(entry);
+
 	zswap_lru_del(&zswap_list_lru, entry);
-	zs_free(entry->pool->zs_pool, entry->handle);
-	zswap_pool_put(entry->pool);
+	zs_free(pool->zs_pool, entry->handle);
+	zswap_pool_put(pool);
 	if (entry->objcg) {
 		obj_cgroup_uncharge_zswap(entry->objcg, entry->length);
 		obj_cgroup_put(entry->objcg);
@@ -927,7 +979,7 @@ unlock:
 
 static bool zswap_decompress(struct zswap_entry *entry, struct folio *folio)
 {
-	struct zswap_pool *pool = entry->pool;
+	struct zswap_pool *pool = zswap_entry_pool(entry);
 	struct scatterlist input[2]; /* zsmalloc returns an SG list 1-2 entries */
 	struct scatterlist output;
 	struct crypto_acomp_ctx *acomp_ctx;
@@ -968,7 +1020,7 @@ static bool zswap_decompress(struct zswap_entry *entry, struct folio *folio)
 	pr_alert_ratelimited("Decompression error from zswap (%d:%lu %s %u->%d)\n",
 						swp_type(entry->swpentry),
 						swp_offset(entry->swpentry),
-						entry->pool->tfm_name,
+						pool->tfm_name,
 						entry->length, dlen);
 	return false;
 }
@@ -1459,7 +1511,7 @@ static bool zswap_store_page(struct page *page,
 	 *    The publishing order matters to prevent writeback from seeing
 	 *    an incoherent entry.
 	 */
-	entry->pool = pool;
+	entry->pool_idx = pool->idx;
 	entry->swpentry = page_swpentry;
 	entry->objcg = objcg;
 	entry->referenced = true;
