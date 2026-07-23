@@ -841,25 +841,25 @@ static bool zswap_compress(struct page *page, struct zswap_entry *entry,
 			   struct zswap_pool *pool)
 {
 	struct crypto_acomp_ctx *acomp_ctx;
-	struct scatterlist input, output;
 	int comp_ret = 0, alloc_ret = 0;
 	unsigned int dlen = PAGE_SIZE;
 	unsigned long handle;
 	gfp_t gfp;
-	u8 *dst;
+	u8 *src, *dst;
 	bool mapped = false;
 
 	acomp_ctx = raw_cpu_ptr(pool->acomp_ctx);
 	mutex_lock(&acomp_ctx->mutex);
 
 	dst = acomp_ctx->buffer;
-	sg_init_table(&input, 1);
-	sg_set_page(&input, page, PAGE_SIZE, 0);
-
-	sg_init_one(&output, dst, PAGE_SIZE);
-	acomp_request_set_params(acomp_ctx->req, &input, &output, PAGE_SIZE, dlen);
 
 	/*
+	 * The source page and the destination buffer are plain kernel memory
+	 * that is never used for DMA here, so hand them to acomp as virtual
+	 * addresses.  For a software (scomp) backend this lets crypto take the
+	 * synchronous virt path directly, without building scatterlists; a
+	 * hardware/offload backend still works via the async request path.
+	 *
 	 * it maybe looks a little bit silly that we send an asynchronous request,
 	 * then wait for its completion synchronously. This makes the process look
 	 * synchronous in fact.
@@ -871,7 +871,11 @@ static bool zswap_compress(struct page *page, struct zswap_entry *entry,
 	 * but in different threads running on different cpu, we have different
 	 * acomp instance, so multiple threads can do (de)compression in parallel.
 	 */
+	src = kmap_local_page(page);
+	acomp_request_set_src_nondma(acomp_ctx->req, src, PAGE_SIZE);
+	acomp_request_set_dst_nondma(acomp_ctx->req, dst, PAGE_SIZE);
 	comp_ret = crypto_wait_req(crypto_acomp_compress(acomp_ctx->req), &acomp_ctx->wait);
+	kunmap_local(src);
 	dlen = acomp_ctx->req->dlen;
 
 	/*
