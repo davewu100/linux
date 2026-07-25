@@ -131,69 +131,6 @@ ssize_t zcomp_available_show(const char *comp, char *buf, ssize_t at)
 }
 EXPORT_SYMBOL_GPL(zcomp_available_show);
 
-struct zcomp_strm *zcomp_stream_get(struct zcomp *comp)
-{
-	for (;;) {
-		struct zcomp_strm *zstrm = raw_cpu_ptr(comp->stream);
-
-		/*
-		 * Inspired by zswap
-		 *
-		 * stream is returned with ->mutex locked which prevents
-		 * cpu_dead() from releasing this stream under us, however
-		 * there is still a race window between raw_cpu_ptr() and
-		 * mutex_lock(), during which we could have been migrated
-		 * from a CPU that has already destroyed its stream.  If
-		 * so then unlock and re-try on the current CPU.
-		 */
-		mutex_lock(&zstrm->lock);
-		if (likely(zstrm->buffer))
-			return zstrm;
-		mutex_unlock(&zstrm->lock);
-	}
-}
-EXPORT_SYMBOL_GPL(zcomp_stream_get);
-
-void zcomp_stream_put(struct zcomp_strm *zstrm)
-{
-	mutex_unlock(&zstrm->lock);
-}
-EXPORT_SYMBOL_GPL(zcomp_stream_put);
-
-int zcomp_compress(struct zcomp *comp, struct zcomp_strm *zstrm,
-		   const void *src, unsigned int *dst_len)
-{
-	struct zcomp_req req = {
-		.src = src,
-		.dst = zstrm->buffer,
-		.src_len = PAGE_SIZE,
-		.dst_len = 2 * PAGE_SIZE,
-	};
-	int ret;
-
-	might_sleep();
-	ret = comp->ops->compress(comp->params, &zstrm->ctx, &req);
-	if (!ret)
-		*dst_len = req.dst_len;
-	return ret;
-}
-EXPORT_SYMBOL_GPL(zcomp_compress);
-
-int zcomp_decompress(struct zcomp *comp, struct zcomp_strm *zstrm,
-		     const void *src, unsigned int src_len, void *dst)
-{
-	struct zcomp_req req = {
-		.src = src,
-		.dst = dst,
-		.src_len = src_len,
-		.dst_len = PAGE_SIZE,
-	};
-
-	might_sleep();
-	return comp->ops->decompress(comp->params, &zstrm->ctx, &req);
-}
-EXPORT_SYMBOL_GPL(zcomp_decompress);
-
 int zcomp_cpu_up_prepare(unsigned int cpu, struct hlist_node *node)
 {
 	struct zcomp *comp = hlist_entry(node, struct zcomp, node);

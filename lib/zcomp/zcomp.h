@@ -4,6 +4,9 @@
 #define _ZCOMP_H_
 
 #include <linux/mutex.h>
+#include <linux/percpu.h>
+#include <linux/kernel.h>
+#include <linux/mm.h>	/* PAGE_SIZE */
 
 #define ZCOMP_PARAM_NOT_SET	INT_MIN
 
@@ -85,12 +88,69 @@ const char *zcomp_lookup_backend_name(const char *comp);
 struct zcomp *zcomp_create(const char *alg, struct zcomp_params *params);
 void zcomp_destroy(struct zcomp *comp);
 
-struct zcomp_strm *zcomp_stream_get(struct zcomp *comp);
-void zcomp_stream_put(struct zcomp_strm *zstrm);
+/*
+ * These are tiny wrappers on the (de)compression hot path.  They are kept
+ * inline in the header so that callers built as separate modules (e.g. zram
+ * with CONFIG_ZRAM=m) do not pay a cross-module call into the built-in
+ * lib/zcomp on every page.  Only the ->ops->{compress,decompress} indirect
+ * call remains, which is inherent to the backend abstraction.
+ */
+static inline struct zcomp_strm *zcomp_stream_get(struct zcomp *comp)
+{
+	for (;;) {
+		struct zcomp_strm *zstrm = raw_cpu_ptr(comp->stream);
 
-int zcomp_compress(struct zcomp *comp, struct zcomp_strm *zstrm,
-		   const void *src, unsigned int *dst_len);
-int zcomp_decompress(struct zcomp *comp, struct zcomp_strm *zstrm,
-		     const void *src, unsigned int src_len, void *dst);
+		/*
+		 * stream is returned with ->lock held which prevents
+		 * cpu_dead() from releasing this stream under us, however
+		 * there is still a race window between raw_cpu_ptr() and
+		 * mutex_lock(), during which we could have been migrated
+		 * from a CPU that has already destroyed its stream.  If
+		 * so then unlock and re-try on the current CPU.
+		 */
+		mutex_lock(&zstrm->lock);
+		if (likely(zstrm->buffer))
+			return zstrm;
+		mutex_unlock(&zstrm->lock);
+	}
+}
+
+static inline void zcomp_stream_put(struct zcomp_strm *zstrm)
+{
+	mutex_unlock(&zstrm->lock);
+}
+
+static inline int zcomp_compress(struct zcomp *comp, struct zcomp_strm *zstrm,
+				 const void *src, unsigned int *dst_len)
+{
+	struct zcomp_req req = {
+		.src = src,
+		.dst = zstrm->buffer,
+		.src_len = PAGE_SIZE,
+		.dst_len = 2 * PAGE_SIZE,
+	};
+	int ret;
+
+	might_sleep();
+	ret = comp->ops->compress(comp->params, &zstrm->ctx, &req);
+	if (!ret)
+		*dst_len = req.dst_len;
+	return ret;
+}
+
+static inline int zcomp_decompress(struct zcomp *comp, struct zcomp_strm *zstrm,
+				   const void *src, unsigned int src_len,
+				   void *dst)
+{
+	struct zcomp_req req = {
+		.src = src,
+		.dst = dst,
+		.src_len = src_len,
+		.dst_len = PAGE_SIZE,
+	};
+
+	might_sleep();
+	return comp->ops->decompress(comp->params, &zstrm->ctx, &req);
+}
 
 #endif /* _ZCOMP_H_ */
