@@ -4697,6 +4697,7 @@ static vm_fault_t handle_pte_marker(struct vm_fault *vmf)
 static bool can_swapin_thp(struct vm_fault *vmf, pte_t *ptep, int nr_pages)
 {
 	unsigned long addr;
+	softleaf_t entry;
 	int idx;
 	pte_t pte;
 
@@ -4708,10 +4709,19 @@ static bool can_swapin_thp(struct vm_fault *vmf, pte_t *ptep, int nr_pages)
 		return false;
 	/*
 	 * swap_read_folio() can't handle the case a large folio is hybridly
-	 * from different backends. And they are likely corner cases. Similar
-	 * things might be added once zswap support large folios.
+	 * from different backends.
 	 */
 	if (swap_pte_batch(ptep, nr_pages, pte) != nr_pages)
+		return false;
+	/*
+	 * zswap_load() can only load a large folio whose whole range is
+	 * uniformly in or out of zswap; a range that is only partially in
+	 * zswap cannot be reconstructed.  The PTL keeps these swap entries
+	 * stable, matching swap_pte_batch() above, so refuse the batch unless
+	 * all @nr_pages share the same zswap residency.
+	 */
+	entry = softleaf_from_pte(pte);
+	if (zswap_present_batch(entry, nr_pages, NULL) != nr_pages)
 		return false;
 	return true;
 }
@@ -4757,13 +4767,12 @@ static unsigned long thp_swapin_suitable_orders(struct vm_fault *vmf)
 		return 0;
 
 	/*
-	 * A large swapped out folio could be partially or fully in zswap. We
-	 * lack handling for such cases, so fallback to swapping in order-0
-	 * folio.
+	 * A large swapped out folio may be fully in zswap; can_swapin_thp()
+	 * only lets a batch through when its whole range shares the same zswap
+	 * residency, and zswap_load() then loads it one sub-page at a time.
+	 * A range that is only partially in zswap is rejected there and falls
+	 * back to order-0, so no special-casing is needed here.
 	 */
-	if (!zswap_never_enabled())
-		return 0;
-
 	entry = softleaf_from_pte(vmf->orig_pte);
 	/*
 	 * Get a list of all the (large) orders below PMD_ORDER that are enabled

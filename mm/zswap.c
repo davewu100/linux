@@ -1804,6 +1804,42 @@ check_old:
 }
 
 /**
+ * zswap_present_batch() - test a run of swap slots for zswap residency
+ * @entry: the first swap entry to test
+ * @nr: number of contiguous entries to test
+ * @is_zswapp: out param, set to whether @entry itself is present in zswap
+ *
+ * Return the number of leading entries starting at @entry that share the same
+ * zswap residency (all present, or all absent) as @entry.  A large folio spans
+ * at most PMD_ORDER pages, so all @nr offsets fall inside a single
+ * swap_zswap_tree() and can be looked up in one tree.
+ *
+ * This lets the swapin path (can_swapin_thp()) refuse to build a large folio
+ * whose range is only partially in zswap, which zswap_load() cannot handle.
+ *
+ * Context: The caller must keep the swap slots from being freed (e.g. by
+ * holding the PTL over stable swap entries), matching swap_pte_batch().
+ */
+int zswap_present_batch(swp_entry_t entry, int nr, bool *is_zswapp)
+{
+	struct xarray *tree = swap_zswap_tree(entry);
+	pgoff_t offset = swp_offset(entry);
+	bool first;
+	int i;
+
+	first = xa_load(tree, offset) != NULL;
+	if (is_zswapp)
+		*is_zswapp = first;
+
+	for (i = 1; i < nr; i++) {
+		if ((xa_load(tree, offset + i) != NULL) != first)
+			break;
+	}
+
+	return i;
+}
+
+/**
  * zswap_load() - load a folio from zswap
  * @folio: folio to load
  *
@@ -1811,24 +1847,33 @@ check_old:
  * of the following error codes:
  *
  *  -EIO: if the swapped out content was in zswap, but could not be loaded
- *  into the page due to a decompression failure. The folio is unlocked, but
+ *  into the folio due to a decompression failure. The folio is unlocked, but
  *  NOT marked up-to-date, so that an IO error is emitted (e.g. do_swap_page()
  *  will SIGBUS).
  *
- *  -EINVAL: if the swapped out content was in zswap, but the page belongs
- *  to a large folio, which is not supported by zswap. The folio is unlocked,
- *  but NOT marked up-to-date, so that an IO error is emitted (e.g.
- *  do_swap_page() will SIGBUS).
+ *  -EINVAL: if the folio is large but only partially present in zswap. Such a
+ *  folio is not supported: the caller (see thp_swapin_suitable_orders() /
+ *  can_swapin_thp()) is expected to only hand us large folios whose entire
+ *  range is uniformly in or out of zswap, so this is a defensive fallback.
+ *  The folio is unlocked but NOT marked up-to-date, so an IO error is emitted.
  *
- *  -ENOENT: if the swapped out content was not in zswap. The folio remains
- *  locked on return.
+ *  -ENOENT: if none of the folio is in zswap. The folio remains locked on
+ *  return so the caller can read it from the backing swap device.
+ *
+ * A large folio is handled one sub-page at a time.  All sub-pages of a large
+ * folio map to swap offsets within a single swap_zswap_tree() (a folio spans
+ * at most PMD_ORDER pages, well below ZSWAP_ADDRESS_SPACE_PAGES), and the
+ * folio lock pins the swapcache slots, so the tree entries are stable for the
+ * duration of the load and cannot be written back from under us.
  */
 int zswap_load(struct folio *folio)
 {
 	swp_entry_t swp = folio->swap;
 	pgoff_t offset = swp_offset(swp);
 	struct xarray *tree = swap_zswap_tree(swp);
-	struct zswap_entry *entry;
+	long nr_pages = folio_nr_pages(folio);
+	long nr_found = 0;
+	long index;
 
 	VM_WARN_ON_ONCE(!folio_test_locked(folio));
 	VM_WARN_ON_ONCE(!folio_test_swapcache(folio));
@@ -1837,41 +1882,63 @@ int zswap_load(struct folio *folio)
 		return -ENOENT;
 
 	/*
-	 * Large folios should not be swapped in while zswap is being used, as
-	 * they are not properly handled. Zswap does not properly load large
-	 * folios, and a large folio may only be partially in zswap.
+	 * First pass: find out how many of the folio's sub-pages are backed by
+	 * zswap.  All sub-pages share one tree (see the kerneldoc above), so a
+	 * single xa_load() per offset is enough.
 	 */
-	if (WARN_ON_ONCE(folio_test_large(folio))) {
+	for (index = 0; index < nr_pages; index++) {
+		if (xa_load(tree, offset + index))
+			nr_found++;
+	}
+
+	/* Nothing here: let the caller read the whole folio from backing swap. */
+	if (nr_found == 0)
+		return -ENOENT;
+
+	/*
+	 * Partially in zswap.  We cannot mix a zswap load with a backing-store
+	 * read for the same folio, and the rest of the sub-pages would carry
+	 * stale backing data.  The swapin path is expected to avoid forming such
+	 * a folio; treat it as an error rather than returning corrupt data.
+	 */
+	if (WARN_ON_ONCE(nr_found != nr_pages)) {
 		folio_unlock(folio);
 		return -EINVAL;
 	}
 
-	entry = xa_load(tree, offset);
-	if (!entry)
-		return -ENOENT;
+	/* Fully in zswap: decompress every sub-page into its slot. */
+	for (index = 0; index < nr_pages; index++) {
+		struct zswap_entry *entry = xa_load(tree, offset + index);
 
-	/* Large folios are rejected above, so this is an order-0 folio. */
-	if (!zswap_decompress(entry, folio, 0)) {
-		folio_unlock(folio);
-		return -EIO;
+		/*
+		 * Stable under the folio lock (see kerneldoc), so the entry we
+		 * counted above is still here.
+		 */
+		if (WARN_ON_ONCE(!entry) ||
+		    !zswap_decompress(entry, folio, index)) {
+			folio_unlock(folio);
+			return -EIO;
+		}
 	}
 
 	folio_mark_uptodate(folio);
 
-	count_vm_event(ZSWPIN);
-	if (entry->objcg)
-		count_objcg_events(entry->objcg, ZSWPIN, 1);
+	count_vm_events(ZSWPIN, nr_pages);
 
 	/*
-	 * We are reading into the swapcache, invalidate zswap entry.
-	 * The swapcache is the authoritative owner of the page and
-	 * its mappings, and the pressure that results from having two
-	 * in-memory copies outweighs any benefits of caching the
-	 * compression work.
+	 * We are reading into the swapcache, invalidate the zswap entries.
+	 * The swapcache is the authoritative owner of the pages and their
+	 * mappings, and the pressure that results from having two in-memory
+	 * copies outweighs any benefits of caching the compression work.
 	 */
 	folio_mark_dirty(folio);
-	xa_erase(tree, offset);
-	zswap_entry_free(entry);
+	for (index = 0; index < nr_pages; index++) {
+		struct zswap_entry *entry = xa_erase(tree, offset + index);
+
+		if (entry->objcg)
+			count_objcg_events(entry->objcg, ZSWPIN, 1);
+		zswap_entry_free(entry);
+	}
 
 	folio_unlock(folio);
 	return 0;
